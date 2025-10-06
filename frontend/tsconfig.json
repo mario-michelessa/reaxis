@@ -1,0 +1,19 @@
+{
+    "extends": "@tsconfig/svelte/tsconfig.json",
+    "compilerOptions": {
+      "moduleResolution": "node",
+      "target": "es2017",
+      "module": "es2020",
+      "importsNotUsedAsValues": "remove",
+      "isolatedModules": true,
+      "sourceMap": true,
+      "esModuleInterop": true,
+      "skipLibCheck": true,
+      "forceConsistentCasingInFileNames": true,
+      "baseUrl": ".",
+      "allowJs": true,
+      "checkJs": false
+    },
+    "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.svelte"],
+    "exclude": ["node_modules/*", "public/*"]
+  }

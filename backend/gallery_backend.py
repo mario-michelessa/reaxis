@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+Image Gallery Backend utilities
+
+Provides an engine to:
+- List images in a dataset
+- Estimate image embeddings (placeholder implementation, pluggable)
+- Reduce embeddings to 2D (UMAP placeholder with PCA fallback)
+- Pack 2D points into a non-overlapping image grid using grid.py
+
+Note: Server endpoints are not implemented here; this module focuses on
+data preparation. You can wire it into a FastAPI/Flask app later.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+from embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
+import layout as layout_utils
+
+class ImageGalleryEngine:
+    """Orchestrates image discovery, embedding, 2D layout, and grid packing."""
+
+    def __init__(self, dataset_path: str):
+        self.dataset_path = Path(dataset_path)
+        if not self.dataset_path.exists():
+            raise FileNotFoundError(f"Dataset path not found: {self.dataset_path}")
+        # delegate embeddings to dedicated engine
+        self.emb = EmbeddingEngine(dataset_path)
+
+    def list_images(self) -> List[ImageEntry]:
+        return self.emb.list_images()
+
+    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = "avg", resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
+        return self.emb.estimate_embeddings(images, method=method, resize=resize)
+
+    # Embedding extraction implementations moved to embeddings. No local copies here.
+
+    def reduce_to_2d(self, embeddings: np.ndarray, method: str = "pca", random_state: int = 42) -> np.ndarray:
+        return layout_utils.reduce_to_2d(embeddings, method=method, random_state=random_state)
+
+    # PCA implementation moved to layout utils
+
+    def pack_to_grid(self, coords01: np.ndarray, n_layer: int = 64, n_tile: int = 8,
+                     filter_fn: Optional[Callable[[int, Dict], bool]] = None) -> Tuple[np.ndarray, int]:
+        return layout_utils.pack_to_grid(coords01, n_layer=n_layer, n_tile=n_tile, filter_fn=filter_fn)
+
+    def build_gallery(self, n_layer: int = 64, n_tile: int = 8,
+                      method: str = "pca", embed_method: str = "avg") -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
+        """End-to-end pipeline returning entries, reduced coords, and packed coords.
+
+        Embeddings and PCA coordinates are cached per dataset and model.
+        """
+        entries = self.list_images()
+        embs = self._load_or_compute_embeddings(entries, embed_method)
+        coords2d = self._load_or_compute_coords(entries, embs, embed_method, method)
+        packed, eff_layer = self.pack_to_grid(coords2d, n_layer=n_layer, n_tile=n_tile)
+        return entries, coords2d, packed, eff_layer
+
+    def _cache_dir(self) -> Path:
+        return self.emb._cache_dir()
+
+    def _load_or_compute_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
+        # Try fast-path: plain embeddings npz without path metadata (e.g., dift_sd_partXY)
+        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        if cache.exists():
+            try:
+                data = np.load(cache, allow_pickle=False)
+                # Accept minimal format: just an 'embeddings' array or first array
+                arr = None
+                if 'embeddings' in data.files:
+                    arr = data['embeddings']
+                elif len(data.files) > 0:
+                    arr = data[data.files[0]]
+                if arr is not None and arr.ndim == 2 and arr.shape[0] == len(entries):
+                    print(f"[emb] loaded minimal cache {cache.name} shape={tuple(arr.shape)}")
+                    return arr
+            except Exception:
+                # Fall through to normal path
+                print(f"[emb] failed to load minimal cache: {cache.name}")
+        # Normal cached format with path+mtime checks
+        print(f"[emb] probing cache (full) embeddings_{method.lower()}.npz with paths/mtimes")
+        embs = self.emb.load_embeddings_only(entries, method=method)
+        if embs is not None:
+            print(f"[emb] loaded full cache shape={tuple(embs.shape)}")
+            return embs
+        print(f"[emb] cache miss, computing embeddings method={method}")
+        return self.emb.compute_and_cache_embeddings(entries, method=method)
+
+    def _load_embeddings_only(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
+        """Load cached embeddings only; supports both minimal and full cache formats.
+
+        Minimal: npz with only an embeddings array (any key, prefers 'embeddings').
+        Full: npz with paths/mtimes + embeddings; validates against current dataset.
+        """
+        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        if not cache.exists():
+            print(f"[emb] cache file not found: {cache}")
+            return None
+        try:
+            print(f"[emb] attempting to load cache: {cache}")
+            data = np.load(cache, allow_pickle=False)
+            print(f"[emb] cache loaded, available keys: {data.files}")
+            
+            # Full format with validation
+            if {'paths', 'embeddings'}.issubset(set(data.files)):
+                print(f"[emb] found full format with paths/embeddings")
+                # Compare by image id (class/filename) only, not absolute paths
+                current_ids = np.array([e.id for e in entries])
+                cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
+                ids_match = len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids)
+                print(f"[emb] validation results - ids match: {ids_match}")
+                if ids_match:
+                    embs = data['embeddings']
+                    print(f"[emb] ids match, embeddings shape={embs.shape}")
+                    if embs.ndim == 2 and embs.shape[0] == len(entries):
+                        print(f"[emb] returning full format embeddings")
+                        return embs
+                    else:
+                        print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
+                else:
+                    print(f"[emb] cache validation failed for full format (ids mismatch)")
+        except Exception:
+            print(f"[emb] failed to load/validate cache: {cache}")
+            return None
+        print(f"[emb] cache format invalid or does not match dataset: {cache}")
+        return None
+
+    def _load_or_compute_coords(self, entries: List[ImageEntry], embs: np.ndarray, method: str, red_method: str) -> np.ndarray:
+        # Always cache PCA coordinates as primary; if UMAP requested and available, skip cache
+        cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
+        current_ids = np.array([e.id for e in entries])
+        if red_method.lower() == 'pca' and cache.exists():
+            try:
+                data = np.load(cache, allow_pickle=False)
+                if 'paths' in data.files:
+                    cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
+                else:
+                    cached_ids = None
+                if (cached_ids is not None and len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids)):
+                    print(f"[coords] loaded cached PCA coords shape={tuple(data['coords'].shape)}")
+                    return data['coords']
+            except Exception:
+                pass
+        print(f"[coords] computing coords method={red_method} for embs shape={tuple(embs.shape)}")
+        coords2d = self.reduce_to_2d(embs, method=red_method)
+        if red_method.lower() == 'pca':
+            try:
+                np.savez_compressed(cache, paths=paths, mtimes=mtimes, coords=coords2d)
+                print(f"[coords] cached PCA coords at {cache}")
+            except Exception:
+                pass
+        return coords2d
+
+    def export_gallery_json(self, out_path: str, base_url: Optional[str] = None,
+                             n_layer: int = 64, n_tile: int = 8,
+                             method: str = "umap", embed_method: str = "avg") -> str:
+        """Generate a JSON file with image metadata and coordinates.
+
+        - base_url: optional URL prefix to serve images (e.g., '/images')
+        Returns the path to the written file.
+        """
+        entries, coords2d, packed, eff_layer = self.build_gallery(n_layer=n_layer, n_tile=n_tile, method=method, embed_method=embed_method)
+
+        items = []
+        for i, e in enumerate(entries):
+            url = e.path
+            if base_url:
+                # Attempt to map to base_url by taking filename
+                url = f"{base_url}/{Path(e.path).name}"
+            items.append({
+                "id": e.id,
+                "path": e.path,
+                "url": url,
+                "className": e.class_name,
+                "x": float(coords2d[i, 0]),
+                "y": float(coords2d[i, 1]),
+                "gx": float(packed[i, 0]),
+                "gy": float(packed[i, 1]),
+            })
+
+        out_path = str(out_path)
+        from json import dumps
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, 'w') as f:
+            f.write(dumps({"items": items, "n_layer": eff_layer, "n_tile": n_tile, "method": method, "embed": embed_method}, indent=2))
+        return out_path
+
+    def build_gallery_from_precomputed(self, n_layer: int = 64, n_tile: int = 8,
+                                       method: str = "pca", embed_method: str = "avg"):
+        """Build gallery using ONLY precomputed embeddings.
+
+        Loads cached embeddings; if unavailable returns (None, None, None, 0).
+        """
+        entries = self.list_images()
+        if not entries:
+            return [], np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32), 0
+        embs = self._load_embeddings_only(entries, method=embed_method)
+        if embs is None:
+            print(f"[build] No cached embeddings found for method={embed_method}")
+            return None, None, None, 0
+        print(f"[build] embs shape={tuple(embs.shape)} method={method}")
+        # If cached embeddings are transposed (D x N), fix by transposing
+        if embs.ndim == 2 and embs.shape[0] == 2 and embs.shape[1] != 2 and embs.shape[1] == len(entries):
+            print(f"Transposing embeddings from {embs.shape} to ({len(entries)}, 2) assumption")
+            embs = embs.T
+        coords2d = self.reduce_to_2d(embs, method=method)
+        # Sanity: coords must be (N,2). If (2,N), transpose.
+        if coords2d.ndim == 2 and coords2d.shape[0] == 2 and coords2d.shape[1] == len(entries):
+            print(f"Transposing coords2d from {coords2d.shape} to ({len(entries)}, 2)")
+            coords2d = coords2d.T
+        packed, eff_layer = self.pack_to_grid(coords2d, n_layer=n_layer, n_tile=n_tile)
+        print(f"[build] coords2d={tuple(coords2d.shape)} packed={tuple(packed.shape)} eff_layer={eff_layer}")
+        return entries, coords2d, packed, eff_layer
+
+    # Note: for part-specific embeddings (e.g., dift_sd_partXY), use embed_method naming
+    # and rely on the existing cache loader which maps to embeddings_{embed_method}.npz
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Build gallery embeddings and coords")
+    parser.add_argument("dataset", help="Path to image dataset root")
+    parser.add_argument("output", help="Path to output JSON, e.g., frontend/public/gallery.json")
+    parser.add_argument("--n_layer", type=int, default=64)
+    parser.add_argument("--n_tile", type=int, default=8)
+    parser.add_argument("--method", type=str, default="pca", help="'umap' or 'pca'")
+    parser.add_argument("--base_url", type=str, default=None, help="Optional URL prefix for images")
+    parser.add_argument("--embed", type=str, default="avg", help="Embedding method: 'avg', 'clip', 'dino', 'sd'")
+    args = parser.parse_args()
+
+    engine = ImageGalleryEngine(args.dataset)
+    out = engine.export_gallery_json(args.output, base_url=args.base_url,
+                                     n_layer=args.n_layer, n_tile=args.n_tile,
+                                     method=args.method, embed_method=args.embed)
+    print(f"✅ Gallery JSON written to {out}")
