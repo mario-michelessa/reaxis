@@ -117,7 +117,8 @@
     if (!draft || !draftInput) return
     const pw = draftInput.offsetWidth
     const ph = draftInput.offsetHeight
-    draft.w = Math.min(1, Math.max(0.05, pw / width))
+    const minW = 100 // px
+    draft.w = Math.min(1, Math.max(minW / width, pw / width))
     draft.h = Math.min(1, Math.max(0.04, ph / height))
   }
 
@@ -127,7 +128,8 @@
     const pw = el.offsetWidth
     const ph = el.offsetHeight
     const txt = el.textContent || ''
-    rectangles = rectangles.map((rr, idx) => idx === i ? { ...rr, text: txt, w: Math.min(1, Math.max(0.05, pw / width)), h: Math.min(1, Math.max(0.04, ph / height)) } : rr)
+    const minW = 100 // px
+    rectangles = rectangles.map((rr, idx) => idx === i ? { ...rr, text: txt, w: Math.min(1, Math.max(minW / width, pw / width)), h: Math.min(1, Math.max(0.04, ph / height)) } : rr)
   }
 </script>
 

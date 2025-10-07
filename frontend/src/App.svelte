@@ -41,6 +41,7 @@
   let minimapRef
   let textOverlayRef
   let showTextOverlay = false
+  let textSimilarities = {}
 
   // DIFT part selector (for UI display only)
   let diftPart = '' // e.g., '11', '12', ..., '33'
@@ -176,22 +177,28 @@
 
   function onConfirmRegion(e) {
     const { rect, text } = e.detail
-    // Demo: adjust positions of points inside rect toward its center, to trigger animation
-    const cx = rect.x + rect.w / 2
-    const cy = rect.y + rect.h / 2
-    const moved = new Set()
-    const newItems = allImages.map((it) => {
-      const inside = it.gx >= rect.x && it.gx <= rect.x + rect.w && it.gy >= rect.y && it.gy <= rect.y + rect.h
-      if (!inside) return it
-      moved.add(it.id)
-      const ax = it.gx + (cx - it.gx) * 0.25
-      const ay = it.gy + (cy - it.gy) * 0.25
-      return { ...it, gx: ax, gy: ay, x: ax, y: ay }
+    fetch(`${API_BASE}/text_force`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, rect, embed: embedSelection === 'dift_sd' ? 'clip' : embedSelection, method: 'pca', alpha: 0.25 })
+    }).then(async (res) => {
+      if (!res.ok) throw new Error('text_force failed')
+      const data = await res.json()
+      const sims = data.similarities || []
+      const coords = data.coords || []
+      const packed = data.packed || []
+      prevImages = allImages
+      allImages = allImages.map((it, idx) => ({
+        ...it,
+        x: coords[idx] ? coords[idx][0] : it.x,
+        y: coords[idx] ? coords[idx][1] : it.y,
+        gx: packed[idx] ? packed[idx][0] : it.gx,
+        gy: packed[idx] ? packed[idx][1] : it.gy,
+      }))
+      textSimilarities[text] = sims
+    }).catch((err) => {
+      console.error('text_force error', err)
     })
-    // Trigger animation: prev -> new
-    prevImages = allImages
-    allImages = newItems
-    console.log('[text-minimap] confirmRegion', rect, text, 'moved', moved.size)
   }
 </script>
 

@@ -24,6 +24,7 @@ from flask import Flask, jsonify, request, send_from_directory, abort
 from flask_cors import CORS
 
 from gallery_backend import ImageGalleryEngine
+from embeddings import EmbeddingEngine
 
 
 app = Flask(__name__)
@@ -120,6 +121,76 @@ def serve_image(relpath: str):
         return abort(404)
     return send_from_directory(directory, filename)
 
+
+@app.post('/text_force')
+def text_force():
+    """Apply an attractive force from a text region to image coordinates.
+
+    Body JSON:
+    - text: string (required)
+    - rect: { x, y, w, h } in normalized [0,1] (required)
+    - embed: embedding method for text/image space, e.g., 'clip' (default 'clip')
+    - alpha: float force strength (default 0.25)
+    - method: 'pca' or 'umap' for 2D reduction (default 'pca')
+    """
+    dataset = app.config.get('DATASET_ROOT') or str(DATASET_PATH)
+    if not dataset or not Path(dataset).exists():
+        abort(400, description='Invalid dataset path')
+    payload = request.get_json(silent=True) or {}
+    text = payload.get('text', '').strip()
+    rect = payload.get('rect') or {}
+    embed_method = (payload.get('embed') or 'clip').lower()
+    red_method = (payload.get('method') or 'pca').lower()
+    alpha = float(payload.get('alpha') or 0.25)
+    if not text or not isinstance(rect, dict) or not all(k in rect for k in ('x','y','w','h')):
+        abort(400, description='Missing text or rect')
+
+    engine = ImageGalleryEngine(dataset)
+    entries = engine.list_images()
+    if not entries:
+        abort(400, description='No images')
+
+    import numpy as np
+    # Reduce to 2D base coords from the selected embedding method
+    embs_for_layout = engine._load_embeddings_only(entries, method=embed_method)
+    if embs_for_layout is None:
+        abort(400, description=f'Embeddings not available for method {embed_method}')
+    coords2d = engine.reduce_to_2d(embs_for_layout, method=red_method)
+
+    # Always compute similarities in CLIP space to match text embedding dimension
+    embs_for_sim = engine._load_embeddings_only(entries, method='clip')
+    if embs_for_sim is None:
+        abort(400, description='CLIP embeddings not available. Precompute with --methods clip')
+    emb_engine = EmbeddingEngine(dataset)
+    tvec = emb_engine.text_embedding('clip', text)
+    if tvec is None:
+        # No-op similarities
+        sims = np.zeros((coords2d.shape[0],), dtype=np.float32)
+    else:
+        X = embs_for_sim.astype(np.float32)
+        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+        tv = tvec.astype(np.float32)
+        tv = tv / (np.linalg.norm(tv) + 1e-8)
+        sims = (Xn @ tv)
+        sims = np.maximum(0.0, sims)  # only pull, no push
+
+    # Attractive force towards rect center
+    cx = float(rect['x']) + float(rect['w']) * 0.5
+    cy = float(rect['y']) + float(rect['h']) * 0.5
+    c = np.array([cx, cy], dtype=np.float32)
+    delta = (c[None, :] - coords2d)
+    new_coords = coords2d + alpha * sims[:, None] * delta
+    new_coords = np.clip(new_coords, 0.0, 1.0)
+
+    # Optionally pack to grid for minimap display
+    packed, eff_layer = engine.pack_to_grid(new_coords, n_layer=0, n_tile=8)
+
+    return jsonify({
+        'similarities': sims.tolist(),
+        'coords': new_coords.tolist(),
+        'packed': packed.tolist(),
+        'n_layer': eff_layer,
+    })
 
 @app.post('/upload')
 def upload_image():

@@ -24,7 +24,7 @@ class CLIPEmbeddingExtractor:
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32"):
         try:
             import torch
-            from transformers import CLIPModel, CLIPImageProcessor
+            from transformers import CLIPModel, CLIPImageProcessor, CLIPTokenizer
             self.torch = torch
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model = CLIPModel.from_pretrained(
@@ -33,6 +33,7 @@ class CLIPEmbeddingExtractor:
                 local_files_only=False,
             ).to(self.device)
             self.processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
             for p in self.model.parameters():
                 p.requires_grad = False
             self.available = True
@@ -41,6 +42,7 @@ class CLIPEmbeddingExtractor:
             self.device = None
             self.model = None
             self.processor = None
+            self.tokenizer = None
             self.available = False
 
     def extract_image_embedding(self, image: Image.Image):
@@ -50,6 +52,16 @@ class CLIPEmbeddingExtractor:
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_image_features(**inputs)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        return feats.squeeze(0).detach().cpu().numpy().astype("float32")
+
+    def extract_text_embedding(self, text: str):
+        if not self.available or self.tokenizer is None:
+            raise RuntimeError("CLIPExtractor unavailable for text")
+        torch = self.torch
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            feats = self.model.get_text_features(**inputs)
         feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
@@ -316,3 +328,15 @@ class EmbeddingEngine:
         except Exception:
             pass
         return embs
+
+    def text_embedding(self, method: str, text: str) -> Optional[np.ndarray]:
+        m = (method or '').lower()
+        if m in { 'clip', 'clip-vit', 'clip32' }:
+            try:
+                extractor = CLIPEmbeddingExtractor()
+                if getattr(extractor, 'available', False):
+                    vec = extractor.extract_text_embedding(text)
+                    return vec
+            except Exception:
+                return None
+        return None
