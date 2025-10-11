@@ -123,8 +123,9 @@
     const m = new Map()
     for (const it of items) {
       const prev = prevMap.get(it.id)
-      const from = posFrom(prev || it, 'grid')
-      const to = posFrom(it, 'grid')
+      // Use original (non-grid) positions for the animated minimap
+      const from = posFrom(prev || it, 'original')
+      const to = posFrom(it, 'original')
       m.set(it.id, { id: it.id, url: it.url, from, to })
     }
     tracks = m
@@ -173,7 +174,14 @@
     y: lerp(tr.from.y, tr.to.y, tNorm)
   }))
 
+  // Filtered window items for minimap (original coords)
   $: windowItems = renderItems
+    .filter((it) => it.x >= x0 && it.x <= x1 && it.y >= y0 && it.y <= y1)
+    .map((it) => ({ ...it, lx: (it.x - x0) / viewW, ly: (it.y - y0) / viewH }))
+
+  // For the zoom overlay panel, use grid (snapped) coordinates
+  $: gridItems = (items || []).map((it) => ({ id: it.id, url: it.url, x: posFrom(it, 'grid').x, y: posFrom(it, 'grid').y }))
+  $: windowGridItems = gridItems
     .filter((it) => it.x >= x0 && it.x <= x1 && it.y >= y0 && it.y <= y1)
     .map((it) => ({ ...it, lx: (it.x - x0) / viewW, ly: (it.y - y0) / viewH }))
 </script>
@@ -244,12 +252,12 @@
     />
   {/if}
 </div>
-
+<!-- 
 {#if zoomPanel}
   <div class="mt-2">
     <div class="text-sm mb-1 text-gray-700">Zoom</div>
     <div class="relative bg-white border border-gray-200" style={`width:${zoomWidth}px;height:${zoomHeight}px;`}>
-      {#each windowItems as it (it.id)}
+      {#each windowGridItems as it (it.id)}
         <img
           alt=""
           src={it.url}
@@ -260,7 +268,7 @@
       {/each}
     </div>
   </div>
-{/if}
+{/if} -->
 
 <style>
 </style>
