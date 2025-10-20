@@ -26,10 +26,12 @@
   let clusters = []
   
   // Backend wiring
-  const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://localhost:5001'
+  // const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://127.0.0.1:5001'
+  const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://localhost:5002'
+  console.log('[frontend] API_BASE', API_BASE)
   let datasetPath = '' // leave blank to let server pick sample
   // Radio selection and effective embed method
-  let embedSelection = 'avg' // 'avg' | 'clip' | 'dino' | 'dift_sd'
+  let embedSelection = 'avg' // 'avg' | 'clip' | 'dino' | 'dift_sd' | 'text'
   let embedMethod = 'avg' // effective method sent to backend (may be dift_sd_partXY)
   let gridSize = 0
   let warningMsg = ''
@@ -45,8 +47,53 @@
   let scribbleRadius = 18
   let minimapRef
   let textOverlayRef
+  let minimapContainerRef
+  // Dynamic minimap size based on available space
+  $: minimapSize = (() => {
+    // Recompute when left pane or window resizes
+    void leftWidth; void windowWidth
+    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth || 700) : 700
+    return Math.max(300, Math.min(1200, w))
+  })()
   let showTextOverlay = false
   let textSimilarities = {}
+  // Text-driven separation layer state (persists)
+  let textLayerState = { baseEmbed: '', baseCoords: {}, coords: {}, rects: [], gridSize: 0 }
+
+  function scatterToCenter(radius = 0.06) {
+    // Randomly scatter all points around center within a small radius
+    prevImages = allImages
+    const r = Math.max(0.005, Math.min(0.2, Number(radius) || 0.06))
+    allImages = allImages.map((it) => {
+      const ang = Math.random() * Math.PI * 2
+      // sqrt for uniform density in circle
+      const rad = Math.sqrt(Math.random()) * r
+      const nx = Math.max(0, Math.min(1, 0.5 + Math.cos(ang) * rad))
+      const ny = Math.max(0, Math.min(1, 0.5 + Math.sin(ang) * rad))
+      return { ...it, x: nx, y: ny }
+    })
+    // Persist scattered coords into text layer state
+    const next = {}
+    for (const it of allImages) next[it.id] = [it.x, it.y]
+    textLayerState = { ...textLayerState, coords: next }
+  }
+
+  function ensureTextBase() {
+    if (Object.keys(textLayerState.baseCoords || {}).length > 0) return
+    const baseCoords = {}
+    for (const it of allImages) baseCoords[it.id] = [it.x, it.y]
+    textLayerState = { ...textLayerState, baseCoords, ids: allImages.map(it => it.id) }
+  }
+
+  function applyTextCoordsFromState() {
+    if (!textLayerState || !textLayerState.coords) return
+    const map = textLayerState.coords
+    prevImages = allImages
+    allImages = allImages.map((it) => {
+      const c = map[it.id]
+      return c ? { ...it, x: Number(c[0]), y: Number(c[1]) } : it
+    })
+  }
   // Split pane state
   let leftWidth = 760
   let dragging = false
@@ -134,6 +181,7 @@
     if (m === 'clip') return 'Content'
     if (m === 'dino') return 'Global composition'
     if (m === 'dift_sd') return 'Local composition'
+    if (m === 'text') return 'Text'
     if (m.startsWith('dift_sd_part')) return `Local composition ${m.replace('dift_sd_part','part ')}`
     return m
   }
@@ -146,6 +194,10 @@
   let composerLoadChain = null
 
   function currentMethodLabel() {
+    // In Text mode, reflect the base embedding, not 'text'
+    if (embedSelection === 'text') {
+      return (textLayerState.baseEmbed && String(textLayerState.baseEmbed)) || (embedMethod || 'clip')
+    }
     // Prefer effective embedMethod which includes dift part when applicable
     return embedMethod || (embedSelection === 'dift_sd' && diftPart ? `dift_sd_part${diftPart}` : embedSelection)
   }
@@ -255,10 +307,21 @@
     selected = new Set(ids)
   }
 
+  const THUMB_SIZE = 200
+  function toThumbUrl(u) {
+    if (!u) return ''
+    // Map '/images/rel' -> `/thumb/<THUMB_SIZE>/rel`
+    if (u.startsWith('/images/')) {
+      return `/thumb/${THUMB_SIZE}${u.substring('/images'.length)}`
+    }
+    return u
+  }
   function prefixUrl(u) {
     if (!u) return ''
     if (u.startsWith('http://') || u.startsWith('https://')) return u
-    if (u.startsWith('/')) return API_BASE + u
+    // Prefer thumbnails for local image paths
+    const maybeThumb = toThumbUrl(u)
+    if (maybeThumb.startsWith('/')) return API_BASE + maybeThumb
     return u
   }
 
@@ -333,6 +396,11 @@
         const parsedC = JSON.parse(rawComb)
         if (Array.isArray(parsedC)) combinedConcepts = parsedC
       }
+      const rawText = localStorage.getItem('promptherder.textlayer')
+      if (rawText) {
+        const parsedT = JSON.parse(rawText)
+        if (parsedT && typeof parsedT === 'object') textLayerState = parsedT
+      }
     } catch (e) { /* ignore */ }
     loadGallery()
   })
@@ -344,6 +412,10 @@
     try { localStorage.setItem('promptherder.combined', JSON.stringify(c)) } catch (_) {}
   })(combinedConcepts)
 
+  $: (function persistTextLayer(s) {
+    try { localStorage.setItem('promptherder.textlayer', JSON.stringify(s)) } catch (_) {}
+  })(textLayerState)
+
   function onEmbedChange() {
     // Compute effective method; if DIFT selected without part, don't fetch yet
     if (embedSelection === 'dift_sd' && !diftPart) {
@@ -352,8 +424,26 @@
       return
     }
     warningMsg = ''
-    embedMethod = embedSelection === 'dift_sd' ? `dift_sd_part${diftPart}` : embedSelection
-    loadGallery()
+    // Do not set embedMethod to 'text'; preserve last non-text embedding
+    if (embedSelection === 'dift_sd') {
+      embedMethod = `dift_sd_part${diftPart}`
+    } else if (embedSelection !== 'text') {
+      embedMethod = embedSelection
+    }
+    if (embedSelection === 'text') {
+      // Enter text layer: disable scribble, set base if missing, and apply/preset coords
+      scribbleEnabled = false
+      if (!(textLayerState && Object.keys(textLayerState.baseCoords||{}).length > 0)) {
+        scatterToCenter(0.06)
+        // After scatter, set the base to the scattered positions
+        ensureTextBase()
+      } else if (textLayerState && Object.keys(textLayerState.coords||{}).length > 0) {
+        applyTextCoordsFromState()
+      }
+    } else {
+      // Switching to a normal embed; reload gallery
+      loadGallery()
+    }
   }
 
   function onScribbleLabel(e) {
@@ -373,27 +463,56 @@
 
   function onConfirmRegion(e) {
     const { rect, text } = e.detail
-    fetch(`${API_BASE}/text_force`, {
+    // Update saved rectangles for persistence
+    const nextRects = Array.isArray(textLayerState.rects) ? [...textLayerState.rects] : []
+    nextRects.push({ ...rect, text })
+    // Build ids and base coords array based on initial scattered base
+    const ids = (textLayerState.ids && Array.isArray(textLayerState.ids) && textLayerState.ids.length === allImages.length)
+      ? textLayerState.ids
+      : allImages.map(it => it.id)
+    const baseCoordsArr = ids.map(id => {
+      const bc = textLayerState.baseCoords?.[id]
+      return Array.isArray(bc) ? [Number(bc[0]), Number(bc[1])] : [0.5, 0.5]
+    })
+    fetch(`${API_BASE}/text_forces`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, rect, embed: embedSelection === 'dift_sd' ? 'clip' : embedSelection, method: 'pca', alpha: 0.25 })
+      body: JSON.stringify({
+        texts: nextRects.map(r => ({ text: r.text, rect: { x: r.x, y: r.y, w: r.w, h: r.h } })),
+        ids,
+        base_coords: baseCoordsArr,
+        embed: 'clip',
+        method: 'pca',
+        alpha: 0.35
+      })
     }).then(async (res) => {
-      if (!res.ok) throw new Error('text_force failed')
+      if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
-      const sims = data.similarities || []
       const coords = data.coords || []
       const packed = data.packed || []
+      const nlayer = Number(data.n_layer || gridSize)
+      const idOrder = Array.isArray(data.ids) ? data.ids : ids
+      // Update coords map according to returned order
+      const nextMap = {}
+      for (let i = 0; i < idOrder.length; i++) {
+        const id = idOrder[i]
+        const c = coords[i]
+        if (Array.isArray(c) && c.length >= 2) nextMap[id] = [Number(c[0]), Number(c[1])]
+      }
+      textLayerState = { ...textLayerState, rects: nextRects, coords: nextMap }
+      // Apply to visible items
       prevImages = allImages
+      const posById = new Map(Object.entries(nextMap))
       allImages = allImages.map((it, idx) => ({
         ...it,
-        x: coords[idx] ? coords[idx][0] : it.x,
-        y: coords[idx] ? coords[idx][1] : it.y,
+        x: posById.has(it.id) ? Number(posById.get(it.id)[0]) : it.x,
+        y: posById.has(it.id) ? Number(posById.get(it.id)[1]) : it.y,
         gx: packed[idx] ? packed[idx][0] : it.gx,
         gy: packed[idx] ? packed[idx][1] : it.gy,
       }))
-      textSimilarities[text] = sims
+      gridSize = nlayer
     }).catch((err) => {
-      console.error('text_force error', err)
+      console.error('text_forces error', err)
     })
   }
 </script>
@@ -467,10 +586,10 @@
         <div class="text-sm mb-1">Image-part selection</div>
         <DiftPartSelector on:select={(e) => { diftPart = e.detail.part; embedMethod = `dift_sd_part${diftPart}`; embedSelection = 'dift_sd'; loadGallery(); }} selected={diftPart} />
       {/if}
-      <div class="relative" style="width:700px;height:700px;">
+      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:${minimapSize}px;`}>
         <!-- Method selection inside minimap -->
         <div class="absolute top-1 left-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
-          {#each ['avg','clip','dino','dift_sd'] as m}
+          {#each ['avg','clip','dino','dift_sd','text'] as m}
             <label class="inline-flex items-center gap-1 cursor-pointer">
               <input type="radio" name="embed" value={m} bind:group={embedSelection} on:change={onEmbedChange} />
               <span class="inline-flex items-center gap-1">
@@ -478,17 +597,28 @@
                 {#if m==='clip'}<span class="i-heroicons-command-line" />{/if}
                 {#if m==='dino'}<span class="i-heroicons-cube-transparent" />{/if}
                 {#if m==='dift_sd'}<span class="i-heroicons-rectangle-stack" />{/if}
+                {#if m==='text'}<span class="i-heroicons-chat-bubble-left-right" />{/if}
                 {methodAlias(m)}
               </span>
             </label>
           {/each}
         </div>
-        {#if scribbleEnabled}
+        {#if embedSelection === 'text'}
+          <div class="absolute top-1 right-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
+            <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={async () => { showTextOverlay = true; await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() }}>
+              <span class="i-heroicons-rectangle-group" /> Add text
+            </button>
+            <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={() => { scatterToCenter(0.06) }}>
+              <span class="i-heroicons-arrow-path" /> Reset
+            </button>
+          </div>
+        {/if}
+        {#if scribbleEnabled && embedSelection !== 'text'}
           <AnimatedMinimap
             items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
             prevItems={prevImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={700}
-            height={700}
+            width={minimapSize}
+            height={minimapSize}
             gridSize={gridSize}
             bind:this={minimapRef}
             enableScribble={scribbleEnabled}
@@ -500,21 +630,22 @@
         {:else}
           <HoverGridMinimap
             items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={700}
-            height={700}
+            width={minimapSize}
+            height={minimapSize}
             gridSize={gridSize}
             viewFrac={0.35}
             experimentalLocalPacking={true}
           />
         {/if}
-        <!-- {#if showTextOverlay}
+        {#if embedSelection === 'text' && showTextOverlay}
           <MinimapTextOverlay
             bind:this={textOverlayRef}
-            width={700}
-            height={700}
+            width={minimapSize}
+            height={minimapSize}
+            rectangles={textLayerState.rects}
             on:confirmRegion={onConfirmRegion}
           />
-        {/if} -->
+        {/if}
       </div>
       <div class="mt-2 text-xs text-gray-600">Positive: {goodCount} • Negative: {badCount}</div>
 

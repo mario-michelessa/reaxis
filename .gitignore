@@ -1,4 +1,4 @@
 backend/uploads
 backend/__pycache__
-data/datasets
 frontend/node_modules
+data/*

@@ -235,6 +235,30 @@
 
   // lastPosMap is updated inside the RAF loop to avoid cycles
 
+  // Compute backdrop bounds sized to the currently gridded images (using rendered positions and inside size)
+  function clamp01(v) { return Math.max(0, Math.min(1, v)) }
+  $: gridBackdrop = (function computeBackdrop(active, list, insideSet, sizePx, wPx, hPx) {
+    if (!active || !Array.isArray(list) || list.length === 0) return null
+    const halfWn = (sizePx / Math.max(1, wPx)) / 2
+    const halfHn = (sizePx / Math.max(1, hPx)) / 2
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity
+    let count = 0
+    for (const it of list) {
+      if (!insideSet.has(it.id)) continue
+      count++
+      if (it.x < minx) minx = it.x
+      if (it.y < miny) miny = it.y
+      if (it.x > maxx) maxx = it.x
+      if (it.y > maxy) maxy = it.y
+    }
+    if (count === 0 || !isFinite(minx)) return null
+    const x0b = clamp01(minx - halfWn)
+    const y0b = clamp01(miny - halfHn)
+    const x1b = clamp01(maxx + halfWn)
+    const y1b = clamp01(maxy + halfHn)
+    return { x0: x0b, y0: y0b, w: Math.max(0, x1b - x0b), h: Math.max(0, y1b - y0b) }
+  })(griddingActive, renderItems, insideIds, sizeInside, width, height)
+
   // Picking logic: click to activate gridding when clicking an image; click empty to clear
   function pickOrToggle(e) {
     const rect = e.currentTarget.getBoundingClientRect()
@@ -284,6 +308,13 @@
   on:mousemove={onMove}
   on:click|stopPropagation={(e) => pickOrToggle(e)}
 >
+  {#if griddingActive && gridBackdrop}
+    <!-- Subtle gray background sized to bounding box of gridded images -->
+    <div
+      class="absolute pointer-events-none rounded"
+      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(148,163,184,0.14);z-index:5;`}
+    />
+  {/if}
   {#each renderItems as it (it.id)}
     <img
       alt=""

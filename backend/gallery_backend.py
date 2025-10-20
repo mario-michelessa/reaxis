@@ -112,20 +112,21 @@ class ImageGalleryEngine:
             if {'paths', 'embeddings'}.issubset(set(data.files)):
                 print(f"[emb] found full format with paths/embeddings")
                 # Compare by image id (class/filename) only, not absolute paths
-                current_ids = np.array([e.id for e in entries])
-                cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
-                ids_match = len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids)
-                print(f"[emb] validation results - ids match: {ids_match}")
-                if ids_match:
+                # Get absolute paths from entries
+                current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
+                cached_paths = np.array([str(Path(p).resolve()) for p in data['paths']])
+                paths_match = len(cached_paths) == len(current_paths) and np.all(cached_paths == current_paths)
+                print(f"[emb] validation results - paths match: {paths_match}")
+                if paths_match:
                     embs = data['embeddings']
-                    print(f"[emb] ids match, embeddings shape={embs.shape}")
+                    print(f"[emb] paths match, embeddings shape={embs.shape}")
                     if embs.ndim == 2 and embs.shape[0] == len(entries):
                         print(f"[emb] returning full format embeddings")
                         return embs
                     else:
                         print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
                 else:
-                    print(f"[emb] cache validation failed for full format (ids mismatch)")
+                    print(f"[emb] cache validation failed for full format (paths mismatch)")
         except Exception:
             print(f"[emb] failed to load/validate cache: {cache}")
             return None

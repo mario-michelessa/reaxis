@@ -37,14 +37,23 @@
   // Per-concept projection cache: method -> [{id,url,x,y}]
   let methodCache = new Map()
   let loading = new Set()
+  const THUMB_SIZE = 200
+  function toThumbUrl(u) {
+    if (!u) return ''
+    if (u.startsWith('/images/')) return `/thumb/${THUMB_SIZE}${u.substring('/images'.length)}`
+    return u
+  }
   function prefixUrl(u) {
     if (!u) return ''
     if (u.startsWith('http://') || u.startsWith('https://')) return u
-    if (u.startsWith('/')) return (apiBase || '') + u
+    const maybeThumb = toThumbUrl(u)
+    if (maybeThumb.startsWith('/')) return (apiBase || '') + maybeThumb
     return u
   }
   async function fetchItemsForMethod(method) {
     if (!method || methodCache.has(method) || loading.has(method)) return
+    // 'text' is a frontend-only view; do not fetch from backend
+    if (method === 'text') { methodCache.set('text', items2d || []); return }
     loading.add(method)
     try {
       try { console.log('[ConceptComposer] fetch start', { method }) } catch(_) {}

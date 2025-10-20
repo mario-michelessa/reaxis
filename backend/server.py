@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from flask import Flask, jsonify, request, send_from_directory, abort
+from PIL import Image
+import io
 from flask_cors import CORS
 
 from gallery_backend import ImageGalleryEngine
@@ -32,7 +34,7 @@ CORS(app)
 
 # Configure your dataset root here. Set this to your images root folder.
 # Example: DATASET_PATH = Path('/data/my_images')
-DATASET_PATH = Path('../data/datasets/CUB')
+DATASET_PATH = Path('../data/datasets/ISIC2017/')
 # Keep the currently active dataset root for serving images
 app.config['DATASET_ROOT'] = str(DATASET_PATH.resolve()) if DATASET_PATH.exists() else None
 print(f'Using DATASET_PATH: {DATASET_PATH}, exists: {DATASET_PATH.exists()}, length: {len(list(DATASET_PATH.rglob("*")))}')
@@ -49,6 +51,9 @@ def gallery() -> Any:
     dataset = str(DATASET_PATH)
     method = request.args.get('method', 'pca').lower()
     embed_method = request.args.get('embed', 'avg').lower()
+    # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
+    if embed_method == 'text':
+        embed_method = 'clip'
 
     print("[gallery] start",
           f"dataset={dataset}",
@@ -122,6 +127,66 @@ def serve_image(relpath: str):
     return send_from_directory(directory, filename)
 
 
+@app.get('/thumb/<int:size>/<path:relpath>')
+def serve_thumbnail(size: int, relpath: str):
+    """Serve or generate a cached thumbnail sized to fit within size x size.
+
+    Thumbnails are cached under <DATASET_ROOT>/.cache/thumbs/<size>/<relpath>.jpg
+    """
+    dataset_root = app.config.get('DATASET_ROOT')
+    if not dataset_root:
+        return abort(400, description='Dataset root not set. Call /gallery.json first with a valid dataset.')
+    if size <= 0 or size > 2048:
+        return abort(400, description='Invalid size')
+    root = Path(dataset_root).resolve()
+    src = (root / relpath).resolve()
+    if root not in src.parents and root != src:
+        return abort(403)
+    if not src.exists():
+        return abort(404)
+
+    cache_dir = root / '.cache' / 'thumbs' / str(size) / Path(relpath).parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / (Path(relpath).stem + '.jpg')
+
+    try:
+        if not cache_file.exists() or cache_file.stat().st_mtime < src.stat().st_mtime:
+            # Generate thumb
+            with Image.open(str(src)) as im:
+                # Convert to RGB (flatten alpha on white background)
+                if im.mode in ('RGBA', 'LA'):
+                    bg = Image.new('RGB', im.size, (255, 255, 255))
+                    alpha = im.split()[-1]
+                    bg.paste(im, mask=alpha)
+                    im = bg
+                elif im.mode != 'RGB':
+                    im = im.convert('RGB')
+                im.thumbnail((size, size), Image.Resampling.LANCZOS)
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                im.save(str(cache_file), format='JPEG', quality=85, optimize=True, progressive=True)
+    except Exception as e:
+        # As a fallback, try to stream a resized image without caching
+        try:
+            with Image.open(str(src)) as im:
+                if im.mode in ('RGBA', 'LA'):
+                    bg = Image.new('RGB', im.size, (255, 255, 255))
+                    alpha = im.split()[-1]
+                    bg.paste(im, mask=alpha)
+                    im = bg
+                elif im.mode != 'RGB':
+                    im = im.convert('RGB')
+                im.thumbnail((size, size), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, format='JPEG', quality=85, optimize=True, progressive=True)
+                buf.seek(0)
+                from flask import send_file
+                return send_file(buf, mimetype='image/jpeg')
+        except Exception:
+            return abort(500, description=f'Failed to generate thumbnail: {e}')
+
+    return send_from_directory(str(cache_file.parent), cache_file.name)
+
+
 @app.post('/text_force')
 def text_force():
     """Apply an attractive force from a text region to image coordinates.
@@ -187,6 +252,112 @@ def text_force():
 
     return jsonify({
         'similarities': sims.tolist(),
+        'coords': new_coords.tolist(),
+        'packed': packed.tolist(),
+        'n_layer': eff_layer,
+    })
+
+
+@app.post('/text_forces')
+def text_forces():
+    """Apply attraction from multiple text labels to image coordinates.
+
+    Body JSON:
+    - texts: [{ text: str, rect: {x,y,w,h} }]
+    - ids: [str] optional — order of images in base_coords and desired output order
+    - base_coords: [[x,y], ...] optional — initial positions; if missing, uses 2D coords from embed
+    - embed: embedding method for similarity space (default 'clip')
+    - alpha: float force scale (default 0.25)
+    - method: dimensionality reduction method for fallback base coords (default 'pca')
+    """
+    dataset = app.config.get('DATASET_ROOT') or str(DATASET_PATH)
+    if not dataset or not Path(dataset).exists():
+        abort(400, description='Invalid dataset path')
+    payload = request.get_json(silent=True) or {}
+    texts = payload.get('texts') or []
+    ids = payload.get('ids') or []
+    base_coords = payload.get('base_coords')
+    embed_method = (payload.get('embed') or 'clip').lower()
+    red_method = (payload.get('method') or 'pca').lower()
+    alpha = float(payload.get('alpha') or 0.25)
+    if (not isinstance(texts, list)) or len(texts) == 0:
+        abort(400, description='Missing texts array')
+
+    engine = ImageGalleryEngine(dataset)
+    entries = engine.list_images()
+    if not entries:
+        abort(400, description='No images')
+
+    # Build id -> index map for ordering
+    id_to_idx = {e.id: i for i, e in enumerate(entries)}
+    if ids and not isinstance(ids, list):
+        abort(400, description='ids must be a list')
+    order = [id_to_idx.get(i) for i in ids] if ids else list(range(len(entries)))
+    if ids and any(o is None for o in order):
+        abort(400, description='Some ids not found in dataset')
+
+    import numpy as np
+    # Base coordinates
+    if isinstance(base_coords, list) and len(base_coords) == len(order):
+        base = np.array(base_coords, dtype=np.float32)
+        if base.ndim != 2 or base.shape[1] != 2:
+            abort(400, description='base_coords must be Nx2')
+    else:
+        # Fallback: compute base from selected embedding
+        embs_for_layout = engine._load_embeddings_only(entries, method=embed_method)
+        if embs_for_layout is None:
+            abort(400, description=f'Embeddings not available for method {embed_method}')
+        coords2d = engine.reduce_to_2d(embs_for_layout, method=red_method)
+        base = coords2d[order, :].astype(np.float32)
+
+    # Similarities in CLIP space (or chosen embed method if desired)
+    embs_for_sim = engine._load_embeddings_only(entries, method='clip')
+    if embs_for_sim is None:
+        abort(400, description='CLIP embeddings not available. Precompute with --methods clip')
+    emb_engine = EmbeddingEngine(dataset)
+    X = embs_for_sim.astype(np.float32)
+    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+
+    # Compute per-text normalized similarities and aggregate force
+    accum = np.zeros_like(base, dtype=np.float32)  # Nx2
+    out_sims = []
+    for t in texts:
+        txt = (t.get('text') or '').strip()
+        rect = t.get('rect') or {}
+        if not txt or not all(k in rect for k in ('x','y','w','h')):
+            # Skip invalid entries
+            out_sims.append([0.0] * len(order))
+            continue
+        tvec = emb_engine.text_embedding('clip', txt)
+        if tvec is None:
+            sims = np.zeros((len(entries),), dtype=np.float32)
+        else:
+            tv = tvec.astype(np.float32)
+            tv = tv / (np.linalg.norm(tv) + 1e-8)
+            sims = (Xn @ tv)
+        # Reorder to requested order
+        sims_ord = sims[order]
+        # Normalize to [0,1] across dataset for this text
+        smin = float(np.min(sims_ord))
+        smax = float(np.max(sims_ord))
+        denom = (smax - smin) if (smax - smin) > 1e-8 else 1.0
+        s_norm = (sims_ord - smin) / denom
+        out_sims.append(s_norm.tolist())
+        # Attraction to rect center
+        cx = float(rect['x']) + float(rect['w']) * 0.5
+        cy = float(rect['y']) + float(rect['h']) * 0.5
+        c = np.array([cx, cy], dtype=np.float32)[None, :]
+        delta = (c - base)
+        accum += (s_norm[:, None].astype(np.float32)) * delta
+
+    new_coords = base + alpha * accum
+    new_coords = np.clip(new_coords, 0.0, 1.0)
+
+    # Pack to grid for minimap display (optional use on frontend)
+    packed, eff_layer = engine.pack_to_grid(new_coords, n_layer=0, n_tile=8)
+    return jsonify({
+        'ids': ids if ids else [entries[i].id for i in order],
+        'similarities': out_sims,  # list per text
         'coords': new_coords.tolist(),
         'packed': packed.tolist(),
         'n_layer': eff_layer,

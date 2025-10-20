@@ -12,6 +12,16 @@ from PIL import Image
 
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
 
+def split_emb(emb, n_parts=4):
+    """Split embeddings into n_parts parts."""
+    size = emb.shape[2]
+    part_size = size // n_parts
+    parts = np.zeros((emb.shape[0], emb.shape[1], n_parts, n_parts), dtype=emb.dtype)
+    for i in range(n_parts):
+        for j in range(n_parts):
+            emb_slice = emb[:, :, i*part_size:(i+1)*part_size, j*part_size:(j+1)*part_size]
+            parts[:, :, i, j] = np.mean(emb_slice, axis=(2, 3))
+    return parts
 
 @dataclass
 class ImageEntry:
@@ -22,28 +32,20 @@ class ImageEntry:
 
 class CLIPEmbeddingExtractor:
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32"):
-        try:
-            import torch
-            from transformers import CLIPModel, CLIPImageProcessor, CLIPTokenizer
-            self.torch = torch
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model = CLIPModel.from_pretrained(
-                clip_model_name,
-                use_safetensors=True,
-                local_files_only=False,
-            ).to(self.device)
-            self.processor = CLIPImageProcessor.from_pretrained(clip_model_name)
-            self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
-            for p in self.model.parameters():
-                p.requires_grad = False
-            self.available = True
-        except Exception:
-            self.torch = None
-            self.device = None
-            self.model = None
-            self.processor = None
-            self.tokenizer = None
-            self.available = False
+        import torch
+        from transformers import CLIPModel, CLIPImageProcessor, CLIPTokenizer
+        self.torch = torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = CLIPModel.from_pretrained(
+            clip_model_name,
+            use_safetensors=True,
+            local_files_only=False,
+        ).to(self.device)
+        self.processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+        self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.available = True
 
     def extract_image_embedding(self, image: Image.Image):
         if not self.available:
@@ -68,34 +70,17 @@ class CLIPEmbeddingExtractor:
 
 class DINOEmbeddingExtractor:
     def __init__(self):
-        try:
-            import torch
-            self.torch = torch
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model = None
-            self.preprocess = None
-            try:
-                import timm
-                self.model = timm.create_model('vit_small_patch16_224.dino', pretrained=True)
-                self.model.eval().to(self.device)
-                self.preprocess = self._make_preprocess(224)
-            except Exception:
-                try:
-                    self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
-                    self.model.eval().to(self.device)
-                    self.preprocess = self._make_preprocess(224)
-                except Exception:
-                    self.available = False
-                    return
-            for p in self.model.parameters():
-                p.requires_grad = False
-            self.available = True
-        except Exception:
-            self.torch = None
-            self.device = None
-            self.model = None
-            self.preprocess = None
-            self.available = False
+        import torch
+        self.torch = torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.preprocess = None
+        self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
+        self.model.eval().to(self.device)
+        self.preprocess = self._make_preprocess(224)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.available = True
 
     def _make_preprocess(self, size: int):
         from torchvision import transforms
@@ -135,26 +120,36 @@ class EmbeddingEngine:
 
     def list_images(self) -> List[ImageEntry]:
         entries: List[ImageEntry] = []
-        for root, _, files in os.walk(self.dataset_path):
-            for fname in files:
-                ext = Path(fname).suffix.lower()
+        # Only process files in the immediate subdirectories (no recursion)
+        for file_path in os.listdir(self.dataset_path):
+            file_path = self.dataset_path / file_path
+            if file_path.is_file():
+                ext = Path(file_path).suffix.lower()
+                basename = Path(file_path).name
                 if ext in SUPPORTED_FORMATS:
-                    fpath = Path(root) / fname
-                    class_name = Path(root).name
-                    img_id = f"{class_name}/{fname}"
-                    entries.append(ImageEntry(id=img_id, path=str(fpath), class_name=class_name))
+                    entries.append(ImageEntry(id=basename, path=str(file_path), class_name=''))
         return sorted(entries, key=lambda e: e.id)
+    
+    # def list_images(self) -> List[ImageEntry]:
+    #     entries: List[ImageEntry] = []
+    #     for root, _, files in os.walk(self.dataset_path):
+    #         for fname in files:
+    #             ext = Path(fname).suffix.lower()
+    #             if ext in SUPPORTED_FORMATS:
+    #                 fpath = Path(root) / fname
+    #                 class_name = Path(root).name
+    #                 img_id = f"{class_name}/{fname}"
+    #                 entries.append(ImageEntry(id=img_id, path=str(fpath), class_name=class_name))
+    #     return sorted(entries, key=lambda e: e.id)
 
     def estimate_embeddings(self, images: Sequence[ImageEntry],
                             method: str = "avg",
                             resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
         method_l = method.lower()
         if method_l in {"clip", "clip-vit", "clip32"}:
-            vecs = self._extract_with_local_clip(images)
-            if vecs is None:
-                extractor = CLIPEmbeddingExtractor()
-                if getattr(extractor, 'available', False):
-                    return self._extract_with_extractor(images, extractor, fallback_dim=512)
+            extractor = CLIPEmbeddingExtractor()
+            if getattr(extractor, 'available', False):
+                return self._extract_with_extractor(images, extractor, fallback_dim=512)
             method_l = "avg"
         elif method_l in {"dino", "dino-vit"}:
             vecs = self._extract_with_local_dino(images)
@@ -172,120 +167,63 @@ class EmbeddingEngine:
             method_l = "avg"
         embs = []
         for e in images:
-            try:
-                with Image.open(e.path) as img:
-                    img = img.convert('RGB')
-                    img = img.resize(resize, Image.Resampling.LANCZOS)
-                    arr = np.asarray(img).astype(np.float32) / 255.0
-                    embs.append(arr.reshape(-1))
-            except Exception:
-                embs.append(np.zeros((resize[0] * resize[1] * 3,), dtype=np.float32))
+            with Image.open(e.path) as img:
+                img = img.convert('RGB')
+                img = img.resize(resize, Image.Resampling.LANCZOS)
+                arr = np.asarray(img).astype(np.float32) / 255.0
+                embs.append(arr.reshape(-1))
         return np.vstack(embs)
 
-    def _extract_with_local_dift(self, images: Sequence[ImageEntry]) -> Optional[np.ndarray]:
+    def _extract_with_local_dift(self, images: Sequence[ImageEntry], n_parts: Optional[int]=3) -> Optional[np.ndarray]:
         """Extract DIFT features by calling dift_sd.create_feature on file list, then pool.
 
         Expects dift_sd.create_feature(filelist, prompt) to return (ft, imglist) where
-        ft is a torch tensor shaped [N, C, H, W]. We global-average-pool to [N, C]
+        ft is a torch tensor shaped [N, C, H, W]. We global-average-pool to [N, C] on n_parts x n_parts regions,
         and L2-normalize per vector.
         """
-        try:
-            import torch
-            from dift_sd import create_feature, SDFeaturizer  # type: ignore
-            filelist = [str(e.path) for e in images]
-            # Use an empty or neutral prompt; dift_sd.create_feature should decide exact usage
-            prompt = ''
-            extractor = SDFeaturizer()
-            ft = create_feature(extractor, filelist, prompt)
-            print("DIFT feature shape:", ft.shape)
-            return ft.detach().cpu().numpy().astype('float32')
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            print("Error extracting DIFT features")
-            return None
-
-    def _extract_with_local_clip(self, images: Sequence[ImageEntry]) -> Optional[np.ndarray]:
-        try:
-            import clip as local_clip  # type: ignore
-            import torch
-            from torchvision import transforms
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            feat = local_clip.CLIPFeaturizer()
-            try:
-                n_blocks = len(feat.clip_model.transformer.resblocks)
-                block_index = n_blocks - 1
-            except Exception:
-                block_index = 0
-            tfm = transforms.Compose([
-                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-            ])
-            vecs = []
-            for e in images:
-                try:
-                    with Image.open(e.path) as im:
-                        x = tfm(im.convert('RGB')).unsqueeze(0)
-                        x = x.to(device)
-                        feats = feat.forward(x, block_index=block_index)
-                        v = feats.mean(dim=(2, 3)).squeeze(0)
-                        v = v / (v.norm() + 1e-8)
-                        vecs.append(v.detach().cpu().numpy().astype('float32'))
-                except Exception:
-                    if vecs:
-                        vecs.append(np.zeros_like(vecs[0]))
-                    else:
-                        vecs.append(np.zeros((512,), dtype=np.float32))
-            return np.vstack(vecs)
-        except Exception:
-            return None
+        import torch
+        from dift_sd import create_feature, SDFeaturizer  # type: ignore
+        filelist = [str(e.path) for e in images]
+        # Use an empty or neutral prompt; dift_sd.create_feature should decide exact usage
+        prompt = ''
+        extractor = SDFeaturizer()
+        ft = create_feature(extractor, filelist, prompt)
+        print("DIFT feature shape:", ft.shape)
+        ft =  ft.detach().cpu().numpy().astype('float32')
+        parts = split_emb(ft, n_parts=n_parts)
+        print("DIFT split parts shape:", parts.shape)
+        return parts
 
     def _extract_with_local_dino(self, images: Sequence[ImageEntry]) -> Optional[np.ndarray]:
-        try:
-            from dino import DINOFeaturizer  # type: ignore
-            import torch
-            from torchvision import transforms
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            feat = DINOFeaturizer()
-            tfm = transforms.Compose([
-                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ])
-            vecs = []
-            for e in images:
-                try:
-                    with Image.open(e.path) as im:
-                        x = tfm(im.convert('RGB')).unsqueeze(0).to(device)
-                        feats = feat.forward(x, block_index=0)
-                        v = feats.mean(dim=(2, 3)).squeeze(0)
-                        v = v / (v.norm() + 1e-8)
-                        vecs.append(v.detach().cpu().numpy().astype('float32'))
-                except Exception:
-                    if vecs:
-                        vecs.append(np.zeros_like(vecs[0]))
-                    else:
-                        vecs.append(np.zeros((384,), dtype=np.float32))
-            return np.vstack(vecs)
-        except Exception:
-            return None
+        from dino import DINOFeaturizer  # type: ignore
+        import torch
+        from torchvision import transforms
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        feat = DINOFeaturizer()
+        tfm = transforms.Compose([
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+        vecs = []
+        for e in images:
+            with Image.open(e.path) as im:
+                x = tfm(im.convert('RGB')).unsqueeze(0).to(device)
+                feats = feat.forward(x, block_index=0)
+                v = feats.mean(dim=(2, 3)).squeeze(0)
+                v = v / (v.norm() + 1e-8)
+                vecs.append(v.detach().cpu().numpy().astype('float32'))
+        return np.vstack(vecs)
 
 
     def _extract_with_extractor(self, images: Sequence[ImageEntry], extractor, fallback_dim: int) -> np.ndarray:
         embs = []
         for e in images:
-            try:
-                with Image.open(e.path) as img:
-                    img = img.convert('RGB')
-                    vec = extractor.extract_image_embedding(img)
-                    embs.append(vec)
-            except Exception:
-                if embs:
-                    embs.append(np.zeros_like(embs[0]))
-                else:
-                    embs.append(np.zeros((fallback_dim,), dtype=np.float32))
+            with Image.open(e.path) as img:
+                img = img.convert('RGB')
+                vec = extractor.extract_image_embedding(img)
+                embs.append(vec)
         return np.vstack(embs)
 
     def _cache_dir(self) -> Path:
@@ -297,46 +235,39 @@ class EmbeddingEngine:
         cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
         if not cache.exists():
             return None
-        try:
-            data = np.load(cache, allow_pickle=False)
-            # Minimal only-embeddings format
-            if 'embeddings' in data.files and 'paths' not in data.files:
-                arr = data['embeddings']
-                if arr.ndim == 2 and arr.shape[0] == len(entries):
-                    return arr
-                return None
-            # Full format: compare ids (class/filename) only
-            if {'paths', 'embeddings'}.issubset(set(data.files)):
-                current_ids = np.array([e.id for e in entries])
-                cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
-                if len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids):
-                    embs = data['embeddings']
-                    if embs.ndim == 2 and embs.shape[0] == len(entries):
-                        return embs
-        except Exception:
+        data = np.load(cache, allow_pickle=False)
+        # Minimal only-embeddings format
+        if 'embeddings' in data.files and 'paths' not in data.files:
+            arr = data['embeddings']
+            if arr.ndim == 2 and arr.shape[0] == len(entries):
+                return arr
             return None
+        # Full format: compare ids (class/filename) only
+        if {'paths', 'embeddings'}.issubset(set(data.files)):
+            current_ids = np.array([e.id for e in entries])
+            cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
+            if len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids):
+                embs = data['embeddings']
+                if embs.ndim == 2 and embs.shape[0] == len(entries):
+                    return embs
         return None
 
     def compute_and_cache_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
         embs = self.estimate_embeddings(entries, method=method)
-        try:
-            import numpy as np
-            cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
-            paths = np.array([e.path for e in entries])
-            mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
-            np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
-        except Exception:
-            pass
+        import numpy as np
+        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        paths = np.array([e.path for e in entries])
+        mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
+        np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
         return embs
 
     def text_embedding(self, method: str, text: str) -> Optional[np.ndarray]:
         m = (method or '').lower()
         if m in { 'clip', 'clip-vit', 'clip32' }:
-            try:
-                extractor = CLIPEmbeddingExtractor()
-                if getattr(extractor, 'available', False):
-                    vec = extractor.extract_text_embedding(text)
-                    return vec
-            except Exception:
-                return None
+            extractor = CLIPEmbeddingExtractor()
+            if getattr(extractor, 'available', False):
+                vec = extractor.extract_text_embedding(text)
+                return vec
         return None
+
+

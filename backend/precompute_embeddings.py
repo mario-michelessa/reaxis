@@ -6,10 +6,9 @@ from pathlib import Path
 from embeddings import EmbeddingEngine
 
 
-# DEFAULT_METHODS = ["avg", "clip", "dino", "dift_sd"]
-DEFAULT_METHODS = ["dift_sd"]
+DEFAULT_METHODS = ["avg", "clip", "dino",]
+# DEFAULT_METHODS = ["dift_sd"]
 DATASETS_DIR = Path(__file__).parent.parent / "data" / "datasets"
-OUTPUT_DIR = Path(__file__).parent.parent / "data" / "embeddings"
 
 def precompute(dataset: str, methods: List[str]) -> None:
     engine = EmbeddingEngine(dataset)
@@ -22,19 +21,23 @@ def precompute(dataset: str, methods: List[str]) -> None:
     fail = []
     for m in methods:
         print(f"-> {m} ...", end="", flush=True)
-        try:
-            embs = engine.estimate_embeddings(entries, method=m)
-            # Persist via the same cache path the server expects
+        embs = engine.estimate_embeddings(entries, method=m)
+        # Persist via the same cache path the server expects
+        import numpy as np
+        paths = np.array([e.path for e in entries])
+        mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
+        
+        if m == 'dift_sd':
+            n_parts = embs.shape[2]
+            for i in range(n_parts):
+                for j in range(n_parts):
+                    cache = engine._cache_dir() / f"embeddings_{m.lower()}_part{i}{j}.npz"
+                    np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs[:,:,i,j])
+        else:
             cache = engine._cache_dir() / f"embeddings_{m.lower()}.npz"
-            import numpy as np
-            paths = np.array([e.path for e in entries])
-            mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
             np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
-            print(" done")
-            ok.append(m)
-        except Exception as e:
-            print(f" failed: {e}")
-            fail.append((m, str(e)))
+        print(" done")
+        ok.append(m)
 
     print()
     print(f"Completed. OK={ok}")
@@ -45,11 +48,14 @@ def precompute(dataset: str, methods: List[str]) -> None:
 
 
 def main():
-    for dataset in DATASETS_DIR.iterdir():
+    # for dataset in DATASETS_DIR.iterdir():
+    for dataset in ['../data/datasets/VIS30K', '../data/datasets/ISIC2017']:
+        dataset = Path(dataset)
         if not dataset.is_dir():
             continue
         print(f"Dataset: {dataset.name}")
         precompute(dataset, DEFAULT_METHODS)
     print("All done.")
+
 if __name__ == "__main__":
     main()
