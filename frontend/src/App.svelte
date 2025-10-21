@@ -5,6 +5,9 @@
   import ScatterMinimap from './components/ScatterMinimap.svelte'
   import AnimatedMinimap from './components/AnimatedMinimap.svelte'
   import HoverGridMinimap from './components/HoverGridMinimap.svelte'
+  import AxesMinimap from './components/AxesMinimap.svelte'
+  import AxesPanel from './components/AxesPanel.svelte'
+  import AxisBuilder from './components/AxisBuilder.svelte'
   import DiftPartSelector from './components/DiftPartSelector.svelte'
   import MinimapTextOverlay from './components/MinimapTextOverlay.svelte'
   import ConceptsPanel from './components/ConceptsPanel.svelte'
@@ -52,13 +55,18 @@
   $: minimapSize = (() => {
     // Recompute when left pane or window resizes
     void leftWidth; void windowWidth
-    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth || 700) : 700
+    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth - 210 || 700) : 700
     return Math.max(300, Math.min(1200, w))
   })()
   let showTextOverlay = false
   let textSimilarities = {}
   // Text-driven separation layer state (persists)
   let textLayerState = { baseEmbed: '', baseCoords: {}, coords: {}, rects: [], gridSize: 0 }
+
+  // Axes state
+  let axes = [] // [{ id, name, coords }]
+  let selectedAxisX = null
+  let selectedAxisY = null
 
   function scatterToCenter(radius = 0.06) {
     // Randomly scatter all points around center within a small radius
@@ -95,7 +103,7 @@
     })
   }
   // Split pane state
-  let leftWidth = 760
+  let leftWidth = 1500
   let dragging = false
   let startX = 0
   let startLeft = 0
@@ -184,6 +192,42 @@
     if (m === 'text') return 'Text'
     if (m.startsWith('dift_sd_part')) return `Local composition ${m.replace('dift_sd_part','part ')}`
     return m
+  }
+
+  // Create or update the two default axes for the current projection (x,y)
+  function axisPrefixForMethod(method) {
+    if (!method) return 'Axis'
+    if (method === 'avg') return 'Color'
+    if (method === 'clip') return 'Content'
+    if (method === 'dino') return 'Global composition'
+    if (method.startsWith('dift_sd_part')) return `Local composition ${method.replace('dift_sd_part','part ')}`
+    if (method === 'dift_sd') return 'Local composition'
+    return method
+  }
+
+  function ensureDefaultAxesForCurrentProjection() {
+    const methodName = embedMethod || currentMethodLabel()
+    if (!methodName) return
+    const prefix = axisPrefixForMethod(methodName)
+    const idX = `axis:${methodName}:x`
+    const idY = `axis:${methodName}:y`
+    const coordsX = {}
+    const coordsY = {}
+    for (const it of allImages) {
+      coordsX[it.id] = Number(it.x ?? 0)
+      coordsY[it.id] = Number(it.y ?? 0)
+    }
+    let next = axes
+    const axX = { id: idX, name: `${prefix} axis 1`, coords: coordsX }
+    const axY = { id: idY, name: `${prefix} axis 2`, coords: coordsY }
+    const hasX = next.some(a => a.id === idX)
+    const hasY = next.some(a => a.id === idY)
+    if (hasX) next = next.map(a => a.id === idX ? axX : a); else next = [axX, ...next]
+    if (hasY) next = next.map(a => a.id === idY ? axY : a); else next = [axY, ...next]
+    axes = next
+    // Default selection to current projection axes
+    selectedAxisX = idX
+    selectedAxisY = idY
   }
 
   // Concepts: saved sets of labels tied to an embedding method
@@ -342,6 +386,8 @@
       gridSize = Number(cached.n_layer || 0)
       classes = ['All', ...Array.from(new Set(allImages.map((i) => i.className)))]
       applyFilters()
+      // Populate axes from current projection (x,y)
+      ensureDefaultAxesForCurrentProjection()
       return
     }
 
@@ -374,6 +420,8 @@
       // Cache for quick toggling between embeddings
       galleryCache.set(cacheKey, { items: allImages, n_layer: gridSize })
       applyFilters()
+      // Populate axes from current projection (x,y)
+      ensureDefaultAxesForCurrentProjection()
     } catch (e) {
       console.error('[frontend] fetch error', e)
       // Fallback to demo data
@@ -401,6 +449,11 @@
         const parsedT = JSON.parse(rawText)
         if (parsedT && typeof parsedT === 'object') textLayerState = parsedT
       }
+      const rawAxes = localStorage.getItem('promptherder.axes')
+      if (rawAxes) {
+        const parsedA = JSON.parse(rawAxes)
+        if (Array.isArray(parsedA)) axes = parsedA
+      }
     } catch (e) { /* ignore */ }
     loadGallery()
   })
@@ -415,6 +468,9 @@
   $: (function persistTextLayer(s) {
     try { localStorage.setItem('promptherder.textlayer', JSON.stringify(s)) } catch (_) {}
   })(textLayerState)
+  $: (function persistAxes(a) {
+    try { localStorage.setItem('promptherder.axes', JSON.stringify(a)) } catch (_) {}
+  })(axes)
 
   function onEmbedChange() {
     // Compute effective method; if DIFT selected without part, don't fetch yet
@@ -447,10 +503,26 @@
   }
 
   function onScribbleLabel(e) {
-    const { ids, label } = e.detail
-    // Update external label object
-    for (const id of ids) {
-      labelDB[id] = label
+    const { ids, label, updates } = e.detail || {}
+    if (Array.isArray(updates)) {
+      const next = { ...labelDB }
+      for (const u of updates) {
+        if (!u) continue
+        const id = u.id
+        const v = u.label
+        if (v === null || v === undefined || v === 'none') delete next[id]
+        else if (v === 'good' || v === 'bad') next[id] = v
+      }
+      labelDB = next
+      return
+    }
+    if (Array.isArray(ids)) {
+      const next = { ...labelDB }
+      for (const id of ids) {
+        if (label === null || label === undefined || label === 'none') delete next[id]
+        else next[id] = label
+      }
+      labelDB = next
     }
   }
 
@@ -556,53 +628,12 @@
             <span class="i-heroicons-photo text-slate-600" />
             <span>Images gallery visualization</span>
           </div>
-      <div class="flex items-center gap-2 mb-2 text-sm">
-        <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={() => (scribbleEnabled = !scribbleEnabled)}>
-          <span class="i-heroicons-pencil-square" /> {scribbleEnabled ? 'Disable Labeling' : 'Enable Labeling'}
-        </button>
-        <!-- <button class="px-2 py-1 border rounded ml-2 inline-flex items-center gap-1" on:click={async () => { showTextOverlay = !showTextOverlay; if (showTextOverlay) { await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() } }}>
-          <span class="i-heroicons-rectangle-group" /> {showTextOverlay ? 'Hide Text Tool' : 'Add Text'}
-        </button> -->
-        {#if scribbleEnabled}
-          <button class="px-2 py-1 rounded text-white inline-flex items-center gap-1" style="background:#16a34a" on:click={() => (scribbleLabel = 'good')} aria-label="Good">
-            <span class="i-heroicons-hand-thumb-up" /> Positive
-          </button>
-          <button class="px-2 py-1 rounded text-white inline-flex items-center gap-1" style="background:#dc2626" on:click={() => (scribbleLabel = 'bad')} aria-label="Bad">
-            <span class="i-heroicons-hand-thumb-down" /> Negative
-          </button>
-          <!-- <label class="ml-2 inline-flex items-center gap-2">
-            <span class="i-heroicons-arrows-pointing-out" /> Radius
-            <input type="range" min="4" max="60" step="1" bind:value={scribbleRadius} class="align-middle" />
-          </label> -->
-          <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={clearAllLabels}>
-            <span class="i-heroicons-trash" /> Clear
-          </button>
-          <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={createConcept}>
-            <span class="i-heroicons-light-bulb" /> Create concept
-          </button>
-        {/if}
-      </div>
+      <!-- Removed legacy scribble label toggle; lasso handles labeling inside minimap -->
       {#if embedSelection === 'dift_sd'}
-        <div class="text-sm mb-1">Image-part selection</div>
-        <DiftPartSelector on:select={(e) => { diftPart = e.detail.part; embedMethod = `dift_sd_part${diftPart}`; embedSelection = 'dift_sd'; loadGallery(); }} selected={diftPart} />
+        <!-- DIFT part selector moved to AxesPanel -->
       {/if}
       <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:${minimapSize}px;`}>
-        <!-- Method selection inside minimap -->
-        <div class="absolute top-1 left-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
-          {#each ['avg','clip','dino','dift_sd','text'] as m}
-            <label class="inline-flex items-center gap-1 cursor-pointer">
-              <input type="radio" name="embed" value={m} bind:group={embedSelection} on:change={onEmbedChange} />
-              <span class="inline-flex items-center gap-1">
-                {#if m==='avg'}<span class="i-heroicons-adjustments-horizontal" />{/if}
-                {#if m==='clip'}<span class="i-heroicons-command-line" />{/if}
-                {#if m==='dino'}<span class="i-heroicons-cube-transparent" />{/if}
-                {#if m==='dift_sd'}<span class="i-heroicons-rectangle-stack" />{/if}
-                {#if m==='text'}<span class="i-heroicons-chat-bubble-left-right" />{/if}
-                {methodAlias(m)}
-              </span>
-            </label>
-          {/each}
-        </div>
+        <!-- Method selection moved to AxesPanel -->
         {#if embedSelection === 'text'}
           <div class="absolute top-1 right-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
             <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={async () => { showTextOverlay = true; await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() }}>
@@ -613,30 +644,39 @@
             </button>
           </div>
         {/if}
-        {#if scribbleEnabled && embedSelection !== 'text'}
-          <AnimatedMinimap
-            items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            prevItems={prevImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={minimapSize}
-            height={minimapSize}
-            gridSize={gridSize}
-            bind:this={minimapRef}
-            enableScribble={scribbleEnabled}
-            activeLabel={scribbleLabel}
-            brushRadiusPx={scribbleRadius}
-            bind:labels={labelsMap}
-            on:label={onScribbleLabel}
-          />
-        {:else}
-          <HoverGridMinimap
-            items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={minimapSize}
-            height={minimapSize}
-            gridSize={gridSize}
-            viewFrac={0.35}
-            experimentalLocalPacking={true}
-          />
-        {/if}
+        <div class="flex items-start gap-3">
+          <div class="w-56 shrink-0">
+            <div class="text-xs text-gray-700 mb-1">Axes</div>
+            <AxesPanel
+              {axes}
+              items={allImages}
+              {concepts}
+              embedSelection={embedSelection}
+              diftPart={diftPart}
+              on:embedChange={(e) => { embedSelection = e.detail.selection; onEmbedChange() }}
+              on:selectDiftPart={(e) => { diftPart = e.detail.part; embedMethod = `dift_sd_part${diftPart}`; embedSelection = 'dift_sd'; loadGallery(); }}
+              on:setX={(e) => { selectedAxisX = e.detail.id }}
+              on:setY={(e) => { selectedAxisY = e.detail.id }}
+              on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
+              on:delete={(e) => { axes = axes.filter(a => a.id !== e.detail.id) }}
+              on:rename={(e) => { axes = axes.map(a => a.id === e.detail.id ? { ...a, name: e.detail.name } : a) }}
+            />
+          </div>
+          <div class="flex-1 min-w-0">
+            <AxesMinimap
+              items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
+              axes={axes}
+              width={minimapSize}
+              height={minimapSize}
+              labels={new Map(Object.entries(labelDB))}
+              bind:selectedX={selectedAxisX}
+              bind:selectedY={selectedAxisY}
+              on:axesChange={(e)=>{ selectedAxisX = e.detail.selectedX; selectedAxisY = e.detail.selectedY }}
+              on:label={onScribbleLabel}
+              on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
+            />
+          </div>
+        </div>
         {#if embedSelection === 'text' && showTextOverlay}
           <MinimapTextOverlay
             bind:this={textOverlayRef}
@@ -647,7 +687,7 @@
           />
         {/if}
       </div>
-      <div class="mt-2 text-xs text-gray-600">Positive: {goodCount} • Negative: {badCount}</div>
+      
 
       <div class="text-sm mb-1 mt-4">Concepts list</div>
       <ConceptsPanel
@@ -691,6 +731,12 @@
           <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
             <span class="i-heroicons-adjustments-horizontal text-slate-600" />
             <span>Concept composer</span>
+          </div>
+          <div class="mt-4">
+            <AxisBuilder
+              items={allImages}
+              on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
+            />
           </div>
           <ConceptComposer
             {concepts}
