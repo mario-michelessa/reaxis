@@ -2,18 +2,16 @@
   // import ImageGrid from './components/ImageGrid.svelte' // replaced by TextSimilarity view
   import { generateDemoImages, sortBySimilarity, clusterKMeans } from './lib/data'
   import { onMount, tick } from 'svelte'
-  import ScatterMinimap from './components/ScatterMinimap.svelte'
-  import AnimatedMinimap from './components/AnimatedMinimap.svelte'
-  import HoverGridMinimap from './components/HoverGridMinimap.svelte'
   import AxesMinimap from './components/AxesMinimap.svelte'
   import AxesPanel from './components/AxesPanel.svelte'
-  import AxisBuilder from './components/AxisBuilder.svelte'
-  import DiftPartSelector from './components/DiftPartSelector.svelte'
   import MinimapTextOverlay from './components/MinimapTextOverlay.svelte'
   import ConceptsPanel from './components/ConceptsPanel.svelte'
   import TextSimilarity from './components/TextSimilarity.svelte'
   import ConceptComposer from './components/ConceptComposer.svelte'
   import CombinedConceptItem from './components/CombinedConceptItem.svelte'
+  import Callout from './components/Callout.svelte'
+  import CombinedSelection from './components/CombinedSelection.svelte'
+  import SelectionComposer from './components/SelectionComposer.svelte'
   
   let allImages = []
   let prevImages = []
@@ -55,8 +53,8 @@
   $: minimapSize = (() => {
     // Recompute when left pane or window resizes
     void leftWidth; void windowWidth
-    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth - 210 || 700) : 700
-    return Math.max(300, Math.min(1200, w))
+    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth - 330) : 700
+    return Math.max(300, Math.min(800, w))
   })()
   let showTextOverlay = false
   let textSimilarities = {}
@@ -103,14 +101,14 @@
     })
   }
   // Split pane state
-  let leftWidth = 1500
+  let leftWidth = 1200
   let dragging = false
   let startX = 0
   let startLeft = 0
   let lastMouseX = 0
-  const minLeft = 740 // minimum visible width for the left pane
-  const maxLeft = 1400
-  const collapseThreshold = 700 // drag below this to auto-collapse on release
+  let minLeft = 500 // tune: minimum visible width for the left pane
+  let maxLeft = 1000 // tune: maximum visible width for the left pane
+  let collapseThreshold = 700 // tune: drag below this to auto-collapse on release
   let leftCollapsed = false
   function startDrag(e) { dragging = true; startX = e.clientX; startLeft = leftWidth; lastMouseX = e.clientX }
   function onLeftResizerDblClick() {
@@ -124,10 +122,11 @@
   
   // Right pane resizer (between composer and combined concepts)
   let rightWidth = 320 // default ~w-80
+  let rightCollapsed = true
   let draggingRight = false
   let startXRight = 0
   let startRight = 0
-  const minRight = 180
+  let minRight = 180 // tune: minimum right panel width
   function startRightDrag(e) { draggingRight = true; startXRight = e.clientX; startRight = rightWidth }
   function onRightResizerDblClick() {
     middleCollapsed = !middleCollapsed
@@ -137,7 +136,7 @@
   let rowRef
   let rowWidth = 0
   $: rowWidth = rowRef ? rowRef.clientWidth : windowWidth
-  let middleCollapsed = false
+  let middleCollapsed = true
   function onDrag(e) {
     lastMouseX = e.clientX
     if (dragging) {
@@ -150,7 +149,7 @@
       const tentative = startRight + dxr
       const RESIZER_PX = 4
       const leftVisible = leftCollapsed ? 28 : leftWidth
-      const minMiddle = 200 // enforce minimum middle width while dragging
+      const minMiddle = 260 // tune: minimum middle width while dragging
       const total = rowWidth || windowWidth || 0
       const allowedMaxRight = Math.max(minRight, total - leftVisible - minMiddle - (2 * RESIZER_PX))
       rightWidth = Math.max(minRight, Math.min(tentative, allowedMaxRight))
@@ -236,6 +235,9 @@
   // Saved combined concepts for the right panel
   let combinedConcepts = []
   let composerLoadChain = null
+  // Selections state
+  let selections = []
+  let combinedSelections = []
 
   function currentMethodLabel() {
     // In Text mode, reflect the base embedding, not 'text'
@@ -454,6 +456,16 @@
         const parsedA = JSON.parse(rawAxes)
         if (Array.isArray(parsedA)) axes = parsedA
       }
+      const rawSel = localStorage.getItem('promptherder.selections')
+      if (rawSel) {
+        const parsedS = JSON.parse(rawSel)
+        if (Array.isArray(parsedS)) selections = parsedS
+      }
+      const rawCombSel = localStorage.getItem('promptherder.combinedSelections')
+      if (rawCombSel) {
+        const parsedCS = JSON.parse(rawCombSel)
+        if (Array.isArray(parsedCS)) combinedSelections = parsedCS
+      }
     } catch (e) { /* ignore */ }
     loadGallery()
   })
@@ -471,6 +483,12 @@
   $: (function persistAxes(a) {
     try { localStorage.setItem('promptherder.axes', JSON.stringify(a)) } catch (_) {}
   })(axes)
+  $: (function persistSelections(s) {
+    try { localStorage.setItem('promptherder.selections', JSON.stringify(s)) } catch (_) {}
+  })(selections)
+  $: (function persistCombinedSelections(s) {
+    try { localStorage.setItem('promptherder.combinedSelections', JSON.stringify(s)) } catch (_) {}
+  })(combinedSelections)
 
   function onEmbedChange() {
     // Compute effective method; if DIFT selected without part, don't fetch yet
@@ -591,14 +609,12 @@
 
 <svelte:window bind:innerWidth={windowWidth} on:mousemove={onDrag} on:mouseup={endDrag} />
 
-<div class="min-h-screen bg-white text-gray-900">
-  <header class="sticky top-0 z-10">
-    <div class="w-full bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 border-b border-slate-200">
-      <div class="px-4 py-3 flex items-center gap-3">
-        <div class="i-heroicons-photo inline-block text-slate-600 text-2xl" />
-        <div class="text-lg font-semibold tracking-wide text-slate-800">PromptHerder</div>
-        <div class="flex-1" />
-      </div>
+<div class="app-main text-gray-900">
+  <header class="app-header">
+    <div class="app-header-inner">
+      <div class="i-heroicons-sparkles brand-icon" />
+      <div class="brand-name">ReQuest</div>
+      <div class="flex-1" />
     </div>
   </header>
 
@@ -610,32 +626,26 @@
     </div>
   {/if}
 
-  <main class="w-full py-6">
-    <div class="flex gap-0 flex-nowrap overflow-x-auto" bind:this={rowRef}>
+  <main class="app-main w-full py-6">
+    <div class="panels-row flex flex-nowrap overflow-x-auto" bind:this={rowRef}>
       <!-- Left minimap + list -->
       {#if leftCollapsed}
-        <div class="shrink-0" style="width:30px; height:200px">
+        <div class="shrink-0" style="width:50px;">
           <button
-            class="w-full h-full flex items-center justify-center text-sm font-semibold mb-2 text-slate-700 border border-slate-200 bg-gradient-to-b from-slate-50 to-slate-200 hover:from-slate-100 hover:to-slate-300"
-            style="writing-mode: vertical-lr; text-orientation: sideways; transform: rotate(180deg);"
-            title="Show Images gallery visualization"
+            class="collapsed-handle rotate tile-header"
+            title="Define projection"
             on:click={() => { leftCollapsed = false; leftWidth = Math.max(minLeft, leftWidth) }}
-          >Images gallery visualization</button>
+          >Define projection</button>
         </div>
       {:else}
-      <aside class="shrink-0 pr-4" style={`width:${leftWidth}px;min-width:${minLeft}px`}>
-          <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-            <span class="i-heroicons-photo text-slate-600" />
-            <span>Images gallery visualization</span>
-          </div>
-      <!-- Removed legacy scribble label toggle; lasso handles labeling inside minimap -->
-      {#if embedSelection === 'dift_sd'}
-        <!-- DIFT part selector moved to AxesPanel -->
-      {/if}
+      <aside class="shrink-0" style={`width:${leftWidth}px;min-width:${minLeft}px ;max-width:${maxLeft}px;`}>
+            <div class="tile tile-primary">
+              <div class="tile-content">
+                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { leftCollapsed = true }}>–</button></div>
+                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-photo text-slate-600" /> Define projection</div>
       <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:${minimapSize}px;`}>
-        <!-- Method selection moved to AxesPanel -->
         {#if embedSelection === 'text'}
-          <div class="absolute top-1 right-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
+          <div class="absolute top-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-sm flex items-center gap-2" style="left: 50%;">
             <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={async () => { showTextOverlay = true; await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() }}>
               <span class="i-heroicons-rectangle-group" /> Add text
             </button>
@@ -644,9 +654,8 @@
             </button>
           </div>
         {/if}
-        <div class="flex items-start gap-3">
-          <div class="w-56 shrink-0">
-            <div class="text-xs text-gray-700 mb-1">Axes</div>
+        <div class="flex items-start">
+          <div class="w-80 shrink-0">
             <AxesPanel
               {axes}
               items={allImages}
@@ -661,8 +670,11 @@
               on:delete={(e) => { axes = axes.filter(a => a.id !== e.detail.id) }}
               on:rename={(e) => { axes = axes.map(a => a.id === e.detail.id ? { ...a, name: e.detail.name } : a) }}
             />
+            <Callout title="Create personalized axes">
+              Start with a projection, select landmarks using the lasso tool, and create axes going from negative to positive.
+            </Callout>
           </div>
-          <div class="flex-1 min-w-0">
+          <div class="flex-1 min-w-0 ml-2">
             <AxesMinimap
               items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
               axes={axes}
@@ -676,6 +688,7 @@
               on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
             />
           </div>
+          
         </div>
         {#if embedSelection === 'text' && showTextOverlay}
           <MinimapTextOverlay
@@ -686,94 +699,91 @@
             on:confirmRegion={onConfirmRegion}
           />
         {/if}
-      </div>
-      
-
-      <div class="text-sm mb-1 mt-4">Concepts list</div>
-      <ConceptsPanel
-        {concepts}
-        items={allImages}
-        on:select={(e) => loadConcept(e.detail.concept)}
-        on:delete={(e) => removeConcept(e.detail.id)}
-        on:rename={(e) => renameConceptById(e.detail.id, e.detail.name)}
-      />
-
+          </div>
+        </div>
         </aside>
       {/if}
-<!-- 
-    <section class="flex-1">
-      <div class="text-sm mb-1">Search images</div>
-      <TextSimilarity
-        items={allImages}
-        apiBase={API_BASE}
-        defaultTopN={10}
-        onCreateConcept={(ids) => createConceptFromGood(ids)}
-        onRefreshGallery={async () => { await loadGallery() }}
-      />
-    </section> 
--->
-
-      <!-- Resizer -->
-      <div class="w-1 bg-gray-200 hover:bg-gray-300 cursor-col-resize" title="Resize left panel (double-click to collapse/expand)" on:mousedown={startDrag} on:dblclick={onLeftResizerDblClick} />
-
-      <!-- Middle: concepts composer -->
-      {#if middleCollapsed}
-        <div class="shrink-0" style="width:30px; height:200px">
+     {#if middleCollapsed}
+        <div class="shrink-0 pr-2" style="width:50px;">
           <button
-            class="w-full h-full flex items-center justify-center text-[11px] text-slate-700 border border-slate-200 bg-gradient-to-b from-slate-50 to-slate-200 hover:from-slate-100 hover:to-slate-300"
-            style="writing-mode: vertical-lr; text-orientation: upright;"
-            title="Show Concept composer"
+            class="collapsed-handle rotate tile-header"
+            title="Define Selections"
             on:click={() => { middleCollapsed = false }}
-          >Concept composer</button>
+          >Define selections</button>
         </div>
       {:else}
-        <section class="flex-1 min-w-0 pl-4 pr-4">
-          <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-            <span class="i-heroicons-adjustments-horizontal text-slate-600" />
-            <span>Concept composer</span>
-          </div>
-          <div class="mt-4">
-            <AxisBuilder
-              items={allImages}
-              on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
-            />
-          </div>
-          <ConceptComposer
-            {concepts}
-            allIds={allImages.map(i => i.id)}
-            defaultMethod={currentMethodLabel()}
-            items2d={allImages}
-            apiBase={API_BASE}
-            datasetPath={datasetPath}
-            on:create={(e) => addCombinedConcept(e.detail)}
-            loadChain={composerLoadChain}
+        <section class="flex-1 min-w-0 pl-2 pr-2">
+          <div class="tile tile-primary">
+            <div class="tile-content">
+              <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { middleCollapsed = true }}>–</button></div>
+              <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-adjustments-horizontal text-slate-600" /> Define selections</div>
+              
+          <SelectionComposer
+            {selections}
+            items={allImages}
+            on:toggle={(e)=>{ const { id, active } = e.detail; selections = selections.map(s => s.id===id ? { ...s, active: !!active } : s) }}
+            on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; selections = selections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
+            on:delete={(e)=>{ const { id } = e.detail; selections = selections.filter(s => s.id !== id) }}
+            on:combine={(e)=>{ const comb = e.detail; if (comb && comb.id) { combinedSelections = [comb, ...combinedSelections] } }}
           />
+          <Callout title="Combine selections">
+                Activate selections to combine all positives or discard all negatives.
+              </Callout>
+            </div>
+          </div>
         </section>
       {/if}
 
-      <!-- Resizer between composer and right panel -->
-      <div class="w-1 bg-gray-200 hover:bg-gray-300 cursor-col-resize" title="Resize right panel (double-click to collapse/expand middle)" on:mousedown={startRightDrag} on:dblclick={onRightResizerDblClick} />
+      <!-- Resizer removed -->
 
-      <!-- Rightmost: saved combined concepts -->
-      <aside class="shrink-0" style={`width:${rightWidth}px;min-width:${minRight}px`}>
-        <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-          <span class="i-heroicons-rectangle-stack text-slate-600" />
-          <span>Saved combined concepts</span>
-        </div>
-        <div class="grid gap-2">
-          {#each combinedConcepts as cc (cc.id)}
-            <CombinedConceptItem
-              combined={cc}
-              idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
-              allIds={allImages.map(i => i.id)}
-              on:load={(e) => { composerLoadChain = e.detail.chain || null }}
-            />
-          {/each}
-          {#if combinedConcepts.length === 0}
-            <div class="text-xs text-gray-500">No combined concepts yet. Use the composer to create one.</div>
-          {/if}
-        </div>
-      </aside>
+      <!-- Rightmost: saved combined selections -->
+      {#if false}
+      {/if}
+      {#if true}
+        {#if rightCollapsed}
+          <div class="shrink-0" style="width:50px;">
+            <button
+              class="collapsed-handle rotate tile-header"
+              title="Show Combined selections"
+              on:click={() => { rightCollapsed = false }}
+            >Combined selections</button>
+          </div>
+        {:else}
+          <aside class="shrink-0" style={`width:${rightWidth}px;min-width:${minRight}px`}>
+          <div class="tile tile-primary">
+            <div class="tile-content">
+              <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
+              <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Saved combined selections</div>
+                <div class="grid gap-2">
+                  {#each combinedSelections as cs (cs.id)}
+                    <CombinedSelection
+                      combined={cs}
+                      idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
+                      on:apply={(e)=>{
+                        const { posIds=[], negIds=[] } = e.detail || {}
+                        const next = {}
+                        for (const id of allImages.map(i => i.id)) next[id] = undefined
+                        for (const id of posIds) next[id] = 'good'
+                        for (const id of negIds) next[id] = 'bad'
+                        labelDB = next
+                      }}
+                      on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; combinedSelections = combinedSelections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
+                      on:delete={(e)=>{ const { id } = e.detail; combinedSelections = combinedSelections.filter(s => s.id !== id) }}
+                      on:sendToSelections={(e)=>{ const { selection } = e.detail || {}; if (selection && selection.id) { selections = [selection, ...selections] } }}
+                    />
+                  {/each}
+                  {#if combinedSelections.length === 0}
+                    <div class="text-sm text-gray-500">No combined selections yet. Use the Selection composer to create one.</div>
+                  {/if}
+                </div>
+                <Callout title="Saved">
+                  Apply a combined selection to set current labels, or move to selections to edit.
+                </Callout>
+              </div>
+            </div>
+          </aside>
+        {/if}
+      {/if}
     </div>
   </main>
 </div>

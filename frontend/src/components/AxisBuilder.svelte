@@ -92,8 +92,8 @@
   }
 </script>
 
-<div class="w-full border rounded bg-white overflow-hidden">
-  <div class="bg-gradient-to-r from-indigo-500 to-purple-500 text-white px-2 py-1.5 text-sm font-medium flex items-center justify-between">
+<div class="w-full card overflow-hidden">
+  <div class="panel-header" style="background:linear-gradient(90deg,#6366f1,#a855f7);color:#fff;border-color:#7c3aed">
     <div class="px-1 truncate">Axis Builder</div>
     <div class="text-[11px] opacity-90">Click: +pos • Ctrl/Cmd+Click: +neg</div>
   </div>
@@ -107,21 +107,20 @@
     </svg>
 
     <div class="mt-3 flex items-center gap-3">
-      <label class="text-xs text-gray-700 flex items-center gap-2">
+      <label class="text-sm text-gray-700 flex items-center gap-2">
         <span>Tolerance</span>
         <input type="range" min="0" max="100" step="1" bind:value={p} class="flex-1" />
         <span class="tabular-nums">{Math.round(p)}%</span>
       </label>
-      <div class="text-xs text-gray-500">Positives: {posItems.length} • Negatives: {negItems.length}</div>
+      <div class="text-sm text-gray-500">Positives: {posItems.length} • Negatives: {negItems.length}</div>
     </div>
 
     <div class="mt-3 flex items-center gap-2">
-      <input class="px-2 py-1 border rounded text-sm flex-1 bg-white" placeholder="Axis name" bind:value={name} />
-      <button class="px-2 py-1 text-sm rounded bg-blue-600 text-white disabled:opacity-50" on:click={createAxis} disabled={posItems.length===0 && negItems.length===0}>Create Axis</button>
+      <input class="text-sm flex-1" placeholder="Axis name" bind:value={name} />
+      <button class="btn btn-primary btn-sm disabled:opacity-50" on:click={createAxis} disabled={posItems.length===0 && negItems.length===0}>Create Axis</button>
     </div>
   </div>
 </div>
 
 <style>
 </style>
-

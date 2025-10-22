@@ -5,15 +5,24 @@
 
   import { createEventDispatcher, onMount, onDestroy } from 'svelte'
   import LassoSelector from './LassoSelector.svelte'
+  import Callout from './Callout.svelte'
   export let items = [] // [{ id, url, x, y, gx, gy }]
   export let axes = [] // [{ id, name, coords: Record<string, number> }]
   export let width = 700
   export let height = 700
-  export let viewFrac = 0.35 // viewport square fraction (initial)
+  export let viewFrac = 0.15 // viewport square fraction (initial)
   export let duration = 400 // ms
-  export let minImagePx = 12
+  export let minImagePx = 20
   export let posUpdateMs = 450
   const dispatch = createEventDispatcher()
+
+  // Visual margin for display (map [0,1] -> [m, 1-m])
+  export let displayMargin = 0.1
+  function toVis(v) {
+    const m = Math.max(0, Math.min(0.49, Number(displayMargin || 0)))
+    const nv = Math.max(0, Math.min(1, Number(v || 0)))
+    return m + nv * (1 - 2 * m)
+  }
 
   // External labels for outline rendering and axis creation
   export let labels = new Map()
@@ -162,11 +171,11 @@
     const y = (oy !== undefined) ? oy : Number(it.y ?? 0)
     return { x, y }
   }
-  // Normalized items for the lasso overlay
-  $: lassoItems = (items || []).map((it) => {
-    const p = posOriginal(it)
-    return { id: it.id, x: p.x, y: p.y }
-  })
+  // Normalized items for the lasso overlay – use the actually rendered positions
+  // so selection matches the current (possibly customized) axes projection and packing.
+  $: lassoItems = Array.isArray(renderItems)
+    ? renderItems.map((it) => ({ id: it.id, x: it.x, y: it.y }))
+    : []
 
   // Animation tracks
   let lastPosMap = new Map() // id -> {x,y}
@@ -183,9 +192,13 @@
   let rafId
   function tickAnim() {
     nowTs = performance.now()
-    // update last positions for current render items
-    if (Array.isArray(renderItems)) {
-      for (const it of renderItems) lastPosMap.set(it.id, { x: it.x, y: it.y })
+    // update last positions in ORIGINAL coord space (not visual)
+    if (tracks && tracks.size > 0) {
+      for (const tr of tracks.values()) {
+        const x = lerp(tr.from.x, tr.to.x, tNorm)
+        const y = lerp(tr.from.y, tr.to.y, tNorm)
+        lastPosMap.set(tr.id, { x, y })
+      }
     }
     if (griddingActive && (nowTs - lastTargetsUpdate > posUpdateMs)) {
       posRect = { x0, y0, x1, y1, margin: hoverMargin }
@@ -257,10 +270,10 @@
   $: cellPx = 16
   $: imSize = Math.max(minImagePx, Math.floor(cellPx ))
   $: vfRatio = 0.35 / Math.max(0.08, Math.min(1.0, vf))
-  $: insideScale = Math.max(1.1, 1.15 + 0.3 * (vfRatio - 1))
+  $: insideScale = Math.max(1.5, 1.7 + 1 * (vfRatio - 1))
   $: sizeInside = Math.max(minImagePx, Math.floor(imSize * insideScale))
   $: sizeOutside = Math.max(8, Math.floor(imSize * 0.8))
-  $: spacingScale = Math.max(1.05, 1.1 + 0.1 * (vfRatio - 1))
+  $: spacingScale = Math.max(1.5, 1.5 + 0.0 * (vfRatio - 1))
 
   // Precompute inside ids set (using original positions from axes)
   $: insideIds = new Set(items.filter((it) => {
@@ -294,7 +307,7 @@
   $: elapsed = Math.max(0, nowTs - startTs)
   $: raw = Math.min(1, duration > 0 ? elapsed / duration : 1)
   $: tNorm = easeInOutCubic(raw)
-  $: renderItems = Array.from(tracks.values()).map((tr) => ({ id: tr.id, url: tr.url, x: lerp(tr.from.x, tr.to.x, tNorm), y: lerp(tr.from.y, tr.to.y, tNorm) }))
+  $: renderItems = Array.from(tracks.values()).map((tr) => ({ id: tr.id, url: tr.url, x: toVis(lerp(tr.from.x, tr.to.x, tNorm)), y: toVis(lerp(tr.from.y, tr.to.y, tNorm)) }))
 
   function clamp01(v) { return Math.max(0, Math.min(1, v)) }
   $: gridBackdrop = (function computeBackdrop(active, list, insideSet, sizePx, wPx, hPx) {
@@ -312,8 +325,11 @@
       if (it.y > maxy) maxy = it.y
     }
     if (count === 0 || !isFinite(minx)) return null
-    const x0b = clamp01(minx - halfWn), y0b = clamp01(miny - halfHn)
-    const x1b = clamp01(maxx + halfWn), y1b = clamp01(maxy + halfHn)
+    // list is already in visual space; extend by half image size (normalized)
+    const x0b = clamp01(minx - halfWn)
+    const y0b = clamp01(miny - halfHn)
+    const x1b = clamp01(maxx + halfWn)
+    const y1b = clamp01(maxy + halfHn)
     return { x0: x0b, y0: y0b, w: Math.max(0, x1b - x0b), h: Math.max(0, y1b - y0b) }
   })(griddingActive, renderItems, insideIds, sizeInside, width, height)
 
@@ -369,18 +385,19 @@
 
 <!-- Y axis selector will be positioned inside the minimap (left side) -->
 
-<div
-  role="img"
-  aria-label="Axes minimap"
-  class="relative border border-gray-300 bg-white select-none"
-  style={`width:${width}px;height:${height}px;`}
-  on:mousemove={onMove}
-  on:click|stopPropagation={(e) => pickOrToggle(e)}
->
+<div class="tile"><div class="tile-content flush">
+  <div
+    role="img"
+    aria-label="Axes minimap"
+    class="minimap"
+    style={`width:${width}px;height:${height}px;`}
+    on:mousemove={onMove}
+    on:click|stopPropagation={(e) => pickOrToggle(e)}
+  >
   {#if griddingActive && gridBackdrop}
     <div
       class="absolute pointer-events-none rounded"
-      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(148,163,184,0.14);z-index:5;`}
+      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(229,231,235,0.5);z-index:5;`}
     />
   {/if}
   {#each renderItems as it (it.id)}
@@ -388,7 +405,7 @@
       alt=""
       src={it.url}
       class="absolute object-cover rounded"
-      style={`left:${it.x * 100}%;top:${it.y * 100}%;transform:translate(-50%,-50%);width:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;height:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;transition:width 120ms ease,height 120ms ease; z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.6)}; border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='good'?'#16a34a':'#dc2626'):'none'}; box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
+      style={`left:${it.x * 100}%;top:${it.y * 100}%;transform:translate(-50%,-50%);width:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;height:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;transition:width 120ms ease,height 120ms ease; z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.8)}; border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='good'?'#16a34a':'#dc2626'):'none'}; box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
       loading="lazy"
     />
   {/each}
@@ -396,48 +413,79 @@
   {#if griddingActive}
     <div
       class="absolute border border-blue-500/70 pointer-events-none"
-      style={`left:${x0 * 100}%;top:${y0 * 100}%;width:${viewW * 100}%;height:${viewH * 100}%;`}
+      style={`left:${toVis(x0) * 100}%;top:${toVis(y0) * 100}%;width:${(viewW * (1 - 2*displayMargin)) * 100}%;height:${(viewH * (1 - 2*displayMargin)) * 100}%;`}
     />
   {/if}
 
-  <div class="absolute top-1 right-1 flex gap-1 bg-white text-white rounded p-0 backdrop-blur-sm">
-    <button type="button" class="w-6 h-6 rounded grid place-items-center m-0 bg-black/20 hover:bg-black/30" on:click|stopPropagation={zoomIn} aria-label="Zoom in">+</button>
-    <button type="button" class="w-6 h-6 rounded grid place-items-center m-0 bg-black/20 hover:bg-black/30" on:click|stopPropagation={zoomOut} aria-label="Zoom out">−</button>
+  <div class="toolbar pos-top-right right-just z-10">
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomIn} aria-label="Zoom in">+</button>
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomOut} aria-label="Zoom out">−</button>
   </div>
 
-  <div class="absolute top-1 left-1 flex gap-1 bg-white text-white rounded p-0 backdrop-blur-sm">
-    <button type="button" class={`w-7 h-7 rounded grid place-items-center m-0 ${lassoEnabled?'bg-blue-600 text-white':'bg-black/20 hover:bg-black/30 text-white'}`} on:click|stopPropagation={() => { lassoEnabled = !lassoEnabled }} aria-label="Toggle lasso">
+  <div class="toolbar pos-top-left z-10">
+    <button type="button" class={`btn btn-icon btn-minimap ${lassoEnabled?'btn-primary':''}`} on:click|stopPropagation={() => { lassoEnabled = !lassoEnabled; if (lassoEnabled) { try { lassoRef && lassoRef.reset && lassoRef.reset() } catch(_) {} } }} aria-label="Toggle lasso">
       <!-- simple lasso icon -->
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10c0-3.314 3.582-6 8-6s8 2.686 8 6-3.582 6-8 6c-1.4 0-2.7-.26-3.8-.72L6 16l.4-2.2C5.2 12.7 4 11.5 4 10z"/></svg>
     </button>
   </div>
 
-  <!-- Y axis dropdown (left side) -->
-  <div class="absolute left-1 top-10 z-10 bg-white/90 rounded px-2 py-1 text-xs flex flex-col gap-1 border border-gray-200" on:dragover={allowDrop} on:drop={onDropY} title="Drop an axis here">
-    <div class="text-[11px] text-gray-700">Y axis</div>
-    <select class="text-sm border rounded bg-white" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
-      <option value="">(none)</option>
-      {#each axes as ax}
-        <option value={ax.id} selected={selectedY===ax.id}>{ax.name}</option>
-      {/each}
-    </select>
+  <!-- Y axis control on the left, fully vertical (label + rotated select) -->
+  <div class="axis-rail-left text-sm"
+       on:dragover={allowDrop} on:drop={onDropY} title="Drop an axis here">
+    <div class="text-gray-700" style="">Y axis</div>
+    <div class="origin-top-left" style="">
+      <select class="text-sm" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+        <option value="">(none)</option>
+        {#each axes as ax}
+          <option value={ax.id} selected={selectedY===ax.id}>{ax.name}</option>
+        {/each}
+      </select>
+    </div>
+  </div>
+
+  <!-- Bottom-right create selection button -->
+  <div class="toolbar pos-bottom-right right-just">
+    <button class="btn btn-sm btn-minimap" on:click|stopPropagation={() => {
+      const good = []
+      const bad = []
+      try {
+        if (labels instanceof Map) { labels.forEach((v,k)=>{ if (v==='good') good.push(k); else if (v==='bad') bad.push(k) }) }
+        else { for (const [k,v] of Object.entries(labels||{})) { if (v==='good') good.push(k); else if (v==='bad') bad.push(k) } }
+      } catch(_) {}
+      const name = prompt('Name this selection', 'Selection') || 'Selection'
+      dispatch('saveSelection', { id: `sel:${Date.now()}`, name, posIds: good, negIds: bad, active: true })
+    }}>Create selection</button>
+  </div>
+
+  <!-- Bottom-left info callout -->
+  <div class="absolute left-1 bottom-1 z-10" style="max-width:260px">
+    <Callout storageKey="minimap" variant="info" title="Minimap">
+      Zoom with +/-, toggle lasso to label regions, then save selections.
+    </Callout>
   </div>
 
   {#if lassoEnabled}
-    <div class="absolute top-1 left-10 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
-      <button class={`px-2 py-1 rounded text-white inline-flex items-center gap-1 ${lassoMode==='pos'?'opacity-100':'opacity-70'}`} style="background:#16a34a" on:click|stopPropagation={() => setLassoMode('pos')} aria-label={`Positive (${posCount})`}>
+    <div class="absolute top-1 left-10 z-10 bg-white/90 rounded shadow px-2 py-1 text-sm flex items-center gap-2">
+      <button class={`btn btn-xs ${lassoMode==='pos'?'btn-success':''}`} on:click|stopPropagation={() => setLassoMode('pos')} aria-label={`Positive (${posCount})`}>
         <span class="i-heroicons-hand-thumb-up" /> Positive ({posCount})
       </button>
-      <button class={`px-2 py-1 rounded text-white inline-flex items-center gap-1 ${lassoMode==='neg'?'opacity-100':'opacity-70'}`} style="background:#dc2626" on:click|stopPropagation={() => setLassoMode('neg')} aria-label={`Negative (${negCount})`}>
+      <button class={`btn btn-xs ${lassoMode==='neg'?'btn-danger':''}`} on:click|stopPropagation={() => setLassoMode('neg')} aria-label={`Negative (${negCount})`}>
         <span class="i-heroicons-hand-thumb-down" /> Negative ({negCount})
       </button>
-      <button class="px-2 py-1 rounded text-white inline-flex items-center gap-1" style="background:#0369a1" on:click|stopPropagation={createAxisFromLabels} aria-label="Create axis">
+      <button class="btn btn-xs btn-primary" on:click|stopPropagation={createAxisFromLabels} aria-label="Create axis">
         <span class="i-heroicons-plus-circle" /> Create axis
       </button>
+      <button class="btn btn-xs btn-ui-secondary" on:click|stopPropagation={() => {
+        const updates = []
+        try {
+          if (labels instanceof Map) { labels.forEach((_,k)=> updates.push({ id: k, label: null })) }
+          else { for (const k of Object.keys(labels||{})) updates.push({ id: k, label: null }) }
+        } catch(_) {}
+        if (updates.length) dispatch('label', { updates })
+        try { lassoRef && lassoRef.reset && lassoRef.reset() } catch(_) {}
+      }} aria-label="Clear all labels">Clear</button>
     </div>
-  {/if}
-
-  {#if lassoEnabled}
+    
     <LassoSelector
       bind:this={lassoRef}
       enabled={true}
@@ -449,20 +497,20 @@
       on:select={onLassoSelect}
     />
   {/if}
-</div>
-
-<!-- X axis dropdown below -->
-<div class="mt-2 text-xs">
-  <div class="inline-flex items-center gap-2" on:dragover={allowDrop} on:drop={onDropX} title="Drop an axis here">
-    <span class="text-gray-700">X axis</span>
-    <select class="text-sm border rounded bg-white" on:change={(e)=>{ selectedX = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
-      <option value="">(none)</option>
-      {#each axes as ax}
-        <option value={ax.id} selected={selectedX===ax.id}>{ax.name}</option>
-      {/each}
-    </select>
+    <!-- X axis selector toolbar (bottom-center of minimap) -->
+    <div class="axis-rail-bottom text-sm">
+      <div class="inline-flex items-center gap-2" on:dragover={allowDrop} on:drop={onDropX} title="Drop an axis here">
+        <span class="text-gray-700 text-sm">X axis</span>
+        <select class="text-sm" on:change={(e)=>{ selectedX = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+          <option value="">(none)</option>
+          {#each axes as ax}
+            <option value={ax.id} selected={selectedX===ax.id}>{ax.name}</option>
+          {/each}
+        </select>
+      </div>
+    </div>
   </div>
-</div>
+</div></div>
 
 <style>
 </style>
