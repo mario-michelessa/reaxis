@@ -143,14 +143,14 @@ class EmbeddingEngine:
     #     return sorted(entries, key=lambda e: e.id)
 
     def estimate_embeddings(self, images: Sequence[ImageEntry],
-                            method: str = "avg",
+                            method: str = "color_rgb",
                             resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
         method_l = method.lower()
         if method_l in {"clip", "clip-vit", "clip32"}:
             extractor = CLIPEmbeddingExtractor()
             if getattr(extractor, 'available', False):
                 return self._extract_with_extractor(images, extractor, fallback_dim=512)
-            method_l = "avg"
+            method_l = "color_rgb"
         elif method_l in {"dino", "dino-vit"}:
             vecs = self._extract_with_local_dino(images)
             if vecs is not None:
@@ -158,13 +158,18 @@ class EmbeddingEngine:
             extractor = DINOEmbeddingExtractor()
             if getattr(extractor, 'available', False):
                 return self._extract_with_extractor(images, extractor, fallback_dim=384)
-            method_l = "avg"
+            method_l = "color_rgb"
         elif method_l in {"sd", "dift", "dift_sd", "diftsd"}:
             vecs = self._extract_with_local_dift(images)
             if vecs is not None:
                 print(vecs.shape)
                 return vecs
-            method_l = "avg"
+            method_l = "color_rgb"
+        elif method_l in {"color_hsv", "hsv"}:
+            return self._extract_color_hsv(images, resize=resize)
+        elif method_l in {"color_lch", "lch", "hcl", "color_lab", "lab"}:
+            return self._extract_color_lch(images, resize=resize)
+        
         embs = []
         for e in images:
             with Image.open(e.path) as img:
@@ -173,6 +178,73 @@ class EmbeddingEngine:
                 arr = np.asarray(img).astype(np.float32) / 255.0
                 embs.append(arr.reshape(-1))
         return np.vstack(embs)
+
+    @staticmethod
+    def _rgb_to_xyz(rgb: np.ndarray) -> np.ndarray:
+        # rgb in [0,1], shape (..., 3)
+        # sRGB inverse companding
+        def inv_compand(c):
+            return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+        r = inv_compand(rgb[..., 0])
+        g = inv_compand(rgb[..., 1])
+        b = inv_compand(rgb[..., 2])
+        # sRGB to XYZ (D65)
+        X = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+        Y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+        Z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
+        return np.stack([X, Y, Z], axis=-1)
+
+    @staticmethod
+    def _xyz_to_lab(xyz: np.ndarray) -> np.ndarray:
+        # D65 reference white
+        Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
+        x = xyz[..., 0] / Xn
+        y = xyz[..., 1] / Yn
+        z = xyz[..., 2] / Zn
+        eps = 216 / 24389
+        kappa = 24389 / 27
+        def f(t):
+            return np.where(t > eps, np.cbrt(t), (kappa * t + 16) / 116)
+        fx = f(x)
+        fy = f(y)
+        fz = f(z)
+        L = (116 * fy) - 16
+        a = 500 * (fx - fy)
+        b = 200 * (fy - fz)
+        return np.stack([L, a, b], axis=-1)
+
+    def _extract_color_lch(self, images: Sequence[ImageEntry], resize: Tuple[int, int] = (64, 64)) -> np.ndarray:
+        vecs = []
+        for e in images:
+            try:
+                with Image.open(e.path) as img:
+                    arr = np.asarray(img.convert('RGB').resize(resize, Image.Resampling.LANCZOS)).astype(np.float32) / 255.0
+            except Exception:
+                arr = np.zeros((resize[1], resize[0], 3), dtype=np.float32)
+            lab = self._xyz_to_lab(self._rgb_to_xyz(arr))  # (...,3)
+            # Average in a/b chroma plane
+            a_mean = float(np.mean(lab[..., 1]))
+            b_mean = float(np.mean(lab[..., 2]))
+            vecs.append([a_mean, b_mean])
+        return np.array(vecs, dtype=np.float32)
+
+    def _extract_color_hsv(self, images: Sequence[ImageEntry], resize: Tuple[int, int] = (64, 64)) -> np.ndarray:
+        vecs = []
+        for e in images:
+            try:
+                with Image.open(e.path) as img:
+                    im = img.convert('HSV').resize(resize, Image.Resampling.LANCZOS)
+                    hsv = np.asarray(im).astype(np.float32)
+            except Exception:
+                hsv = np.zeros((resize[1], resize[0], 3), dtype=np.float32)
+            # PIL HSV: H,S,V in 0..255
+            H = hsv[..., 0] * (360.0 / 255.0)
+            S = hsv[..., 1] / 255.0
+            ang = np.deg2rad(H)
+            cx = float(np.mean(np.cos(ang) * S))
+            sx = float(np.mean(np.sin(ang) * S))
+            vecs.append([cx, sx])
+        return np.array(vecs, dtype=np.float32)
 
     def _extract_with_local_dift(self, images: Sequence[ImageEntry], n_parts: Optional[int]=3) -> Optional[np.ndarray]:
         """Extract DIFT features by calling dift_sd.create_feature on file list, then pool.
@@ -269,5 +341,4 @@ class EmbeddingEngine:
                 vec = extractor.extract_text_embedding(text)
                 return vec
         return None
-
 

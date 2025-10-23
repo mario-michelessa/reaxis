@@ -6,7 +6,8 @@ from pathlib import Path
 from embeddings import EmbeddingEngine
 
 
-DEFAULT_METHODS = ["avg", "clip", "dino",]
+DEFAULT_METHODS = ["color_rgb","color_hsv", "color_lch"]
+# DEFAULT_METHODS = ["color_rgb","color_hsv", "color_lch", "clip", "dino", "dift_sd", ]
 # DEFAULT_METHODS = ["dift_sd"]
 DATASETS_DIR = Path(__file__).parent.parent / "data" / "datasets"
 
@@ -48,13 +49,18 @@ def precompute(dataset: str, methods: List[str]) -> None:
 
 
 def main():
-    # for dataset in DATASETS_DIR.iterdir():
-    for dataset in ['../data/datasets/VIS30K', '../data/datasets/ISIC2017']:
+    for dataset in DATASETS_DIR.iterdir():
         dataset = Path(dataset)
+        if dataset.name in ['VIS30K', 'ImageNet_R', 'ImageNet']:
+            print(f"Skipping dataset: {dataset}")
+            continue
         if not dataset.is_dir():
             continue
         print(f"Dataset: {dataset.name}")
-        precompute(dataset, DEFAULT_METHODS)
+        try :
+            precompute(dataset, DEFAULT_METHODS)
+        except Exception as e:
+            print(f"Error processing dataset {dataset.name}: {e}")
     print("All done.")
 
 if __name__ == "__main__":

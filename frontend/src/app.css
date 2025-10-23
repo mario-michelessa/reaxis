@@ -37,9 +37,9 @@ body {
 .collapsed-slot { width: 36px; display:flex; align-items:center; justify-content:center; }
 
 /* App header */
-.app-header { width: 100%; background: #ffffff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+.app-header { width: 100%; background: #ffffff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100; }
 .app-header-inner { padding: 10px 16px; display: flex; align-items: center; gap: 12px; }
-.brand-name { font-weight: 800; font-size: 1.35rem; letter-spacing: 0.4px; background: linear-gradient(90deg, #2563eb, #7c3aed); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.brand-name { font-weight: 800; font-size: 1.35rem; letter-spacing: 0.4px; background: #2563eb; -webkit-background-clip: text; background-clip: text; color: transparent; }
 .brand-icon { font-size: 1.6rem; color: #2563eb; }
 
 #app {
@@ -168,7 +168,7 @@ select, input[type="range"], input[type="text"], input[type="search"], input[typ
 .thumb { width: 3rem; height: 3rem; border-radius: 6px; object-fit: cover; border:1px solid var(--border); }
 
 /* Tiles (for App and subcomponents) */
-.tile { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: hidden; margin-left: 12px}
+.tile { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: visible; }
 .tile-header { padding: 4px 10px; border-bottom: 0; font-weight: 700; font-size: 1.2rem; display:flex; align-items:center; gap:10px; background: #fff; }
 .tile-content { padding: 6px; }
 .tile-content.flush { padding: 0; }
@@ -178,6 +178,22 @@ select, input[type="range"], input[type="text"], input[type="search"], input[typ
 
 /* Panel titles */
 .panel-title { font-weight: 800; letter-spacing: 0.2px; color: var(--text); }
+.panel-actions { position: absolute; top: 6px; right: 6px; display:flex; gap:6px; }
+
+/* Corner resize handle for tiles */
+.tile-resize-handle {
+  position: absolute;
+  right: -7px;           /* stick out horizontally */
+  bottom: -7px;          /* stick out vertically */
+  width: 16px;           /* compact hit area */
+  height: 16px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  border-radius: 5px;
+  cursor: nwse-resize;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.12);
+  z-index: 20;           /* above tile content */
+}
 
 /* Collapsed handles */
 .collapsed-handle {

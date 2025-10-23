@@ -273,7 +273,7 @@
   $: insideScale = Math.max(1.5, 1.7 + 1 * (vfRatio - 1))
   $: sizeInside = Math.max(minImagePx, Math.floor(imSize * insideScale))
   $: sizeOutside = Math.max(8, Math.floor(imSize * 0.8))
-  $: spacingScale = Math.max(1.5, 1.5 + 0.0 * (vfRatio - 1))
+  $: spacingScale = Math.max(1.3, 1.3 + 0.0 * (vfRatio - 1))
 
   // Precompute inside ids set (using original positions from axes)
   $: insideIds = new Set(items.filter((it) => {
@@ -444,7 +444,7 @@
   </div>
 
   <!-- Bottom-right create selection button -->
-  <div class="toolbar pos-bottom-right right-just">
+  <div class="toolbar pos-bottom-right right-just z-10">
     <button class="btn btn-sm btn-minimap" on:click|stopPropagation={() => {
       const good = []
       const bad = []

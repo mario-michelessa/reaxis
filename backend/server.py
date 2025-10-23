@@ -32,12 +32,45 @@ from embeddings import EmbeddingEngine
 app = Flask(__name__)
 CORS(app)
 
-# Configure your dataset root here. Set this to your images root folder.
-# Example: DATASET_PATH = Path('/data/my_images')
-DATASET_PATH = Path('../data/datasets/ISIC2017/')
+"""Dataset configuration
+
+- DATASETS_ROOT: base folder containing available datasets
+- DATASET_PATH: default dataset folder (used if no dataset query is provided)
+"""
+DATASETS_ROOT = (Path(__file__).parent.parent / 'data' / 'datasets').resolve()
+DATASET_PATH = (DATASETS_ROOT / 'ISIC2017').resolve()
+
 # Keep the currently active dataset root for serving images
-app.config['DATASET_ROOT'] = str(DATASET_PATH.resolve()) if DATASET_PATH.exists() else None
-print(f'Using DATASET_PATH: {DATASET_PATH}, exists: {DATASET_PATH.exists()}, length: {len(list(DATASET_PATH.rglob("*")))}')
+app.config['DATASET_ROOT'] = str(DATASET_PATH) if DATASET_PATH.exists() else None
+print(f'[server] DATASETS_ROOT={DATASETS_ROOT} exists={DATASETS_ROOT.exists()}')
+print(f'[server] default DATASET_PATH={DATASET_PATH} exists={DATASET_PATH.exists()}')
+
+def list_available_datasets():
+    out = []
+    if not DATASETS_ROOT.exists():
+        return out
+    for p in sorted(DATASETS_ROOT.iterdir()):
+        try:
+            if p.is_dir() and not p.name.startswith('.'):
+                # Heuristic: only include if contains at least one file in subtree
+                any_file = next(p.rglob('*.*'), None)
+                if any_file is not None:
+                    out.append({'label': p.name, 'value': p.name})
+        except Exception:
+            continue
+    return out
+
+def resolve_dataset_root(name_or_none: str | None) -> Path:
+    if not name_or_none:
+        return DATASET_PATH
+    # Only allow names that resolve under DATASETS_ROOT to avoid arbitrary paths
+    candidate = (DATASETS_ROOT / name_or_none).resolve()
+    try:
+        candidate.relative_to(DATASETS_ROOT)
+    except Exception:
+        # Outside datasets root; reject by falling back to default
+        return DATASET_PATH
+    return candidate if candidate.exists() else DATASET_PATH
 
 
 @app.get('/health')
@@ -47,8 +80,10 @@ def health() -> Any:
 
 @app.get('/gallery.json')
 def gallery() -> Any:
-    # Use configured dataset; do not accept dataset via query params
-    dataset = str(DATASET_PATH)
+    # Accept optional dataset name via query params (must exist under DATASETS_ROOT)
+    dataset_name = request.args.get('dataset')
+    dataset_path = resolve_dataset_root(dataset_name)
+    dataset = str(dataset_path)
     method = request.args.get('method', 'pca').lower()
     embed_method = request.args.get('embed', 'avg').lower()
     # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
@@ -108,6 +143,29 @@ def gallery() -> Any:
         })
     print(f"[gallery] returning items={len(items)}")
     return jsonify({'items': items, 'dataset': dataset, 'n_layer': eff_layer, 'n_tile': n_tile, 'method': method, 'embed': embed_method, 'warning': None})
+
+
+@app.get('/datasets')
+def datasets_list():
+    """List available datasets under DATASETS_ROOT.
+
+    Returns an array of { label, value } objects, where value can be passed
+    as the 'dataset' query parameter to /gallery.json.
+    """
+    datasets = list_available_datasets()
+    # Always include a default entry at top
+    default_label = DATASET_PATH.name if DATASET_PATH.exists() else 'Default'
+    base = [{'label': default_label, 'value': DATASET_PATH.name}] if DATASET_PATH.exists() else []
+    # De-duplicate by value while preserving order
+    seen = set()
+    out = []
+    for d in base + datasets:
+        v = d.get('value')
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append({'label': d.get('label') or v, 'value': v})
+    return jsonify(out)
 
 
 @app.get('/images/<path:relpath>')

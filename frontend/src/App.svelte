@@ -31,9 +31,17 @@
   const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://localhost:5002'
   console.log('[frontend] API_BASE', API_BASE)
   let datasetPath = '' // leave blank to let server pick sample
+  // Datasets list for header dropdown; populated from backend if available
+  let datasets = [
+    { label: 'Sample (server default)', value: '' },
+    { label: 'COCO (sample)', value: 'coco-sample' },
+    { label: 'CIFAR-10', value: 'cifar10' },
+    { label: 'Placeholder A', value: 'dataset-a' },
+  ]
   // Radio selection and effective embed method
   let embedSelection = 'avg' // 'avg' | 'clip' | 'dino' | 'dift_sd' | 'text'
   let embedMethod = 'avg' // effective method sent to backend (may be dift_sd_partXY)
+  let colorSpace = 'color_lch' // 'color_lch' | 'color_hsv'
   let gridSize = 0
   let warningMsg = ''
   // External label storage (object, separate from images)
@@ -52,9 +60,10 @@
   // Dynamic minimap size based on available space
   $: minimapSize = (() => {
     // Recompute when left pane or window resizes
-    void leftWidth; void windowWidth
+    void leftWidth; void windowWidth; void leftTileH;
     const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth - 330) : 700
-    return Math.max(300, Math.min(800, w))
+    const h = minimapContainerRef ? Math.floor(minimapContainerRef.clientHeight - 50) : 700
+    return Math.max(300, Math.min(2000, w, h))
   })()
   let showTextOverlay = false
   let textSimilarities = {}
@@ -65,6 +74,48 @@
   let axes = [] // [{ id, name, coords }]
   let selectedAxisX = null
   let selectedAxisY = null
+  
+  function resetAllStateForDatasetChange() {
+    // Clear in-memory state
+    allImages = []
+    prevImages = []
+    filtered = []
+    clusters = []
+    selected = new Set()
+    refId = null
+    axes = []
+    selectedAxisX = null
+    selectedAxisY = null
+    concepts = []
+    combinedConcepts = []
+    selections = []
+    combinedSelections = []
+    labelsMap = new Map()
+    labelDB = {}
+    textLayerState = { baseEmbed: '', baseCoords: {}, coords: {}, rects: [], gridSize: 0 }
+    showTextOverlay = false
+    warningMsg = ''
+    // Clear caches
+    galleryCache.clear()
+    // Clear persisted keys
+    try {
+      localStorage.removeItem('promptherder.concepts')
+      localStorage.removeItem('promptherder.combined')
+      localStorage.removeItem('promptherder.textlayer')
+      localStorage.removeItem('promptherder.axes')
+      localStorage.removeItem('promptherder.selections')
+      localStorage.removeItem('promptherder.combinedSelections')
+    } catch (_) {}
+  }
+
+  async function onDatasetSelect(val) {
+    if (val === undefined) return
+    // If the same value, ignore
+    if ((datasetPath || '') === (val || '')) return
+    datasetPath = val
+    resetAllStateForDatasetChange()
+    await loadGallery()
+  }
 
   function scatterToCenter(radius = 0.06) {
     // Randomly scatter all points around center within a small radius
@@ -102,12 +153,17 @@
   }
   // Split pane state
   let leftWidth = 1200
+  // Simple per-tile sizes for corner resize
+  let leftTileH = 920
+  let middleWidth = 700
+  let middleTileH = 600
+  let rightTileH = 600
   let dragging = false
   let startX = 0
   let startLeft = 0
   let lastMouseX = 0
   let minLeft = 500 // tune: minimum visible width for the left pane
-  let maxLeft = 1000 // tune: maximum visible width for the left pane
+  let maxLeft = 2000 // tune: maximum visible width for the left pane
   let collapseThreshold = 700 // tune: drag below this to auto-collapse on release
   let leftCollapsed = false
   function startDrag(e) { dragging = true; startX = e.clientX; startLeft = leftWidth; lastMouseX = e.clientX }
@@ -131,12 +187,31 @@
   function onRightResizerDblClick() {
     middleCollapsed = !middleCollapsed
   }
+  // Corner tile drag resize state
+  let tileDrag = null // { which: 'left'|'middle'|'right', startX, startY, startW, startH }
+  function startLeftTileResize(e) {
+    tileDrag = { which: 'left', startX: e.clientX, startY: e.clientY, startW: leftWidth, startH: leftTileH }
+  }
+  function startMiddleTileResize(e) {
+    tileDrag = { which: 'middle', startX: e.clientX, startY: e.clientY, startW: middleWidth, startH: middleTileH }
+  }
+  function startRightTileResize(e) {
+    tileDrag = { which: 'right', startX: e.clientX, startY: e.clientY, startW: rightWidth, startH: rightTileH }
+  }
   
   let windowWidth = 0
   let rowRef
   let rowWidth = 0
   $: rowWidth = rowRef ? rowRef.clientWidth : windowWidth
   let middleCollapsed = true
+  // Projection options + aliases forwarded to AxesPanel
+  // Combine Shape and Local similarity under one radio; default DINO, optional DIFT part
+  const projectionOptions = [
+    { value: 'avg', label: 'Color' },
+    { value: 'clip', label: 'Semantic' },
+    { value: 'shape', label: 'Shape' },
+    { value: 'text', label: 'Text' },
+  ]
   function onDrag(e) {
     lastMouseX = e.clientX
     if (dragging) {
@@ -153,6 +228,20 @@
       const total = rowWidth || windowWidth || 0
       const allowedMaxRight = Math.max(minRight, total - leftVisible - minMiddle - (2 * RESIZER_PX))
       rightWidth = Math.max(minRight, Math.min(tentative, allowedMaxRight))
+    }
+    if (tileDrag) {
+      const dx = e.clientX - tileDrag.startX
+      const dy = e.clientY - tileDrag.startY
+      if (tileDrag.which === 'left') {
+        leftWidth = Math.max(minLeft, Math.min(maxLeft, tileDrag.startW + dx))
+        leftTileH = Math.max(300, tileDrag.startH + dy)
+      } else if (tileDrag.which === 'middle') {
+        middleWidth = Math.max(400, tileDrag.startW + dx)
+        middleTileH = Math.max(300, tileDrag.startH + dy)
+      } else if (tileDrag.which === 'right') {
+        rightWidth = Math.max(minRight, tileDrag.startW + dx)
+        rightTileH = Math.max(300, tileDrag.startH + dy)
+      }
     }
   }
   function endDrag() {
@@ -175,32 +264,23 @@
         middleCollapsed = true
       }
     }
+    tileDrag = null
     dragging = false; draggingRight = false
   }
 
   // DIFT part selector (for UI display only)
   let diftPart = '' // e.g., '11', '12', ..., '33'
 
-  // UI aliases for embed methods
-  function methodAlias(m) {
-    if (!m) return ''
-    if (m === 'avg') return 'Color'
-    if (m === 'clip') return 'Content'
-    if (m === 'dino') return 'Global composition'
-    if (m === 'dift_sd') return 'Local composition'
-    if (m === 'text') return 'Text'
-    if (m.startsWith('dift_sd_part')) return `Local composition ${m.replace('dift_sd_part','part ')}`
-    return m
-  }
-
   // Create or update the two default axes for the current projection (x,y)
   function axisPrefixForMethod(method) {
     if (!method) return 'Axis'
     if (method === 'avg') return 'Color'
-    if (method === 'clip') return 'Content'
-    if (method === 'dino') return 'Global composition'
-    if (method.startsWith('dift_sd_part')) return `Local composition ${method.replace('dift_sd_part','part ')}`
-    if (method === 'dift_sd') return 'Local composition'
+    if (method === 'color_hsv') return 'Color HSV'
+    if (method === 'color_lch') return 'Color LCh'
+    if (method === 'clip') return 'Semantic'
+    if (method === 'dino') return 'Shape'
+    if (method.startsWith('dift_sd_part')) return `Local sim. ${method.replace('dift_sd_part','part ')}`
+    if (method === 'dift_sd') return 'Local sim.'
     return method
   }
 
@@ -217,8 +297,8 @@
       coordsY[it.id] = Number(it.y ?? 0)
     }
     let next = axes
-    const axX = { id: idX, name: `${prefix} axis 1`, coords: coordsX }
-    const axY = { id: idY, name: `${prefix} axis 2`, coords: coordsY }
+    const axX = { id: idX, name: `${prefix} X`, coords: coordsX }
+    const axY = { id: idY, name: `${prefix} Y`, coords: coordsY }
     const hasX = next.some(a => a.id === idX)
     const hasY = next.some(a => a.id === idY)
     if (hasX) next = next.map(a => a.id === idX ? axX : a); else next = [axX, ...next]
@@ -435,6 +515,28 @@
   }
 
   onMount(() => {
+    // Try to fetch datasets list for the dropdown; fallback to placeholders above
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/datasets`)
+        if (res.ok) {
+          const data = await res.json()
+          if (Array.isArray(data)) {
+            // Accept an array of strings or objects
+            const mapped = data.map((d) => {
+              if (typeof d === 'string') return { label: d, value: d }
+              if (d && typeof d === 'object') {
+                const label = d.label || d.name || d.id || d.path || 'Dataset'
+                const value = d.value || d.id || d.path || d.name || label
+                return { label, value }
+              }
+              return null
+            }).filter(Boolean)
+            if (mapped.length > 0) datasets = mapped
+          }
+        }
+      } catch (_) { /* ignore, keep placeholders */ }
+    })()
     try {
       const raw = localStorage.getItem('promptherder.concepts')
       if (raw) {
@@ -491,16 +593,12 @@
   })(combinedSelections)
 
   function onEmbedChange() {
-    // Compute effective method; if DIFT selected without part, don't fetch yet
-    if (embedSelection === 'dift_sd' && !diftPart) {
-      warningMsg = 'Select a DIFT part (3x3) to load embeddings'
-      embedMethod = ''
-      return
-    }
     warningMsg = ''
-    // Do not set embedMethod to 'text'; preserve last non-text embedding
-    if (embedSelection === 'dift_sd') {
-      embedMethod = `dift_sd_part${diftPart}`
+    // Compute effective method for each selection
+    if (embedSelection === 'shape') {
+      embedMethod = diftPart ? `dift_sd_part${diftPart}` : 'dino'
+    } else if (embedSelection === 'avg') {
+      embedMethod = colorSpace || 'avg'
     } else if (embedSelection !== 'text') {
       embedMethod = embedSelection
     }
@@ -614,6 +712,16 @@
     <div class="app-header-inner">
       <div class="i-heroicons-sparkles brand-icon" />
       <div class="brand-name">ReQuest</div>
+      <!-- Dataset selector -->
+      <div class="ml-4 inline-flex items-center gap-2">
+        <label for="dataset-select" class="text-sm text-gray-700">Dataset</label>
+        <select id="dataset-select" class="text-sm"
+                on:change={(e)=> onDatasetSelect(e.currentTarget.value)}>
+          {#each datasets as d}
+            <option value={d.value} selected={(datasetPath||'')===(d.value||'')}>{d.label}</option>
+          {/each}
+        </select>
+      </div>
       <div class="flex-1" />
     </div>
   </header>
@@ -640,10 +748,10 @@
       {:else}
       <aside class="shrink-0" style={`width:${leftWidth}px;min-width:${minLeft}px ;max-width:${maxLeft}px;`}>
             <div class="tile tile-primary">
-              <div class="tile-content">
+              <div class="tile-content" style={`height:${leftTileH}px`}>
                 <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { leftCollapsed = true }}>–</button></div>
                 <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-photo text-slate-600" /> Define projection</div>
-      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:${minimapSize}px;`}>
+      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:100%;`}>
         {#if embedSelection === 'text'}
           <div class="absolute top-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-sm flex items-center gap-2" style="left: 50%;">
             <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={async () => { showTextOverlay = true; await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() }}>
@@ -660,10 +768,23 @@
               {axes}
               items={allImages}
               {concepts}
+              labels={new Map(Object.entries(labelDB))}
               embedSelection={embedSelection}
               diftPart={diftPart}
+              colorSpace={colorSpace}
+              projections={projectionOptions}
               on:embedChange={(e) => { embedSelection = e.detail.selection; onEmbedChange() }}
-              on:selectDiftPart={(e) => { diftPart = e.detail.part; embedMethod = `dift_sd_part${diftPart}`; embedSelection = 'dift_sd'; loadGallery(); }}
+              on:selectDiftPart={(e) => {
+                diftPart = (e.detail.part || '').trim()
+                if (diftPart) {
+                  embedMethod = `dift_sd_part${diftPart}`
+                } else {
+                  embedMethod = 'dino'
+                }
+                embedSelection = 'shape'
+                loadGallery()
+              }}
+              on:selectColorSpace={(e) => { colorSpace = e.detail.space; embedMethod = colorSpace; embedSelection = 'avg'; loadGallery(); }}
               on:setX={(e) => { selectedAxisX = e.detail.id }}
               on:setY={(e) => { selectedAxisY = e.detail.id }}
               on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
@@ -671,22 +792,27 @@
               on:rename={(e) => { axes = axes.map(a => a.id === e.detail.id ? { ...a, name: e.detail.name } : a) }}
             />
             <Callout title="Create personalized axes">
-              Start with a projection, select landmarks using the lasso tool, and create axes going from negative to positive.
+              <ul class="list-disc list-inside">
+                <li> Start with an initial projection, </li>
+                <li> Define new axes by selecting extremal examples in the scatterplot using the lasso tool </li>
+                <li> Drag new axes to reorganize scatterplot </li>
+              </ul>
             </Callout>
           </div>
           <div class="flex-1 min-w-0 ml-2">
-            <AxesMinimap
-              items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-              axes={axes}
-              width={minimapSize}
-              height={minimapSize}
-              labels={new Map(Object.entries(labelDB))}
-              bind:selectedX={selectedAxisX}
-              bind:selectedY={selectedAxisY}
-              on:axesChange={(e)=>{ selectedAxisX = e.detail.selectedX; selectedAxisY = e.detail.selectedY }}
-              on:label={onScribbleLabel}
-              on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
-            />
+          <AxesMinimap
+            items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
+            axes={axes}
+            width={minimapSize}
+            height={minimapSize}
+            labels={new Map(Object.entries(labelDB))}
+            bind:selectedX={selectedAxisX}
+            bind:selectedY={selectedAxisY}
+            on:axesChange={(e)=>{ selectedAxisX = e.detail.selectedX; selectedAxisY = e.detail.selectedY }}
+            on:label={onScribbleLabel}
+            on:create={(e) => { const ax = e.detail; if (ax && ax.id) { axes = [ax, ...axes] } }}
+            on:saveSelection={(e) => { const sel = e.detail; if (sel && sel.id) { selections = [sel, ...selections] } }}
+          />
           </div>
           
         </div>
@@ -699,8 +825,9 @@
             on:confirmRegion={onConfirmRegion}
           />
         {/if}
+      </div>
+      <div class="tile-resize-handle" title="Resize" on:mousedown={startLeftTileResize}></div>
           </div>
-        </div>
         </aside>
       {/if}
      {#if middleCollapsed}
@@ -712,9 +839,9 @@
           >Define selections</button>
         </div>
       {:else}
-        <section class="flex-1 min-w-0 pl-2 pr-2">
+        <section class="shrink-0 pl-2 pr-2" style={`width:${middleWidth}px`}>
           <div class="tile tile-primary">
-            <div class="tile-content">
+            <div class="tile-content" style={`height:${middleTileH}px`}>
               <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { middleCollapsed = true }}>–</button></div>
               <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-adjustments-horizontal text-slate-600" /> Define selections</div>
               
@@ -729,12 +856,13 @@
           <Callout title="Combine selections">
                 Activate selections to combine all positives or discard all negatives.
               </Callout>
+              <div class="tile-resize-handle" title="Resize" on:mousedown={startMiddleTileResize}></div>
             </div>
           </div>
         </section>
       {/if}
 
-      <!-- Resizer removed -->
+      
 
       <!-- Rightmost: saved combined selections -->
       {#if false}
@@ -751,7 +879,7 @@
         {:else}
           <aside class="shrink-0" style={`width:${rightWidth}px;min-width:${minRight}px`}>
           <div class="tile tile-primary">
-            <div class="tile-content">
+            <div class="tile-content" style={`height:${rightTileH}px`}>
               <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
               <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Saved combined selections</div>
                 <div class="grid gap-2">
@@ -779,6 +907,7 @@
                 <Callout title="Saved">
                   Apply a combined selection to set current labels, or move to selections to edit.
                 </Callout>
+                <div class="tile-resize-handle" title="Resize" on:mousedown={startRightTileResize}></div>
               </div>
             </div>
           </aside>
