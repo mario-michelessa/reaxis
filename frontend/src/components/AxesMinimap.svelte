@@ -20,8 +20,14 @@
   export let displayMargin = 0.1
   function toVis(v) {
     const m = Math.max(0, Math.min(0.49, Number(displayMargin || 0)))
-    const nv = Math.max(0, Math.min(1, Number(v || 0)))
+    const nv = Number(v || 0)
     return m + nv * (1 - 2 * m)
+  }
+  function fromVis(v) {
+    const m = Math.max(0, Math.min(0.49, Number(displayMargin || 0)))
+    const nv = Number(v || 0)
+    const denom = Math.max(1e-6, (1 - 2 * m))
+    return (nv - m) / denom
   }
 
   // External labels for outline rendering and axis creation
@@ -135,29 +141,35 @@
   // Hover and zoom state
   let griddingActive = false
   let activeCenterId = null
+  let gridRect = null // fixed rect while grid is active
+  // Zoom center for scaling points
   let cx = 0.5
   let cy = 0.5
+  // Rectangle center follows cursor
+  let rcx = 0.5
+  let rcy = 0.5
   let vf = viewFrac
   let lastTargetsUpdate = 0
   let posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 }
 
   function onMove(e) {
     const rect = e.currentTarget.getBoundingClientRect()
-    const x = (e.clientX - rect.left) / rect.width
-    const y = (e.clientY - rect.top) / rect.height
-    cx = Math.min(1, Math.max(0, x))
-    cy = Math.min(1, Math.max(0, y))
+    const vx = (e.clientX - rect.left) / rect.width
+    const vy = (e.clientY - rect.top) / rect.height
+    rcx = fromVis(vx)
+    rcy = fromVis(vy)
   }
+  let zoomZ = 1.0 // visual zoom scale around (cx,cy); 1 = no zoom
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
-  function zoomIn() { vf = clamp(vf * 0.85, 0.08, 0.8) }
-  function zoomOut() { vf = clamp(vf / 0.85, 0.08, 0.8) }
-  $: if (griddingActive) { posRect = { x0, y0, x1, y1, margin: hoverMargin }; lastTargetsUpdate = 0 }
+  function zoomIn() { zoomZ = clamp(zoomZ * 1.12, 1.0, 6.0) }
+  function zoomOut() { zoomZ = clamp(zoomZ / 1.12, 1.0, 6.0) }
+  function resetView() { cx = 0.5; cy = 0.5; zoomZ = 1.0; griddingActive = false; activeCenterId = null; gridRect = null; posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 } }
 
   // Viewport rect
   $: viewW = vf
   $: viewH = vf
-  $: x0 = Math.max(0, Math.min(1 - viewW, cx - viewW / 2))
-  $: y0 = Math.max(0, Math.min(1 - viewH, cy - viewH / 2))
+  $: x0 = Math.max(0, Math.min(1 - viewW, rcx - viewW / 2))
+  $: y0 = Math.max(0, Math.min(1 - viewH, rcy - viewH / 2))
   $: x1 = x0 + viewW
   $: y1 = y0 + viewH
   $: hoverMargin = Math.min(0.02, vf * 0.15)
@@ -173,8 +185,8 @@
   }
   // Normalized items for the lasso overlay – use the actually rendered positions
   // so selection matches the current (possibly customized) axes projection and packing.
-  $: lassoItems = Array.isArray(renderItems)
-    ? renderItems.map((it) => ({ id: it.id, x: it.x, y: it.y }))
+  $: lassoItems = Array.isArray(renderItemsVisible)
+    ? renderItemsVisible.map((it) => ({ id: it.id, x: it.x, y: it.y }))
     : []
 
   // Animation tracks
@@ -277,20 +289,22 @@
 
   // Precompute inside ids set (using original positions from axes)
   $: insideIds = new Set(items.filter((it) => {
+    if (!griddingActive || !gridRect) return false
     const p = posOriginal(it)
-    return griddingActive && p.x >= (x0 - hoverMargin) && p.x <= (x1 + hoverMargin) && p.y >= (y0 - hoverMargin) && p.y <= (y1 + hoverMargin)
+    return p.x >= (gridRect.x0 - hoverMargin) && p.x <= (gridRect.x1 + hoverMargin) && p.y >= (gridRect.y0 - hoverMargin) && p.y <= (gridRect.y1 + hoverMargin)
   }).map((it) => it.id))
 
-  $: localPacked = computeLocalPacked(items, posRect, sizeInside, spacingScale, width, height)
+  $: localPacked = computeLocalPacked(items, (griddingActive && gridRect) ? gridRect : null, sizeInside, spacingScale, width, height)
 
   // Compute animation targets and renderItems
   $: {
     const nextTargets = new Map(); const m = new Map(); let anyChange = false
     for (const it of items) {
       const p = posOriginal(it)
-      const rx0 = posRect?.x0 ?? x0, ry0 = posRect?.y0 ?? y0, rx1 = posRect?.x1 ?? x1, ry1 = posRect?.y1 ?? y1
-      const rmg = posRect?.margin ?? hoverMargin
-      const inside = griddingActive && p.x >= (rx0 - rmg) && p.x <= (rx1 + rmg) && p.y >= (ry0 - rmg) && p.y <= (ry1 + rmg)
+      const rect = (griddingActive && gridRect) ? gridRect : null
+      const rx0 = rect?.x0 ?? x0, ry0 = rect?.y0 ?? y0, rx1 = rect?.x1 ?? x1, ry1 = rect?.y1 ?? y1
+      const rmg = rect?.margin ?? hoverMargin
+      const inside = !!(griddingActive && rect && p.x >= (rx0 - rmg) && p.x <= (rx1 + rmg) && p.y >= (ry0 - rmg) && p.y <= (ry1 + rmg))
       const lp = localPacked.get(it.id)
       const to = (inside && lp) ? lp : p
       const prevTarget = prevTargets.get(it.id)
@@ -307,7 +321,17 @@
   $: elapsed = Math.max(0, nowTs - startTs)
   $: raw = Math.min(1, duration > 0 ? elapsed / duration : 1)
   $: tNorm = easeInOutCubic(raw)
-  $: renderItems = Array.from(tracks.values()).map((tr) => ({ id: tr.id, url: tr.url, x: toVis(lerp(tr.from.x, tr.to.x, tNorm)), y: toVis(lerp(tr.from.y, tr.to.y, tNorm)) }))
+  $: renderItems = Array.from(tracks.values()).map((tr) => {
+    const wx = lerp(tr.from.x, tr.to.x, tNorm)
+    const wy = lerp(tr.from.y, tr.to.y, tNorm)
+    const zx = cx + (wx - cx) * zoomZ
+    const zy = cy + (wy - cy) * zoomZ
+    const sx = toVis(zx)
+    const sy = toVis(zy)
+    return { id: tr.id, url: tr.url, x: sx, y: sy }
+  })
+  $: renderItemsVisible = Array.isArray(renderItems) ? renderItems.filter((it) => it.x >= 0 && it.x <= 1 && it.y >= 0 && it.y <= 1) : []
+  $: zoomScale = zoomZ
 
   function clamp01(v) { return Math.max(0, Math.min(1, v)) }
   $: gridBackdrop = (function computeBackdrop(active, list, insideSet, sizePx, wPx, hPx) {
@@ -331,15 +355,18 @@
     const x1b = clamp01(maxx + halfWn)
     const y1b = clamp01(maxy + halfHn)
     return { x0: x0b, y0: y0b, w: Math.max(0, x1b - x0b), h: Math.max(0, y1b - y0b) }
-  })(griddingActive, renderItems, insideIds, sizeInside, width, height)
+  })(griddingActive, renderItemsVisible, insideIds, Math.floor(sizeInside * zoomScale), width, height)
 
+  let suppressUntil = 0
   function pickOrToggle(e) {
+    if (zoomItemId) { return } // When overlay is open, ignore background clicks
+    if (performance.now() < suppressUntil) { return }
     const rect = e.currentTarget.getBoundingClientRect()
     const px = (e.clientX - rect.left) / rect.width
     const py = (e.clientY - rect.top) / rect.height
     let hitId = null
-    for (let i = renderItems.length - 1; i >= 0; i--) {
-      const it = renderItems[i]
+    for (let i = renderItemsVisible.length - 1; i >= 0; i--) {
+      const it = renderItemsVisible[i]
       const inside = griddingActive && insideIds.has(it.id)
       const sz = inside ? sizeInside : sizeOutside
       const dx = Math.abs(px - it.x) * rect.width
@@ -347,21 +374,46 @@
       if (dx <= sz / 2 && dy <= sz / 2) { hitId = it.id; break }
     }
     if (hitId) {
+      // If grid is active and we clicked a gridded image, open zoom overlay
+      if (griddingActive && insideIds && insideIds.has(hitId)) {
+        zoomItemId = hitId
+        return
+      }
       griddingActive = true
       activeCenterId = hitId
       const orig = items.find(j => j.id === hitId)
       if (orig) {
         const p = posOriginal(orig); cx = p.x; cy = p.y
       }
-      posRect = { x0, y0, x1, y1, margin: hoverMargin }
+      gridRect = { x0, y0, x1, y1, margin: hoverMargin }
       lastTargetsUpdate = 0
     } else {
-      griddingActive = false
-      activeCenterId = null
-      posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 }
-      lastTargetsUpdate = 0
+      // If clicking outside the current grid rect, close with an out animation
+      if (griddingActive && gridRect) {
+        const vx = px
+        const vy = py
+        const rx0 = toVis(gridRect.x0), ry0 = toVis(gridRect.y0)
+        const rx1 = toVis(gridRect.x1), ry1 = toVis(gridRect.y1)
+        const inside = (vx >= rx0 && vx <= rx1 && vy >= ry0 && vy <= ry1)
+        if (!inside) {
+          griddingActive = false
+          activeCenterId = null
+          gridRect = null
+          posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 }
+          lastTargetsUpdate = 0
+        }
+      }
     }
   }
+  let zoomItemId = null
+  function labelZoomed(kind) {
+    const id = zoomItemId
+    if (!id) return
+    const updates = [{ id, label: kind === 'pos' ? 'good' : 'bad' }]
+    dispatch('label', { updates })
+    zoomItemId = null
+  }
+  function closeZoom() { zoomItemId = null; suppressUntil = performance.now() + 250 }
 
   // Drag and drop handlers for X/Y axis selectors
   function allowDrop(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' }
@@ -392,34 +444,53 @@
     class="minimap"
     style={`width:${width}px;height:${height}px;`}
     on:mousemove={onMove}
+    on:wheel|passive={(e) => { if (e.deltaY < 0) { zoomIn() } else { zoomOut() } }}
     on:click|stopPropagation={(e) => pickOrToggle(e)}
   >
   {#if griddingActive && gridBackdrop}
     <div
       class="absolute pointer-events-none rounded"
-      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(229,231,235,0.5);z-index:5;`}
+      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(229,231,235,0.5);z-index:5; transition: opacity 200ms ease; opacity:1;`}
     />
   {/if}
-  {#each renderItems as it (it.id)}
+  {#each renderItemsVisible as it (it.id)}
     <img
       alt=""
       src={it.url}
       class="absolute object-cover rounded"
-      style={`left:${it.x * 100}%;top:${it.y * 100}%;transform:translate(-50%,-50%);width:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;height:${(griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside)}px;transition:width 120ms ease,height 120ms ease; z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.8)}; border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='good'?'#16a34a':'#dc2626'):'none'}; box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
+      style={`left:${it.x * 100}%;top:${it.y * 100}%;transform:translate(-50%,-50%);width:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;height:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;transition:width 120ms ease,height 120ms ease; z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.85)}; border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='good'?'#16a34a':'#dc2626'):'none'}; box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
       loading="lazy"
     />
   {/each}
 
-  {#if griddingActive}
+  {#if true}
     <div
       class="absolute border border-blue-500/70 pointer-events-none"
-      style={`left:${toVis(x0) * 100}%;top:${toVis(y0) * 100}%;width:${(viewW * (1 - 2*displayMargin)) * 100}%;height:${(viewH * (1 - 2*displayMargin)) * 100}%;`}
+      style={`left:${toVis(x0) * 100}%;top:${toVis(y0) * 100}%;width:${(toVis(x1)-toVis(x0)) * 100}%;height:${(toVis(y1)-toVis(y0)) * 100}%;`}
     />
+  {/if}
+
+  {#if zoomItemId}
+    <div class="absolute inset-0 bg-black/40 flex items-center justify-center z-30" on:click|stopPropagation={closeZoom}>
+      <div class="bg-white rounded shadow-lg p-3 relative" on:click|stopPropagation style="max-width:90%;max-height:85%;">
+        {#each renderItemsVisible.filter(r => r.id===zoomItemId) as itz}
+          <img alt="zoom" src={itz.url} style="max-width:80vw; max-height:70vh; object-fit:contain; display:block; margin:auto;" />
+        {/each}
+        <div class="mt-2 flex gap-2 justify-center z-40 relative">
+          <button class="btn btn-sm btn-success" style="z-index:41" on:click|stopPropagation|preventDefault={() => labelZoomed('pos')}><span class="i-heroicons-hand-thumb-up" /> Label as positive</button>
+          <button class="btn btn-sm btn-danger" style="z-index:41" on:click|stopPropagation|preventDefault={() => labelZoomed('neg')}><span class="i-heroicons-hand-thumb-down" /> Label as negative</button>
+          <button class="btn btn-sm btn-ui-secondary" style="z-index:41" on:click|stopPropagation|preventDefault={closeZoom}>Close</button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   <div class="toolbar pos-top-right right-just z-10">
     <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomIn} aria-label="Zoom in">+</button>
     <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomOut} aria-label="Zoom out">−</button>
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={resetView} title="Reset view" aria-label="Reset view">
+      ⟲
+    </button>
   </div>
 
   <div class="toolbar pos-top-left z-10">
