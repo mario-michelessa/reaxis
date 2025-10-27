@@ -11,7 +11,8 @@
   function onDelete() { dispatch('delete', { id: selection.id }) }
 </script>
 
-<div class="subtile flex flex-col gap-2 hover:bg-gray-50">
+<div class="subtile flex flex-col gap-2 hover:bg-gray-50" draggable="true"
+     on:dragstart={(e)=>{ try { const payload = JSON.stringify({ id: selection.id, name: selection.name, posIds: selection.posIds||[], negIds: selection.negIds||[] }); e.dataTransfer.setData('application/x-selection', payload); e.dataTransfer.setData('text/plain', payload); } catch(_) {} }}>
   <div class="flex items-start gap-2">
     <button class="text-left flex-1" on:click={() => (expanded = !expanded)}
             title={`Pos: ${selection.posIds?.length || 0} • Neg: ${selection.negIds?.length || 0}`}>

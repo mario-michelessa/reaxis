@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte'
-  export let selected = '' // '11'..'33'
+  let selected = '' // '11'..'33'
+  let method = '' // dino or dift_sd_partXY
   const dispatch = createEventDispatcher()
 
   const rows = [0,1,2,]
@@ -9,13 +10,22 @@
   function pick(r, c) {
     const part = `${r}${c}`
     if (selected === part) {
-      // Toggle off selection
+      method = 'dino'
       selected = ''
-      dispatch('select', { part: '' })
     } else {
+      method = 'dift_sd_part' + part
       selected = part
-      dispatch('select', { part })
     }
+    dispatch('change', method)
+  }
+
+  function symbolForPart(r, c) {
+    const symbols = [  
+      ['↖','↑','↗'],
+      ['←','·','→'],
+      ['↙','↓','↘'],
+    ]
+    return symbols[r][c]
   }
 </script>
 <div class="flex justify-center ">
@@ -27,9 +37,8 @@
           class="w-9 h-9 border rounded text-xs"
           class:bg-gray-200={selected !== `${r}${c}`}
           class:bg-blue-600={selected === `${r}${c}`}
-          class:text-white={selected === `${r}${c}`}
           on:click={() => pick(r, c)}
-        ></button>
+        > {symbolForPart(r, c)}</button>
       {/key}
     {/each}
   {/each}

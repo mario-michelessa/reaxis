@@ -11,9 +11,10 @@
   export let width = 700
   export let height = 700
   export let viewFrac = 0.15 // viewport square fraction (initial)
-  export let duration = 400 // ms
-  export let minImagePx = 20
+  export let duration = 300 // ms
+  export let minImagePx = 25
   export let posUpdateMs = 450
+
   const dispatch = createEventDispatcher()
 
   // Visual margin for display (map [0,1] -> [m, 1-m])
@@ -45,8 +46,8 @@
     let c = 0
     if (!labels) return 0
     try {
-      if (labels instanceof Map) { labels.forEach((v) => { if (v === 'good') c++ }) }
-      else { for (const v of Object.values(labels)) if (v === 'good') c++ }
+      if (labels instanceof Map) { labels.forEach((v) => { if (v === 'pos') c++ }) }
+      else { for (const v of Object.values(labels)) if (v === 'pos') c++ }
     } catch (_) {}
     return c
   })()
@@ -54,14 +55,14 @@
     let c = 0
     if (!labels) return 0
     try {
-      if (labels instanceof Map) { labels.forEach((v) => { if (v === 'bad') c++ }) }
-      else { for (const v of Object.values(labels)) if (v === 'bad') c++ }
+      if (labels instanceof Map) { labels.forEach((v) => { if (v === 'neg') c++ }) }
+      else { for (const v of Object.values(labels)) if (v === 'neg') c++ }
     } catch (_) {}
     return c
   })()
 
   // Lasso selection & labeling
-  let lassoEnabled = false
+  let lassoEnabled = true
   let lassoMode = 'pos' // 'pos' | 'neg' controls lasso color
   let lastSelectedIds = []
   let lassoRef
@@ -77,33 +78,35 @@
     for (const id of ids) {
       const cur = labelOf(id)
       if (lassoMode === 'pos') {
-        if (cur === 'good') updates.push({ id, label: null }) // toggle off
-        else updates.push({ id, label: 'good' }) // set or flip to good
+        if (cur === 'pos') updates.push({ id, label: null }) // toggle off
+        else updates.push({ id, label: 'pos' }) // set or flip to pos
       } else {
-        if (cur === 'bad') updates.push({ id, label: null })
-        else updates.push({ id, label: 'bad' })
+        if (cur === 'neg') updates.push({ id, label: null })
+        else updates.push({ id, label: 'neg' })
       }
     }
     dispatch('label', { updates })
     // Clear selection and lasso path; keep lasso enabled for next selection
     lastSelectedIds = []
     try { lassoRef && lassoRef.reset && lassoRef.reset() } catch(_) {}
+    // Suppress grid toggling immediately after a lasso selection completes
+    suppressUntil = performance.now() + 400
   }
   // Buttons now only change mode (color); application happens on release
   function setLassoMode(kind) { lassoMode = (kind === 'neg') ? 'neg' : 'pos' }
   function createAxisFromLabels() {
     // Build axis scores based on current labels
-    const goodIds = new Set()
-    const badIds = new Set()
+    const posIds = new Set()
+    const negIds = new Set()
     if (labels) {
       if (labels instanceof Map) {
-        labels.forEach((v, k) => { if (v === 'good') goodIds.add(k); if (v === 'bad') badIds.add(k) })
+        labels.forEach((v, k) => { if (v === 'pos') posIds.add(k); if (v === 'neg') negIds.add(k) })
       } else {
-        for (const [k, v] of Object.entries(labels)) { if (v === 'good') goodIds.add(k); if (v === 'bad') badIds.add(k) }
+        for (const [k, v] of Object.entries(labels)) { if (v === 'pos') posIds.add(k); if (v === 'neg') negIds.add(k) }
       }
     }
-    const posItems = items.filter(i => goodIds.has(i.id))
-    const negItems = items.filter(i => badIds.has(i.id))
+    const posItems = items.filter(i => posIds.has(i.id))
+    const negItems = items.filter(i => negIds.has(i.id))
     function dist(a, b) { const pa = posOriginal(a), pb = posOriginal(b); return Math.hypot((pa.x - pb.x), (pa.y - pb.y)) }
     function minDist(pt, arr) { if (!arr.length) return Infinity; let m = Infinity; for (const s of arr) { const d = dist(pt, s); if (d < m) m = d } return m }
     const coords = {}
@@ -142,6 +145,8 @@
   let griddingActive = false
   let activeCenterId = null
   let gridRect = null // fixed rect while grid is active
+  let griddedImsRect = null // last rect used to compute gridded images
+  let gridMargin = 0.01
   // Zoom center for scaling points
   let cx = 0.5
   let cy = 0.5
@@ -161,9 +166,33 @@
   }
   let zoomZ = 1.0 // visual zoom scale around (cx,cy); 1 = no zoom
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
-  function zoomIn() { zoomZ = clamp(zoomZ * 1.12, 1.0, 6.0) }
-  function zoomOut() { zoomZ = clamp(zoomZ / 1.12, 1.0, 6.0) }
-  function resetView() { cx = 0.5; cy = 0.5; zoomZ = 1.0; griddingActive = false; activeCenterId = null; gridRect = null; posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 } }
+  // Buttons: resize the viewport (blue rect)
+  function viewportZoomIn() { vf = clamp(vf * 0.88, 0.04, 0.9) }
+  function viewportZoomOut() { vf = clamp(vf / 0.88, 0.04, 0.9) }
+  // Wheel: zoom content around center
+  function contentZoomIn() { zoomZ = clamp(zoomZ * 1.12, 1.0, 6.0) }
+  function contentZoomOut() { zoomZ = clamp(zoomZ / 1.12, 1.0, 6.0) }
+  function resetView() { cx = 0.5; cy = 0.5; zoomZ = 1.0; griddingActive = false; activeCenterId = null; gridRect = null; griddedImsRect = null; posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 } }
+  function onWheel(e) {
+    // Zoom around the cursor so the pointed spot stays fixed
+    const rect = e.currentTarget.getBoundingClientRect()
+    const vx = (e.clientX - rect.left) / Math.max(1, rect.width)
+    const vy = (e.clientY - rect.top) / Math.max(1, rect.height)
+    const zx = fromVis(vx)
+    const zy = fromVis(vy)
+    const factor = 1.12
+    const nextZ = clamp(e.deltaY < 0 ? (zoomZ * factor) : (zoomZ / factor), 1.0, 6.0)
+    if (nextZ === zoomZ) return
+    // Convert current cursor zoom-space position (zx,zy) to world (pre-zoom) coords
+    const px = cx + (zx - cx) / Math.max(1e-6, zoomZ)
+    const py = cy + ((1 - zy) - cy) / Math.max(1e-6, zoomZ)
+    if (Math.abs(1 - nextZ) > 1e-6) {
+      const denom = (1 - nextZ)
+      cx = clamp((zx - nextZ * px) / denom, 0, 1)
+      cy = clamp(((1 - zy) - nextZ * py) / denom, 0, 1)
+    }
+    zoomZ = nextZ
+  }
 
   // Viewport rect
   $: viewW = vf
@@ -186,7 +215,7 @@
   // Normalized items for the lasso overlay – use the actually rendered positions
   // so selection matches the current (possibly customized) axes projection and packing.
   $: lassoItems = Array.isArray(renderItemsVisible)
-    ? renderItemsVisible.map((it) => ({ id: it.id, x: it.x, y: it.y }))
+    ? renderItemsVisible.map((it) => ({ id: it.id, x: it.x, y: 1 - it.y }))
     : []
 
   // Animation tracks
@@ -231,7 +260,7 @@
     const sy = Math.max(1e-6, stepPx / Math.max(1, hPx))
     const inside = itemsArr.filter((it) => {
       const p = posOriginal(it)
-      return p.x >= (rx0 - margin) && p.x <= (rx1 + margin) && p.y >= (ry0 - margin) && p.y <= (ry1 + margin)
+      return p.x >= (rx0 - margin) && p.x <= (rx1 + margin) && (1 - p.y) >= (ry0 - margin) && (1 - p.y) <= (ry1 + margin)
     })
     if (!inside.length) return new Map()
     const cx = (rx0 + rx1) / 2, cy = (ry0 + ry1) / 2
@@ -287,24 +316,24 @@
   $: sizeOutside = Math.max(8, Math.floor(imSize * 0.8))
   $: spacingScale = Math.max(1.3, 1.3 + 0.0 * (vfRatio - 1))
 
-  // Precompute inside ids set (using original positions from axes)
-  $: insideIds = new Set(items.filter((it) => {
+  // Precompute inside ids set (using original positions and fixed gridRect captured on click)
+  $: insideIds = new Set(itemsFiltered.filter((it) => {
     if (!griddingActive || !gridRect) return false
     const p = posOriginal(it)
-    return p.x >= (gridRect.x0 - hoverMargin) && p.x <= (gridRect.x1 + hoverMargin) && p.y >= (gridRect.y0 - hoverMargin) && p.y <= (gridRect.y1 + hoverMargin)
+    return p.x >= (gridRect.x0 - hoverMargin) && p.x <= (gridRect.x1 + hoverMargin) && (1 - p.y) >= (gridRect.y0 - hoverMargin) && (1 - p.y) <= (gridRect.y1 + hoverMargin)
   }).map((it) => it.id))
 
-  $: localPacked = computeLocalPacked(items, (griddingActive && gridRect) ? gridRect : null, sizeInside, spacingScale, width, height)
+  $: localPacked = computeLocalPacked(itemsFiltered, (griddingActive && gridRect) ? gridRect : null, sizeInside, spacingScale, width, height)
 
   // Compute animation targets and renderItems
   $: {
     const nextTargets = new Map(); const m = new Map(); let anyChange = false
-    for (const it of items) {
+    for (const it of itemsFiltered) {
       const p = posOriginal(it)
       const rect = (griddingActive && gridRect) ? gridRect : null
       const rx0 = rect?.x0 ?? x0, ry0 = rect?.y0 ?? y0, rx1 = rect?.x1 ?? x1, ry1 = rect?.y1 ?? y1
       const rmg = rect?.margin ?? hoverMargin
-      const inside = !!(griddingActive && rect && p.x >= (rx0 - rmg) && p.x <= (rx1 + rmg) && p.y >= (ry0 - rmg) && p.y <= (ry1 + rmg))
+      const inside = !!(griddingActive && rect && p.x >= (rx0 - rmg) && p.x <= (rx1 + rmg) && (1 - p.y) >= (ry0 - rmg) && (1 - p.y) <= (ry1 + rmg))
       const lp = localPacked.get(it.id)
       const to = (inside && lp) ? lp : p
       const prevTarget = prevTargets.get(it.id)
@@ -334,6 +363,7 @@
   $: zoomScale = zoomZ
 
   function clamp01(v) { return Math.max(0, Math.min(1, v)) }
+  // Grey rectangle based on visible gridded images (static while grid is active)
   $: gridBackdrop = (function computeBackdrop(active, list, insideSet, sizePx, wPx, hPx) {
     if (!active || !Array.isArray(list) || list.length === 0) return null
     const halfWn = (sizePx / Math.max(1, wPx)) / 2
@@ -344,17 +374,16 @@
       if (!insideSet.has(it.id)) continue
       count++
       if (it.x < minx) minx = it.x
-      if (it.y < miny) miny = it.y
+      if (1-it.y < miny) miny = 1-it.y
       if (it.x > maxx) maxx = it.x
-      if (it.y > maxy) maxy = it.y
+      if (1-it.y > maxy) maxy = 1-it.y
     }
     if (count === 0 || !isFinite(minx)) return null
-    // list is already in visual space; extend by half image size (normalized)
     const x0b = clamp01(minx - halfWn)
     const y0b = clamp01(miny - halfHn)
     const x1b = clamp01(maxx + halfWn)
     const y1b = clamp01(maxy + halfHn)
-    return { x0: x0b, y0: y0b, w: Math.max(0, x1b - x0b), h: Math.max(0, y1b - y0b) }
+    return { x0: x0b, y0: y0b, w: Math.max(0, x1b - x0b), h: Math.max(0, y1b - y0b), x1: x1b, y1: y1b }
   })(griddingActive, renderItemsVisible, insideIds, Math.floor(sizeInside * zoomScale), width, height)
 
   let suppressUntil = 0
@@ -364,52 +393,74 @@
     const rect = e.currentTarget.getBoundingClientRect()
     const px = (e.clientX - rect.left) / rect.width
     const py = (e.clientY - rect.top) / rect.height
+    
+    // Find nearest visible image under cursor (in visual coords)
     let hitId = null
     for (let i = renderItemsVisible.length - 1; i >= 0; i--) {
       const it = renderItemsVisible[i]
       const inside = griddingActive && insideIds.has(it.id)
       const sz = inside ? sizeInside : sizeOutside
       const dx = Math.abs(px - it.x) * rect.width
-      const dy = Math.abs(py - it.y) * rect.height
+      const dy = Math.abs(py - 1 + it.y) * rect.height
       if (dx <= sz / 2 && dy <= sz / 2) { hitId = it.id; break }
     }
-    if (hitId) {
-      // If grid is active and we clicked a gridded image, open zoom overlay
-      if (griddingActive && insideIds && insideIds.has(hitId)) {
-        zoomItemId = hitId
+    // If grid is active, handle inside/outside clicks
+    if (griddingActive && gridRect) {
+      const vx = px
+      const vy = py
+      // Compare against gridded images rect for interaction; fallback to captured rect if missing
+      const rx0 = gridBackdrop ? gridBackdrop.x0 : toVis(gridRect.x0)
+      const ry0 = gridBackdrop ? gridBackdrop.y0 : toVis(gridRect.y0)
+      const rx1 = gridBackdrop ? gridBackdrop.x1 : toVis(gridRect.x1)
+      const ry1 = gridBackdrop ? gridBackdrop.y1 : toVis(gridRect.y1)
+      const inside = (vx >= rx0 && vx <= rx1 && vy >= ry0 && vy <= ry1)
+      if (!inside) {
+        // Click outside grid -> close grid
+        griddingActive = false
+        activeCenterId = null
+        gridRect = null
+        posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 }
+        lastTargetsUpdate = 0
+        try { console.log('[minimap] grid closed') } catch(_) {}
         return
       }
-      griddingActive = true
-      activeCenterId = hitId
-      const orig = items.find(j => j.id === hitId)
-      if (orig) {
-        const p = posOriginal(orig); cx = p.x; cy = p.y
+      // Inside grid: if clicking a gridded image, open zoom overlay
+      if (hitId && insideIds && insideIds.has(hitId)) {
+        zoomItemId = hitId
+        try { console.log('[minimap] zoom image', hitId) } catch(_) {}
+        return
       }
-      gridRect = { x0, y0, x1, y1, margin: hoverMargin }
-      lastTargetsUpdate = 0
-    } else {
-      // If clicking outside the current grid rect, close with an out animation
-      if (griddingActive && gridRect) {
-        const vx = px
-        const vy = py
-        const rx0 = toVis(gridRect.x0), ry0 = toVis(gridRect.y0)
-        const rx1 = toVis(gridRect.x1), ry1 = toVis(gridRect.y1)
-        const inside = (vx >= rx0 && vx <= rx1 && vy >= ry0 && vy <= ry1)
-        if (!inside) {
-          griddingActive = false
-          activeCenterId = null
-          gridRect = null
-          posRect = { x0: 0, y0: 0, x1: 1, y1: 1, margin: 0 }
-          lastTargetsUpdate = 0
-        }
-      }
+      // Otherwise do nothing (keep grid)
+      return
     }
+    // Grid not active: enable grid on current viewport rectangle (capture current blue rect)
+    griddingActive = true
+    activeCenterId = null
+    gridRect = { x0, y0, x1, y1, margin: hoverMargin }
+    lastTargetsUpdate = 0
+    try {
+      console.log('[minimap] grid enable gridRect (norm)', gridRect)
+      // compute and log grey bounds based on current visible items
+      const sz = Math.floor(sizeInside * zoomScale)
+      const halfWn = (sz / Math.max(1, width)) / 2
+      const halfHn = (sz / Math.max(1, height)) / 2
+      let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity, count=0
+      for (const it of renderItemsVisible) { if (insideIds.has(it.id)) { count++; if (it.x<minx) minx=it.x; if (it.y<miny) miny=it.y; if (it.x>maxx) maxx=it.x; if (it.y>maxy) maxy=it.y } }
+      if (count>0 && isFinite(minx)) {
+        const x0b = clamp01(minx - halfWn), y0b = clamp01(miny - halfHn)
+        const x1b = clamp01(maxx + halfWn), y1b = clamp01(maxy + halfHn)
+        console.log('[minimap] grey visual %', { x0: +(x0b*100).toFixed(1), y0: +(y0b*100).toFixed(1), x1: +(x1b*100).toFixed(1), y1: +(y1b*100).toFixed(1) })
+      }
+      console.log('[minimap] insideIds count', insideIds.size, 'sample', Array.from(insideIds).slice(0,10))
+    } catch(_) {}
   }
+
+  
   let zoomItemId = null
   function labelZoomed(kind) {
     const id = zoomItemId
     if (!id) return
-    const updates = [{ id, label: kind === 'pos' ? 'good' : 'bad' }]
+    const updates = [{ id, label: kind === 'pos' ? 'pos' : 'neg' }]
     dispatch('label', { updates })
     zoomItemId = null
   }
@@ -433,6 +484,89 @@
   }
   function clearX() { selectedX = null; dispatch('axesChange', { selectedX, selectedY }) }
   function clearY() { selectedY = null; dispatch('axesChange', { selectedX, selectedY }) }
+
+  // Selections provided by parent and top-center filtering controls
+  export let selections = [] // [{id,name,posIds,negIds,active}]
+  $: selectionsById = new Map((selections||[]).map(s => [s.id, s]))
+  // Top-center filter dropdown + drag-and-drop of selections
+  // Modes: 'all' shows everything; 'keep-pos' shows only selected selection's positives;
+  //        'discard-neg' hides selected selection's negatives (keeps non-negative images)
+  let filterMode = 'all' // 'all' | 'keep-pos' | 'discard-neg'
+  let filterSelection = null // { id, name, posIds:[], negIds:[] }
+  let selectedSelectionId = ''
+  $: filterPosSet = new Set(Array.isArray(filterSelection?.posIds) ? filterSelection.posIds : [])
+  $: filterNegSet = new Set(Array.isArray(filterSelection?.negIds) ? filterSelection.negIds : [])
+  // Keep filter in sync with current selections list (e.g., if deleted)
+  $: if (filterSelection && selectionsById.size > 0) {
+    if (selectionsById.has(filterSelection.id)) {
+      // Update reference to the canonical selection object
+      filterSelection = selectionsById.get(filterSelection.id)
+    } else if (selectedSelectionId) {
+      // Selected id is no longer present
+      selectedSelectionId = ''
+      filterSelection = null
+      filterMode = 'all'
+    }
+  }
+  function onFilterModeChange(val) {
+    // If no selection is set, non-'all' modes are not applicable
+    if ((val === 'keep-pos' || val === 'discard-neg') && !filterSelection) {
+      filterMode = 'all'
+      return
+    }
+    // Switching manually clears selection details when returning to 'all'
+    filterMode = val
+    if (filterMode === 'all') filterSelection = null
+  }
+  function allowDropSelection(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' }
+  function onDropSelection(e) {
+    e.preventDefault()
+    try {
+      const raw = e.dataTransfer.getData('application/x-selection') || e.dataTransfer.getData('text/plain')
+      if (!raw) return
+      const sel = JSON.parse(raw)
+      // Prefer the canonical selection from props when available
+      const viaId = sel?.id && selectionsById.get(sel.id)
+      const s = viaId || sel
+      selectedSelectionId = viaId ? viaId.id : ''
+      applySelectionChoice(s)
+    } catch (_) { /* ignore */ }
+  }
+  function onDropdownSelect(id) {
+    selectedSelectionId = id || ''
+    if (!id) {
+      filterSelection = null
+      filterMode = 'all'
+      return
+    }
+    const sel = selectionsById.get(id)
+    applySelectionChoice(sel)
+  }
+  function applySelectionChoice(sel) {
+    if (!sel) { filterSelection = null; filterMode = 'all'; return }
+    const pos = Array.isArray(sel?.posIds) ? sel.posIds : []
+    const neg = Array.isArray(sel?.negIds) ? sel.negIds : []
+    filterSelection = sel
+    if (pos.length > 0 && neg.length === 0) {
+      filterMode = 'keep-pos'
+    } else if (neg.length > 0 && pos.length === 0) {
+      filterMode = 'discard-neg'
+    } else if (pos.length > 0 && neg.length > 0) {
+      // Mixed: wait for explicit button click; show controls
+      filterMode = 'all'
+    } else {
+      // Empty selection: show all
+      filterMode = 'all'
+    }
+  }
+
+  // Items used for rendering after applying filter
+  $: itemsFiltered = (function() {
+    const base = Array.isArray(items) ? items : []
+    if (filterMode === 'keep-pos') return base.filter(it => filterPosSet.has(it.id))
+    if (filterMode === 'discard-neg') return base.filter(it => !filterNegSet.has(it.id))
+    return base
+  })()
 </script>
 
 <!-- Y axis selector will be positioned inside the minimap (left side) -->
@@ -444,22 +578,32 @@
     class="minimap"
     style={`width:${width}px;height:${height}px;`}
     on:mousemove={onMove}
-    on:wheel|passive={(e) => { if (e.deltaY < 0) { zoomIn() } else { zoomOut() } }}
-    on:click|stopPropagation={(e) => pickOrToggle(e)}
+    on:wheel|stopPropagation|preventDefault={onWheel}
+    on:click|stopPropagation|preventDefault={(e) => pickOrToggle(e)}
   >
   {#if griddingActive && gridBackdrop}
     <div
       class="absolute pointer-events-none rounded"
-      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(229,231,235,0.5);z-index:5; transition: opacity 200ms ease; opacity:1;`}
+      style={`left:${(gridBackdrop.x0 - gridMargin) * 100}%;top:${(gridBackdrop.y0 - gridMargin) * 100}%;width:${(gridBackdrop.w + 2*gridMargin) * 100}%;height:${(gridBackdrop.h + 2*gridMargin) * 100}%;background:rgba(229,231,235,0.9);z-index:5; transition: opacity 200ms ease; opacity:1;`}
     />
-  {/if}
+    {/if}
   {#each renderItemsVisible as it (it.id)}
     <img
       alt=""
       src={it.url}
       class="absolute object-cover rounded"
-      style={`left:${it.x * 100}%;top:${it.y * 100}%;transform:translate(-50%,-50%);width:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;height:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;transition:width 120ms ease,height 120ms ease; z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.85)}; border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='good'?'#16a34a':'#dc2626'):'none'}; box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
-      loading="lazy"
+      decoding="async"
+      fetchpriority="low"
+      style={`left:${it.x * 100}%;
+              top:${(1 - it.y) * 100}%;
+              transform:translate(-50%,-50%);
+              width:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
+              height:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
+              transition:width 120ms ease,height 120ms ease; 
+              z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; 
+              opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.85)}; 
+              border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='pos'?'#16a34a':'#dc2626'):'none'}; 
+              box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
     />
   {/each}
 
@@ -469,6 +613,8 @@
       style={`left:${toVis(x0) * 100}%;top:${toVis(y0) * 100}%;width:${(toVis(x1)-toVis(x0)) * 100}%;height:${(toVis(y1)-toVis(y0)) * 100}%;`}
     />
   {/if}
+
+  
 
   {#if zoomItemId}
     <div class="absolute inset-0 bg-black/40 flex items-center justify-center z-30" on:click|stopPropagation={closeZoom}>
@@ -486,9 +632,9 @@
   {/if}
 
   <div class="toolbar pos-top-right right-just z-10">
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomIn} aria-label="Zoom in">+</button>
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={zoomOut} aria-label="Zoom out">−</button>
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation={resetView} title="Reset view" aria-label="Reset view">
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomIn} aria-label="Zoom in">+</button>
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomOut} aria-label="Zoom out">−</button>
+    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view">
       ⟲
     </button>
   </div>
@@ -500,9 +646,28 @@
     </button>
   </div>
 
+  <!-- Top-center filter dropdown and drop target -->
+  <div class="axis-rail-top text-sm" on:dragover={allowDropSelection} on:drop={onDropSelection} title="Drop a selection here or choose one to filter">
+    <div class="inline-flex items-center gap-2">
+      <span class="text-gray-700 text-sm">Filter</span>
+      <select class="text-sm" on:change={(e)=> onDropdownSelect(e.currentTarget.value)}>
+        <option value="" selected={!selectedSelectionId}>All images</option>
+        {#each (selections||[]) as s}
+          <option value={s.id} selected={selectedSelectionId===s.id}>{s.name || s.id}</option>
+        {/each}
+      </select>
+      {#if filterSelection && (Array.isArray(filterSelection.posIds) && filterSelection.posIds.length>0) && (Array.isArray(filterSelection.negIds) && filterSelection.negIds.length>0)}
+        <button class="btn btn-xs btn-positive" on:click={() => { filterMode='keep-pos' }} title="Keep only positive examples">Keep positive</button>
+        <button class="btn btn-xs btn-negative" on:click={() => { filterMode='discard-neg' }} title="Remove negative examples">Remove negatives</button>
+      {/if}
+      {#if filterMode!=='all' && filterSelection}
+        <button class="btn btn-xs btn-ui-secondary" on:click={() => { filterMode='all'; filterSelection=null; selectedSelectionId='' }}>Clear</button>
+      {/if}
+    </div>
+  </div>
+
   <!-- Y axis control on the left, fully vertical (label + rotated select) -->
-  <div class="axis-rail-left text-sm"
-       on:dragover={allowDrop} on:drop={onDropY} title="Drop an axis here">
+  <div class="axis-rail-left text-sm left-just" on:dragover={allowDrop} on:drop={onDropY} title="Drop an axis here">
     <div class="text-gray-700" style="">Y axis</div>
     <div class="origin-top-left" style="">
       <select class="text-sm" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
@@ -517,26 +682,26 @@
   <!-- Bottom-right create selection button -->
   <div class="toolbar pos-bottom-right right-just z-10">
     <button class="btn btn-sm btn-minimap" on:click|stopPropagation={() => {
-      const good = []
-      const bad = []
+      const pos = []
+      const neg = []
       try {
-        if (labels instanceof Map) { labels.forEach((v,k)=>{ if (v==='good') good.push(k); else if (v==='bad') bad.push(k) }) }
-        else { for (const [k,v] of Object.entries(labels||{})) { if (v==='good') good.push(k); else if (v==='bad') bad.push(k) } }
+        if (labels instanceof Map) { labels.forEach((v,k)=>{ if (v==='pos') pos.push(k); else if (v==='neg') neg.push(k) }) }
+        else { for (const [k,v] of Object.entries(labels||{})) { if (v==='pos') pos.push(k); else if (v==='neg') neg.push(k) } }
       } catch(_) {}
       const name = prompt('Name this selection', 'Selection') || 'Selection'
-      dispatch('saveSelection', { id: `sel:${Date.now()}`, name, posIds: good, negIds: bad, active: true })
+      dispatch('saveSelection', { id: `sel:${Date.now()}`, name, posIds: pos, negIds: neg, active: true })
     }}>Create selection</button>
   </div>
 
   <!-- Bottom-left info callout -->
   <div class="absolute left-1 bottom-1 z-10" style="max-width:260px">
-    <Callout storageKey="minimap" variant="info" title="Minimap">
-      Zoom with +/-, toggle lasso to label regions, then save selections.
+    <Callout storageKey="minimap" variant="info" title="Define concepts">
+      Click to zoom on images. Lasso by dragging to label images as positive or negative. Use labeled images to create new axes or selections.
     </Callout>
   </div>
 
   {#if lassoEnabled}
-    <div class="absolute top-1 left-10 z-10 bg-white/90 rounded shadow px-2 py-1 text-sm flex items-center gap-2">
+    <div class="absolute top-10 left-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-sm flex flex-col items-stretch gap-1">
       <button class={`btn btn-xs ${lassoMode==='pos'?'btn-success':''}`} on:click|stopPropagation={() => setLassoMode('pos')} aria-label={`Positive (${posCount})`}>
         <span class="i-heroicons-hand-thumb-up" /> Positive ({posCount})
       </button>

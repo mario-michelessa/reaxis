@@ -128,16 +128,16 @@ select, input[type="range"], input[type="text"], input[type="search"], input[typ
 .panel-header { background: linear-gradient(90deg, #e2e8f0, #e5e7eb, #e2e8f0); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px;  font-weight: 600; display:flex; align-items:center; gap:8px; }
 .minimap { position: relative; background: var(--surface); border: none; user-select: none; }
 .toolbar { position: absolute; background: rgba(255,255,255,0.9); backdrop-filter: blur(2px); border-radius: 6px; padding: 2px 4px; display:flex; align-items:center; gap:4px; }
-.pos-top-right { top: 4px; right: 4px; }
+.pos-top-right { top: 4px; right: -54px; }
 .pos-top-left { top: 4px; left: 4px; }
 .right-just { justify-content: flex-end; }
-.pos-bottom-right { bottom: 4px; right: 4px; }
+.pos-bottom-right { bottom: 4px; right: -54px; }
 .pos-bottom-left { bottom: 4px; left: 4px; }
 .axis-rail-left, .axis-rail-right, .axis-rail-top, .axis-rail-bottom { position: absolute; background: rgba(255,255,255,0.9); border: 0px solid var(--border); border-radius: 6px; padding: 6px; display:flex; flex-direction:row; align-items:center; gap:8px; z-index: 10; }
-.axis-rail-left { left: -34px; top:50%; transform: rotate(-90deg);}
+.axis-rail-left { left: -45px; top:50%; transform: rotate(-90deg);}
 .axis-rail-right { right: 4px; top:50%; transform: rotate(-90deg);}
 .axis-rail-top { top: 4px; left:50%; transform: translateX(-50%); }
-.axis-rail-bottom { bottom: 4px; left:50%; transform: translateX(-50%); }
+.axis-rail-bottom { bottom: 0px; left:50%; transform: translateX(-50%); }
 
 .btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
 .btn:hover { background: var(--muted-surface); }

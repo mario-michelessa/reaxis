@@ -37,7 +37,7 @@ class ImageGalleryEngine:
     def list_images(self) -> List[ImageEntry]:
         return self.emb.list_images()
 
-    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = "avg", resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
+    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = "color_rgb", resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
         return self.emb.estimate_embeddings(images, method=method, resize=resize)
 
     # Embedding extraction implementations moved to embeddings. No local copies here.
@@ -52,7 +52,7 @@ class ImageGalleryEngine:
         return layout_utils.pack_to_grid(coords01, n_layer=n_layer, n_tile=n_tile, filter_fn=filter_fn)
 
     def build_gallery(self, n_layer: int = 64, n_tile: int = 8,
-                      method: str = "pca", embed_method: str = "avg") -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
+                      method: str = "pca", embed_method: str = "color_rgb") -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
         """End-to-end pipeline returning entries, reduced coords, and packed coords.
 
         Embeddings and PCA coordinates are cached per dataset and model.
@@ -161,7 +161,7 @@ class ImageGalleryEngine:
 
     def export_gallery_json(self, out_path: str, base_url: Optional[str] = None,
                              n_layer: int = 64, n_tile: int = 8,
-                             method: str = "umap", embed_method: str = "avg") -> str:
+                             method: str = "umap", embed_method: str = "color_rgb") -> str:
         """Generate a JSON file with image metadata and coordinates.
 
         - base_url: optional URL prefix to serve images (e.g., '/images')
@@ -194,7 +194,7 @@ class ImageGalleryEngine:
         return out_path
 
     def build_gallery_from_precomputed(self, n_layer: int = 64, n_tile: int = 8,
-                                       method: str = "pca", embed_method: str = "avg"):
+                                       method: str = "pca", embed_method: str = "color_rgb"):
         """Build gallery using ONLY precomputed embeddings.
 
         Loads cached embeddings; if unavailable returns (None, None, None, 0).
@@ -233,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_tile", type=int, default=8)
     parser.add_argument("--method", type=str, default="pca", help="'umap' or 'pca'")
     parser.add_argument("--base_url", type=str, default=None, help="Optional URL prefix for images")
-    parser.add_argument("--embed", type=str, default="avg", help="Embedding method: 'avg', 'clip', 'dino', 'sd'")
+    parser.add_argument("--embed", type=str, default="color_rgb", help="Embedding method: 'color_rgb', 'clip', 'dino', 'sd'")
     args = parser.parse_args()
 
     engine = ImageGalleryEngine(args.dataset)

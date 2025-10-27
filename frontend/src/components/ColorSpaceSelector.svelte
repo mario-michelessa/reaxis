@@ -1,7 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte'
-  export let selected = 'color_rgb'
   const dispatch = createEventDispatcher()
+  let selected = 'color_rgb'
 
   const options = [
     { value: 'color_rgb', label: 'RGB' },
@@ -11,7 +11,7 @@
 
   function pick(value) {
     selected = value
-    dispatch('select', { space: value })
+    dispatch('change', value)
   }
 </script>
 

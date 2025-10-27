@@ -27,6 +27,8 @@ from flask_cors import CORS
 
 from gallery_backend import ImageGalleryEngine
 from embeddings import EmbeddingEngine
+import csv
+import hashlib
 
 
 app = Flask(__name__)
@@ -85,7 +87,7 @@ def gallery() -> Any:
     dataset_path = resolve_dataset_root(dataset_name)
     dataset = str(dataset_path)
     method = request.args.get('method', 'pca').lower()
-    embed_method = request.args.get('embed', 'avg').lower()
+    embed_method = request.args.get('embed', 'color_rgb').lower()
     # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
     if embed_method == 'text':
         embed_method = 'clip'
@@ -141,8 +143,95 @@ def gallery() -> Any:
             'gx': float(packed[i, 0]),
             'gy': float(packed[i, 1]),
         })
-    print(f"[gallery] returning items={len(items)}")
-    return jsonify({'items': items, 'dataset': dataset, 'n_layer': eff_layer, 'n_tile': n_tile, 'method': method, 'embed': embed_method, 'warning': None})
+    # Attempt to load per-image metadata axes from metadata.csv in dataset root
+    metadata_axes = []
+    try:
+        meta_path = dataset_root / 'metadata.csv'
+        if meta_path.exists():
+            print(f"[gallery] reading metadata.csv from {meta_path}")
+            # Read CSV rows
+            rows = []
+            with meta_path.open('r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                headers = [h.strip() for h in (reader.fieldnames or [])]
+                if 'image' not in [h.lower() for h in headers]:
+                    print('[gallery] metadata.csv missing image column; skipping')
+                else:
+                    image_col = next(h for h in headers if h.lower() == 'image')
+                    field_cols = [h for h in headers if h != image_col]
+                    print('[gallery] metadata headers:', headers, 'fields:', field_cols)
+                    for r in reader:
+                        # Strip header keys and string values to avoid mismatches
+                        rows.append({(k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v) for k, v in r.items()})
+                    print('[gallery] metadata rows:', len(rows))
+                    for field in field_cols:
+                        raw_map: Dict[str, Any] = {}
+                        for r in rows:
+                            key = str(r.get(image_col) or '').strip()
+                            if not key:
+                                continue
+                            # Match by exact id or by filename (stem/base/rel), case-insensitive
+                            match_id = None
+                            if key in [e.id for e in entries]:
+                                match_id = key
+                            else:
+                                kp = Path(key)
+                                base = kp.name; stem = kp.stem
+                                for e in entries:
+                                    pe = Path(e.path)
+                                    if pe.name.lower() == base.lower() or pe.stem.lower() == stem.lower():
+                                        match_id = e.id
+                                        break
+                            if not match_id:
+                                continue
+                            raw_map[match_id] = r.get(field)
+                        if not raw_map:
+                            print('[gallery] field has no matches:', field)
+                            continue
+                        # Unique values preserving order
+                        uniq_vals = []
+                        for v in raw_map.values():
+                            sv = '' if v is None else str(v)
+                            if sv not in uniq_vals:
+                                print(sv)
+                                uniq_vals.append(sv)
+                        # Number of unique values (n). We'll map categories to k/n with jitter.
+                        n = len(uniq_vals)
+                        val_to_idx = {v: i for i, v in enumerate(uniq_vals)}
+                        coords: Dict[str, float] = {}
+                        for img_id, v in raw_map.items():
+                            sv = '' if v is None else str(v)
+                            idx = val_to_idx.get(sv, 0)
+                            # Base position as k/n with k in 1..n
+                            base = (idx + 1) / float(n if n > 0 else 1)
+                            # Deterministic jitter in [-1/(2n), 0] using hash(img_id, field)
+                            if n > 0:
+                                jitter_range = 1.0 / (2.0 * float(n))
+                                h = hashlib.md5(f'{field}|{img_id}'.encode('utf-8')).digest()
+                                u = int.from_bytes(h[:8], 'big') / float(2**64 - 1)
+                                jitter = (u - 1.0) * jitter_range
+                                val = base + jitter
+                            else:
+                                val = base
+                            # Clamp to [0,1]
+                            val = 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
+                            coords[img_id] = float(val)
+                        print('[gallery] field coord count:', field, len(coords), 'unique:', n)
+                        axis_id = f'axis:meta:{field}'
+                        axis_name = f'{field}'
+                        metadata_axes.append({'id': axis_id, 'name': axis_name, 'coords': coords})
+    except Exception as e:
+        print('[gallery] metadata parse error:', e)
+
+    print(f"[gallery] returning items={len(items)} meta_axes={len(metadata_axes)}")
+    return jsonify({'items': items,
+                    'dataset': dataset,
+                    'n_layer': eff_layer,
+                    'n_tile': n_tile,
+                    'method': method,
+                    'embed': embed_method,
+                    'metadata_axes': metadata_axes,
+                    'warning': None})
 
 
 @app.get('/datasets')
@@ -182,7 +271,12 @@ def serve_image(relpath: str):
     filename = target.name
     if not Path(target).exists():
         return abort(404)
-    return send_from_directory(directory, filename)
+    resp = send_from_directory(directory, filename)
+    try:
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    except Exception:
+        pass
+    return resp
 
 
 @app.get('/thumb/<int:size>/<path:relpath>')
@@ -238,11 +332,21 @@ def serve_thumbnail(size: int, relpath: str):
                 im.save(buf, format='JPEG', quality=85, optimize=True, progressive=True)
                 buf.seek(0)
                 from flask import send_file
-                return send_file(buf, mimetype='image/jpeg')
+                resp = send_file(buf, mimetype='image/jpeg')
+                try:
+                    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+                except Exception:
+                    pass
+                return resp
         except Exception:
             return abort(500, description=f'Failed to generate thumbnail: {e}')
 
-    return send_from_directory(str(cache_file.parent), cache_file.name)
+    resp = send_from_directory(str(cache_file.parent), cache_file.name)
+    try:
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    except Exception:
+        pass
+    return resp
 
 
 @app.post('/text_force')
