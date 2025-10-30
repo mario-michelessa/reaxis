@@ -188,16 +188,28 @@ def gallery() -> Any:
                         if not raw_map:
                             print('[gallery] field has no matches:', field)
                             continue
-                        # Unique values preserving order
-                        uniq_vals = []
+                        # Unique values preserving order, then sort small->high where possible
+                        uniq_vals_raw = []
                         for v in raw_map.values():
                             sv = '' if v is None else str(v)
-                            if sv not in uniq_vals:
-                                print(sv)
-                                uniq_vals.append(sv)
+                            if sv not in uniq_vals_raw:
+                                uniq_vals_raw.append(sv)
+                        # Try numeric sort; fallback to case-insensitive alpha
+                        as_num = []
+                        all_numeric = True
+                        for sv in uniq_vals_raw:
+                            try:
+                                as_num.append((float(sv), sv))
+                            except Exception:
+                                all_numeric = False
+                                break
+                        if all_numeric:
+                            uniq_vals_sorted = [sv for _, sv in sorted(as_num, key=lambda x: x[0])]
+                        else:
+                            uniq_vals_sorted = sorted(uniq_vals_raw, key=lambda s: s.lower())
                         # Number of unique values (n). We'll map categories to k/n with jitter.
-                        n = len(uniq_vals)
-                        val_to_idx = {v: i for i, v in enumerate(uniq_vals)}
+                        n = len(uniq_vals_sorted)
+                        val_to_idx = {v: i for i, v in enumerate(uniq_vals_sorted)}
                         coords: Dict[str, float] = {}
                         for img_id, v in raw_map.items():
                             sv = '' if v is None else str(v)
@@ -216,10 +228,19 @@ def gallery() -> Any:
                             # Clamp to [0,1]
                             val = 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
                             coords[img_id] = float(val)
+                        # Also prepare tick labels and their positions from small->high
+                        label_positions = []
+                        if n > 0:
+                            for i, _sv in enumerate(uniq_vals_sorted):
+                                label_positions.append((i + 0.75) / float(n))
                         print('[gallery] field coord count:', field, len(coords), 'unique:', n)
                         axis_id = f'axis:meta:{field}'
                         axis_name = f'{field}'
-                        metadata_axes.append({'id': axis_id, 'name': axis_name, 'coords': coords})
+                        metadata_axes.append({'id': axis_id,
+                                              'name': axis_name,
+                                              'coords': coords,
+                                              'labels': uniq_vals_sorted,
+                                              'label_positions': label_positions})
     except Exception as e:
         print('[gallery] metadata parse error:', e)
 

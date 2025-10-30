@@ -306,7 +306,7 @@
         const metaAxes = Array.isArray(cached.metaAxes) ? cached.metaAxes : []
         console.log('[frontend] cache metaAxes count', metaAxes.length)
         if (metaAxes.length > 0) {
-          const incoming = metaAxes.map(a => ({ id: a.id, name: a.name || a.id, coords: a.coords || {}, group: 'meta' }))
+          const incoming = metaAxes.map(a => ({ id: a.id, name: a.name || a.id, coords: a.coords || {}, labels: a.labels || [], label_positions: a.label_positions || [], group: 'meta' }))
           const existing = new Map(axes.map(a => [a.id, a]))
           for (const ax of incoming) { if (!existing.has(ax.id)) existing.set(ax.id, ax) }
           axes = Array.from(existing.values())
@@ -412,7 +412,10 @@
             if (matched === 0) {
               console.warn('[frontend] meta axis produced zero matches; sample keys', keyList.slice(0,5))
             }
-            return { id: raw.id, name: raw.name || raw.id, coords: out, group: 'meta' }
+            // Pass through labels info for axis tick rendering
+            const labels = Array.isArray(raw.labels) ? raw.labels : []
+            const label_positions = Array.isArray(raw.label_positions) ? raw.label_positions : []
+            return { id: raw.id, name: raw.name || raw.id, coords: out, labels, label_positions, group: 'meta' }
           }
           const incoming = metaAxes.map(normalizeMetaAxis)
           const existing = new Map(axes.map(a => [a.id, a]))
@@ -717,60 +720,59 @@
               <div class="tile-resize-handle" title="Resize" on:mousedown={startMiddleTileResize}></div>
             </div>
           </div>
+                  <!-- Rightmost: saved combined selections -->
+        {#if true}
+          {#if rightCollapsed}
+            <div class="shrink-0" style="width:50px;">
+              <button
+                class="collapsed-handle rotate tile-header"
+                title="Show Combined selections"
+                on:click={() => { rightCollapsed = false }}
+              >Combined selections</button>
+            </div>
+          {:else}
+            <aside class="shrink-0 mt-2" style={`width:${rightWidth}px;min-width:${minRight}px`}>
+            <div class="tile tile-primary">
+              <div class="tile-content" style={`height:${rightTileH}px`}>
+                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
+                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Combined selections</div>
+                  <div class="grid gap-2">
+                    {#each combinedSelections as cs (cs.id)}
+                      <CombinedSelection
+                        combined={cs}
+                        idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
+                        on:apply={(e)=>{
+                          const { posIds=[], negIds=[] } = e.detail || {}
+                          const next = {}
+                          for (const id of allImages.map(i => i.id)) next[id] = undefined
+                          for (const id of posIds) next[id] = 'pos'
+                          for (const id of negIds) next[id] = 'neg'
+                          labelDB = next
+                        }}
+                        on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; combinedSelections = combinedSelections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
+                        on:delete={(e)=>{ const { id } = e.detail; combinedSelections = combinedSelections.filter(s => s.id !== id) }}
+                        on:sendToSelections={(e)=>{ const { selection } = e.detail || {}; if (selection && selection.id) { selections = [selection, ...selections] } }}
+                      />
+                    {/each}
+                    {#if combinedSelections.length === 0}
+                      <div class="text-sm text-gray-500">No combined selections yet. Use the Selection composer to create one.</div>
+                    {/if}
+                  </div>
+                  <Callout title="Saved">
+                    Apply a combined selection to set current labels, or move to selections to edit.
+                  </Callout>
+                  <div class="tile-resize-handle" title="Resize" on:mousedown={startRightTileResize}></div>
+                </div>
+              </div>
+            </aside>
+          {/if}
+        {/if}
+
         </section>
       {/if}
 
       
 
-      <!-- Rightmost: saved combined selections -->
-      {#if false}
-      {/if}
-      {#if true}
-        {#if rightCollapsed}
-          <div class="shrink-0" style="width:50px;">
-            <button
-              class="collapsed-handle rotate tile-header"
-              title="Show Combined selections"
-              on:click={() => { rightCollapsed = false }}
-            >Combined selections</button>
-          </div>
-        {:else}
-          <aside class="shrink-0" style={`width:${rightWidth}px;min-width:${minRight}px`}>
-          <div class="tile tile-primary">
-            <div class="tile-content" style={`height:${rightTileH}px`}>
-              <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
-              <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Saved combined selections</div>
-                <div class="grid gap-2">
-                  {#each combinedSelections as cs (cs.id)}
-                    <CombinedSelection
-                      combined={cs}
-                      idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
-                      on:apply={(e)=>{
-                        const { posIds=[], negIds=[] } = e.detail || {}
-                        const next = {}
-                        for (const id of allImages.map(i => i.id)) next[id] = undefined
-                        for (const id of posIds) next[id] = 'pos'
-                        for (const id of negIds) next[id] = 'neg'
-                        labelDB = next
-                      }}
-                      on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; combinedSelections = combinedSelections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
-                      on:delete={(e)=>{ const { id } = e.detail; combinedSelections = combinedSelections.filter(s => s.id !== id) }}
-                      on:sendToSelections={(e)=>{ const { selection } = e.detail || {}; if (selection && selection.id) { selections = [selection, ...selections] } }}
-                    />
-                  {/each}
-                  {#if combinedSelections.length === 0}
-                    <div class="text-sm text-gray-500">No combined selections yet. Use the Selection composer to create one.</div>
-                  {/if}
-                </div>
-                <Callout title="Saved">
-                  Apply a combined selection to set current labels, or move to selections to edit.
-                </Callout>
-                <div class="tile-resize-handle" title="Resize" on:mousedown={startRightTileResize}></div>
-              </div>
-            </div>
-          </aside>
-        {/if}
-      {/if}
     </div>
   </main>
 </div>

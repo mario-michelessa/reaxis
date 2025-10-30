@@ -140,6 +140,14 @@
     const v = ax.coords[id]
     return (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(1, v)) : undefined
   }
+  function axisTicks(axisId) {
+    const ax = axisId ? axesById.get(axisId) : null
+    if (!ax) return { labels: [], pos: [] }
+    const labels = Array.isArray(ax.labels) ? ax.labels : []
+    const pos = Array.isArray(ax.label_positions) ? ax.label_positions : []
+    console.log('axisTicks', axisId, labels, pos)
+    return { labels, pos }
+  }
 
   // Hover and zoom state
   let griddingActive = false
@@ -179,19 +187,220 @@
     const vx = (e.clientX - rect.left) / Math.max(1, rect.width)
     const vy = (e.clientY - rect.top) / Math.max(1, rect.height)
     const zx = fromVis(vx)
-    const zy = fromVis(vy)
+    const zy = fromVis(1 - vy) // convert screen-down to internal up
     const factor = 1.12
     const nextZ = clamp(e.deltaY < 0 ? (zoomZ * factor) : (zoomZ / factor), 1.0, 6.0)
     if (nextZ === zoomZ) return
     // Convert current cursor zoom-space position (zx,zy) to world (pre-zoom) coords
     const px = cx + (zx - cx) / Math.max(1e-6, zoomZ)
-    const py = cy + ((1 - zy) - cy) / Math.max(1e-6, zoomZ)
+    const py = cy + (zy - cy) / Math.max(1e-6, zoomZ)
     if (Math.abs(1 - nextZ) > 1e-6) {
       const denom = (1 - nextZ)
       cx = clamp((zx - nextZ * px) / denom, 0, 1)
-      cy = clamp(((1 - zy) - nextZ * py) / denom, 0, 1)
+      cy = clamp((zy - nextZ * py) / denom, 0, 1)
     }
     zoomZ = nextZ
+  }
+
+  // KDE density overlay (contours)
+  let showDensity = false
+  let densityCanvas
+  let pointsCanvas
+  let pointRadius = 0 // 0 = images only; >0 draws points with given radius (px)
+  let isoCount = 5 // number of contour levels
+  function gaussianKernel(sigma) {
+    const r = Math.max(1, Math.round(sigma * 2.5))
+    const k = new Float32Array(2*r + 1)
+    const s2 = sigma * sigma * 2
+    let sum = 0
+    for (let i = -r; i <= r; i++) { const v = Math.exp(-(i*i)/s2); k[i + r] = v; sum += v }
+    for (let i = 0; i < k.length; i++) k[i] /= sum
+    return { k, r }
+  }
+  function convolve1D(arr, w, h, kernel) {
+    const out = new Float32Array(arr.length)
+    const { k, r } = kernel
+    // Horizontal
+    for (let y=0; y<h; y++) {
+      for (let x=0; x<w; x++) {
+        let acc = 0
+        for (let t=-r; t<=r; t++) {
+          const xx = Math.max(0, Math.min(w-1, x + t))
+          acc += arr[y*w + xx] * k[t+r]
+        }
+        out[y*w + x] = acc
+      }
+    }
+    // Vertical into arr
+    const out2 = new Float32Array(arr.length)
+    for (let y=0; y<h; y++) {
+      for (let x=0; x<w; x++) {
+        let acc = 0
+        for (let t=-r; t<=r; t++) {
+          const yy = Math.max(0, Math.min(h-1, y + t))
+          acc += out[yy*w + x] * k[t+r]
+        }
+        out2[y*w + x] = acc
+      }
+    }
+    return out2
+  }
+  function buildDensityGrid(points, wpx, hpx) {
+    const gw = Math.min(180, Math.max(60, Math.round(wpx/6)))
+    const gh = Math.min(180, Math.max(60, Math.round(hpx/6)))
+    const grid = new Float32Array(gw*gh)
+    const clamp01f = (v) => Math.max(0, Math.min(1, v))
+    for (const p of points) {
+      const gx = clamp01f(p.x) * (gw - 1)
+      const gy = clamp01f(1 - p.y) * (gh - 1)
+      const x0 = Math.floor(gx), y0 = Math.floor(gy)
+      const dx = gx - x0, dy = gy - y0
+      const x1 = Math.min(gw - 1, x0 + 1)
+      const y1 = Math.min(gh - 1, y0 + 1)
+      const w00 = (1 - dx) * (1 - dy)
+      const w10 = dx * (1 - dy)
+      const w01 = (1 - dx) * dy
+      const w11 = dx * dy
+      grid[y0*gw + x0] += w00
+      grid[y0*gw + x1] += w10
+      grid[y1*gw + x0] += w01
+      grid[y1*gw + x1] += w11
+    }
+    // Blur with Gaussian kernel ~ 2% of min dimension in grid cells
+    const sigma = Math.max(1.2, Math.min(15.5, Math.min(gw, gh) * 0.03))
+    const ker = gaussianKernel(sigma)
+    const blurred = convolve1D(grid, gw, gh, ker)
+    // Normalize
+    let maxv = 1e-6
+    for (let i=0;i<blurred.length;i++) if (blurred[i] > maxv) maxv = blurred[i]
+    for (let i=0;i<blurred.length;i++) blurred[i] /= maxv
+    return { data: blurred, gw, gh }
+  }
+  function drawContours(ctx, grid, gw, gh, levels, wpx, hpx) {
+    // Marching squares
+    function interp(p1, p2, v1, v2, t) { const a = (t - v1) / ((v2 - v1) || 1e-6); return { x: p1.x + a * (p2.x - p1.x), y: p1.y + a * (p2.y - p1.y) } }
+    ctx.save()
+    const dprLocal = (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1)
+    ctx.lineWidth = Math.max(1, Math.floor(dprLocal))
+    // First paint a subtle blue fill for regions above each threshold
+    const cellW = wpx / Math.max(1, (gw - 1))
+    const cellH = hpx / Math.max(1, (gh - 1))
+    for (const t of levels) {
+      ctx.save()
+      ctx.fillStyle = 'rgba(59,130,246,0.10)'
+      for (let y=0; y<gh-1; y++) {
+        for (let x=0; x<gw-1; x++) {
+          const i00 = y*gw + x, i10 = y*gw + (x+1), i11 = (y+1)*gw + (x+1), i01 = (y+1)*gw + x
+          const avg = (grid[i00] + grid[i10] + grid[i11] + grid[i01]) * 0.25
+          if (avg >= t) {
+            ctx.fillRect(x * cellW, y * cellH, cellW, cellH)
+          }
+        }
+      }
+      ctx.restore()
+    }
+    // Then draw iso-lines on top
+    ctx.strokeStyle = 'rgba(59,130,246,0.85)'
+    for (const t of levels) {
+      for (let y=0; y<gh-1; y++) {
+        for (let x=0; x<gw-1; x++) {
+          const i00 = y*gw + x, i10 = y*gw + (x+1), i11 = (y+1)*gw + (x+1), i01 = (y+1)*gw + x
+          const v00 = grid[i00] - t, v10 = grid[i10] - t, v11 = grid[i11] - t, v01 = grid[i01] - t
+          const idx = (v00>0?8:0) | (v10>0?4:0) | (v11>0?2:0) | (v01>0?1:0)
+          if (idx === 0 || idx === 15) continue
+          const p00 = { x: x/(gw-1)*wpx, y: y/(gh-1)*hpx }
+          const p10 = { x: (x+1)/(gw-1)*wpx, y: y/(gh-1)*hpx }
+          const p11 = { x: (x+1)/(gw-1)*wpx, y: (y+1)/(gh-1)*hpx }
+          const p01 = { x: x/(gw-1)*wpx, y: (y+1)/(gh-1)*hpx }
+          // Edge intersections
+          const e = {}
+          e.top = interp(p00, p10, v00, v10, 0)
+          e.right = interp(p10, p11, v10, v11, 0)
+          e.bottom = interp(p01, p11, v01, v11, 0)
+          e.left = interp(p00, p01, v00, v01, 0)
+          // Cases mapping (with simple split for ambiguous 5/10)
+          const cases = {
+            1: ['left','bottom'], 2: ['bottom','right'], 3: ['left','right'], 4: ['top','right'], 5: ['top','left','bottom','right'], 6: ['top','bottom'], 7: ['left','top'],
+            8: ['left','top'], 9: ['top','bottom'], 10: ['top','right','left','bottom'], 11: ['top','right'], 12: ['left','right'], 13: ['bottom','right'], 14: ['left','bottom']
+          }
+          const seg = cases[idx]
+          if (!seg) continue
+          ctx.beginPath()
+          if (seg.length === 2) {
+            const a = e[seg[0]], b = e[seg[1]]
+            ctx.moveTo(a.x, a.y)
+            ctx.lineTo(b.x, b.y)
+            ctx.stroke()
+          } else if (seg.length === 4) {
+            // ambiguous cell: draw two segments
+            const a1 = e[seg[0]], b1 = e[seg[1]]
+            const a2 = e[seg[2]], b2 = e[seg[3]]
+            ctx.moveTo(a1.x, a1.y); ctx.lineTo(b1.x, b1.y); ctx.stroke()
+            ctx.beginPath(); ctx.moveTo(a2.x, a2.y); ctx.lineTo(b2.x, b2.y); ctx.stroke()
+          }
+        }
+      }
+    }
+    ctx.restore()
+  }
+  $: if (showDensity && densityCanvas && renderItemsVisible && width && height) {
+    try {
+      const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1
+      const wpx = Math.max(1, Math.floor(width))
+      const hpx = Math.max(1, Math.floor(height))
+      densityCanvas.width = Math.floor(wpx * dpr)
+      densityCanvas.height = Math.floor(hpx * dpr)
+      densityCanvas.style.width = wpx + 'px'
+      densityCanvas.style.height = hpx + 'px'
+      const ctx = densityCanvas.getContext('2d')
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, wpx, hpx)
+      const pts = renderItemsVisible.map((r) => ({ x: r.x, y: r.y }))
+      if (pts.length > 0) {
+        const { data, gw, gh } = buildDensityGrid(pts, wpx, hpx)
+        const n = Math.max(1, Math.min(20, Math.floor(isoCount || 1)))
+        const levels = Array.from({ length: n }, (_, i) => 0.15 + (0.7 * (i / Math.max(1, n - 1))))
+        drawContours(ctx, data, gw, gh, levels, wpx, hpx)
+      }
+    } catch (_) { /* ignore drawing errors */ }
+  }
+  $: if (!showDensity && densityCanvas && width && height) {
+    try {
+      const ctx = densityCanvas.getContext('2d')
+      if (ctx) ctx.clearRect(0, 0, densityCanvas.width, densityCanvas.height)
+    } catch (_) {}
+  }
+
+  // Points overlay drawing
+  $: if (pointsCanvas && pointRadius > 0 && renderItemsVisible && width && height) {
+    try {
+      const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1
+      const wpx = Math.max(1, Math.floor(width))
+      const hpx = Math.max(1, Math.floor(height))
+      pointsCanvas.width = Math.floor(wpx * dpr)
+      pointsCanvas.height = Math.floor(hpx * dpr)
+      pointsCanvas.style.width = wpx + 'px'
+      pointsCanvas.style.height = hpx + 'px'
+      const ctx = pointsCanvas.getContext('2d')
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, wpx, hpx)
+      const r = Math.max(1, Math.round(Math.max(0, pointRadius) * Math.max(1, zoomZ)))
+      for (const it of renderItemsVisible) {
+        const x = it.x * wpx
+        const y = (1 - it.y) * hpx
+        // Color by label: neg=red, pos=green, unlabeled=black
+        const lv = labelOf(it.id)
+        const col = (lv === 'neg') ? 'rgba(220,38,38,0.95)'
+                  : (lv === 'pos') ? 'rgba(22,163,74,0.95)'
+                  : 'rgba(17,24,39,0.95)'
+        ctx.fillStyle = col
+        ctx.beginPath()
+        ctx.arc(x, y, r, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    } catch (_) { /* ignore */ }
+  } else if (pointsCanvas) {
+    try { const ctx = pointsCanvas.getContext('2d'); ctx && ctx.clearRect(0, 0, pointsCanvas.width, pointsCanvas.height) } catch (_) {}
   }
 
   // Viewport rect
@@ -581,31 +790,37 @@
     on:wheel|stopPropagation|preventDefault={onWheel}
     on:click|stopPropagation|preventDefault={(e) => pickOrToggle(e)}
   >
+  <!-- Density overlay canvas (behind images) -->
+  <canvas bind:this={densityCanvas} style="position:absolute;left:0;top:0;z-index:0;opacity:0.9;pointer-events:none;"></canvas>
+  <!-- Points overlay canvas (above images) -->
+  <canvas bind:this={pointsCanvas} style="position:absolute;left:0;top:0;z-index:12;pointer-events:none;"></canvas>
   {#if griddingActive && gridBackdrop}
     <div
       class="absolute pointer-events-none rounded"
       style={`left:${(gridBackdrop.x0 - gridMargin) * 100}%;top:${(gridBackdrop.y0 - gridMargin) * 100}%;width:${(gridBackdrop.w + 2*gridMargin) * 100}%;height:${(gridBackdrop.h + 2*gridMargin) * 100}%;background:rgba(229,231,235,0.9);z-index:5; transition: opacity 200ms ease; opacity:1;`}
     />
     {/if}
-  {#each renderItemsVisible as it (it.id)}
-    <img
-      alt=""
-      src={it.url}
-      class="absolute object-cover rounded"
-      decoding="async"
-      fetchpriority="low"
-      style={`left:${it.x * 100}%;
-              top:${(1 - it.y) * 100}%;
-              transform:translate(-50%,-50%);
-              width:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
-              height:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
-              transition:width 120ms ease,height 120ms ease; 
-              z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; 
-              opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.85)}; 
-              border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='pos'?'#16a34a':'#dc2626'):'none'}; 
-              box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
-    />
-  {/each}
+  {#if pointRadius === 0}
+    {#each renderItemsVisible as it (it.id)}
+      <img
+        alt=""
+        src={it.url}
+        class="absolute object-cover rounded"
+        decoding="async"
+        fetchpriority="low"
+        style={`left:${it.x * 100}%;
+                top:${(1 - it.y) * 100}%;
+                transform:translate(-50%,-50%);
+                width:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
+                height:${Math.floor((griddingActive && insideIds.has(it.id) ? sizeInside : sizeOutside) * zoomScale)}px;
+                transition:width 120ms ease,height 120ms ease; 
+                z-index:${(griddingActive && insideIds.has(it.id) ? 10 : 1)}; 
+                opacity:${(griddingActive && insideIds.has(it.id) ? 1 : 0.85)}; 
+                border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='pos'?'#16a34a':'#dc2626'):'none'}; 
+                box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':'none'};`}
+      />
+    {/each}
+  {/if}
 
   {#if true}
     <div
@@ -631,13 +846,59 @@
     </div>
   {/if}
 
-  <div class="toolbar pos-top-right right-just z-10">
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomIn} aria-label="Zoom in">+</button>
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomOut} aria-label="Zoom out">−</button>
-    <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view">
-      ⟲
-    </button>
+  <div style="position:absolute; top:10px; right:-50px; z-index:30; pointer-events:auto;">
+    <div class="chip" style="pointer-events:auto; display:flex; flex-direction:column; align-items:flex-end; gap:2px; padding:4px 6px;" on:click|stopPropagation on:mousedown|stopPropagation>
+      <div style="display:flex; align-items:center; gap:4px;">
+        <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomIn} aria-label="Zoom in">+</button>
+        <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={viewportZoomOut} aria-label="Zoom out">−</button>
+        <button type="button" class="btn btn-icon btn-minimap" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view">⟲</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <label class="text-xs text-gray-700 inline-flex gap-2 items-center" title="Show KDE density contours" style="cursor:pointer;">
+          <input class="chip-input" type="checkbox" checked={showDensity} on:click|stopPropagation on:mousedown|stopPropagation on:change={(e)=>{ showDensity = !!e.currentTarget.checked }} />
+          <span>Show density</span>
+        </label>
+      </div>
+      {#if showDensity}
+        <div style="display:flex; align-items:center; gap:6px;">
+          <label class="text-xs text-gray-700 inline-flex items-center gap-2" title="Point size in pixels (0 = images only)" style="cursor:pointer;">
+            <span>Size</span>
+            <input class="chip-input" type="range" min="0" max="10" step="1" value={pointRadius} style="width:70px;" on:input={(e)=>{ pointRadius = Math.max(0, Math.min(50, parseInt(e.currentTarget.value||'0'))) }} />
+          </label>
+        </div>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <label class="text-xs text-gray-700 inline-flex items-center gap-2" title="# of isocontours" style="cursor:pointer;">
+            <span>#Iso</span>
+            <input class="chip-input" type="range" min="1" max="12" step="1" value={isoCount} style="width:70px;" on:input={(e)=>{ isoCount = Math.max(1, Math.min(20, parseInt(e.currentTarget.value||'5'))) }} />
+          </label>
+        </div>
+      {/if}
+    </div>
   </div>
+
+  <!-- Axis categorical labels when metadata axes are selected -->
+  {#if selectedY && (selectedY.startsWith('axis:meta:'))}
+    {#await Promise.resolve(axisTicks(selectedY)) then t}
+      {#if t.labels.length === t.pos.length && t.labels.length > 0}
+        {#each t.labels as lab, i}
+          {#if typeof t.pos[i] === 'number'}
+            <div class="axis-label y-meta" style={`position:absolute;left:60px;top:${(1 - toVis(t.pos[i])) * 100}%;transform:translateY(-50%);pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{lab}</div>
+          {/if}
+        {/each}
+      {/if}
+    {/await}
+  {/if}
+  {#if selectedX && (selectedX.startsWith('axis:meta:'))}
+    {#await Promise.resolve(axisTicks(selectedX)) then t}
+      {#if t.labels.length === t.pos.length && t.labels.length > 0}
+        {#each t.labels as lab, i}
+          {#if typeof t.pos[i] === 'number'}
+            <div class="axis-label x-meta" style={`position:absolute;bottom:80px;left:${toVis(t.pos[i]) * 100}%;transform:translateX(-50%) rotate(-90deg);transform-origin:center;pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{lab}</div>
+          {/if}
+        {/each}
+      {/if}
+    {/await}
+  {/if}
 
   <div class="toolbar pos-top-left z-10">
     <button type="button" class={`btn btn-icon btn-minimap ${lassoEnabled?'btn-primary':''}`} on:click|stopPropagation={() => { lassoEnabled = !lassoEnabled; if (lassoEnabled) { try { lassoRef && lassoRef.reset && lassoRef.reset() } catch(_) {} } }} aria-label="Toggle lasso">
