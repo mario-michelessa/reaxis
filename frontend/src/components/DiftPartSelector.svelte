@@ -4,10 +4,11 @@
   let method = '' // dino or dift_sd_partXY
   const dispatch = createEventDispatcher()
 
-  const rows = [0,1,2,]
-  const cols = [0,1,2]
+  const rows = [0, 1, 2]
+  const cols = [0, 1, 2]
 
   function pick(r, c) {
+    // partXY with X=row, Y=column (dataset expects `${r}${c}`)
     const part = `${r}${c}`
     if (selected === part) {
       method = 'dino'

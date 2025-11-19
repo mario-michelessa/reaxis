@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
+from json import dumps
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -153,6 +155,9 @@ class ImageGalleryEngine:
         coords2d = self.reduce_to_2d(embs, method=red_method)
         if red_method.lower() == 'pca':
             try:
+                # Persist identifiers for validation on reload
+                paths = np.array([e.path for e in entries])
+                mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
                 np.savez_compressed(cache, paths=paths, mtimes=mtimes, coords=coords2d)
                 print(f"[coords] cached PCA coords at {cache}")
             except Exception:
@@ -187,7 +192,6 @@ class ImageGalleryEngine:
             })
 
         out_path = str(out_path)
-        from json import dumps
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, 'w') as f:
             f.write(dumps({"items": items, "n_layer": eff_layer, "n_tile": n_tile, "method": method, "embed": embed_method}, indent=2))
@@ -223,21 +227,98 @@ class ImageGalleryEngine:
     # Note: for part-specific embeddings (e.g., dift_sd_partXY), use embed_method naming
     # and rely on the existing cache loader which maps to embeddings_{embed_method}.npz
 
+from PIL import Image
+
+def export_all(dataset: str, out_dir: str, methods: Optional[List[str]] = None,
+               reduction: str = "pca", n_layer: int = 64, n_tile: int = 8,
+               default_method: Optional[str] = None, copy_images: bool = True) -> Dict[str, Any]:
+    """Export a standalone dataset folder with images and multiple gallery_* JSONs.
+
+    - Copies all images into <out_dir>/images
+    - For each method in `methods`, computes 2D coords (PCA) and writes <out_dir>/gallery_<method>.json
+    - Writes <out_dir>/gallery.json for the default_method (or first in list)
+    - Writes <out_dir>/methods.json listing available methods
+    Returns mapping with written files and counts.
+    """
+    dataset_path = Path(dataset)
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    eng = ImageGalleryEngine(str(dataset_path))
+    entries = eng.list_images()
+    if not entries:
+        raise RuntimeError(f"No images found in dataset: {dataset_path}")
+
+    # Copy images
+    copied = 0
+    if copy_images:
+        img_dir = out_root / 'images'
+        img_dir.mkdir(parents=True, exist_ok=True)
+        for e in entries:
+            src = Path(e.path)
+            dst = img_dir / src.name
+            if not dst.exists() or (src.stat().st_mtime > dst.stat().st_mtime):
+                img = Image.open(src)
+                w,h = img.size
+                new_w = 256  # Desired new width
+                new_h = int(h * (new_w / w))
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+                print(f"Copying and resizing image {src} -> {dst} ({new_w}x{new_h})")
+                img.save(dst)
+            copied += 1
+
+    # Methods processing
+    written: Dict[str, str] = {}
+    for m in methods:
+        out_path = out_root / f"gallery_{m}.json"
+        eng.export_gallery_json(str(out_path), base_url='images',
+                                n_layer=n_layer, n_tile=n_tile,
+                                method=reduction, embed_method=m)
+        written[m] = str(out_path)
+
+    # Write default link
+    default_m = default_method or (methods[0] if methods else None)
+    if default_m:
+        default_json = out_root / 'gallery.json'
+        src_json = out_root / f"gallery_{default_m}.json"
+        if src_json.exists():
+            # Copy to gallery.json (do not symlink for portability)
+            shutil.copy2(src_json, default_json)
+
+    # Methods manifest
+    with open(out_root / 'methods.json', 'w') as f:
+        f.write(dumps({ 'methods': methods, 'default': default_m }, indent=2))
+
+    return { 'out_dir': str(out_root), 'copied_images': copied, 'written': written, 'default_method': default_m }
+
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Build gallery embeddings and coords")
     parser.add_argument("dataset", help="Path to image dataset root")
-    parser.add_argument("output", help="Path to output JSON, e.g., frontend/public/gallery.json")
+    parser.add_argument("output", nargs='?', help="Path to output JSON, e.g., frontend/public/gallery.json")
     parser.add_argument("--n_layer", type=int, default=64)
     parser.add_argument("--n_tile", type=int, default=8)
     parser.add_argument("--method", type=str, default="pca", help="'umap' or 'pca'")
     parser.add_argument("--base_url", type=str, default=None, help="Optional URL prefix for images")
     parser.add_argument("--embed", type=str, default="color_rgb", help="Embedding method: 'color_rgb', 'clip', 'dino', 'sd'")
+    # Standalone export-all
+    parser.add_argument("--export_all_dir", type=str, default=None, help="Output folder for standalone dataset (copies images and writes gallery_*.json)")
+    parser.add_argument("--methods", type=str, default="color_rgb,clip,dino,dift_sd", help="Comma-separated embedding methods to export")
+    parser.add_argument("--default_method", type=str, default="color_rgb", help="Default method for gallery.json link")
     args = parser.parse_args()
 
-    engine = ImageGalleryEngine(args.dataset)
-    out = engine.export_gallery_json(args.output, base_url=args.base_url,
-                                     n_layer=args.n_layer, n_tile=args.n_tile,
-                                     method=args.method, embed_method=args.embed)
-    print(f"✅ Gallery JSON written to {out}")
+    if args.export_all_dir:
+        methods = [m.strip() for m in (args.methods or '').split(',') if m.strip()]
+        info = export_all(args.dataset, args.export_all_dir, methods=methods,
+                          reduction=args.method or 'pca', n_layer=args.n_layer, n_tile=args.n_tile,
+                          default_method=args.default_method or None, copy_images=True)
+        print("✅ Exported standalone dataset:", info)
+    else:
+        if not args.output:
+            raise SystemExit("Missing output path for single gallery export")
+        engine = ImageGalleryEngine(args.dataset)
+        out = engine.export_gallery_json(args.output, base_url=args.base_url,
+                                         n_layer=args.n_layer, n_tile=args.n_tile,
+                                         method=args.method, embed_method=args.embed)
+        print(f"✅ Gallery JSON written to {out}")
