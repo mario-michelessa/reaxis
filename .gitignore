@@ -1,4 +1,8 @@
 backend/uploads
 backend/__pycache__
 frontend/node_modules
+frontend/public/datasets
+frontend/dist
+frontend/build
 data/*
+*.zip

@@ -79,3 +79,17 @@ export default function Panel({ items, prevItems, nLayer }) {
 ```
 
 Note: This Svelte app does not mount React by default; consume the component in a React project or wrap it as a custom element if needed.
+
+## Standalone mode (no backend)
+
+- Toggle via env or query: set `VITE_STANDALONE=1` or open `/?standalone=1`.
+- For a single dataset, place `gallery.json` and assets under `frontend/public/` and ensure `url` fields in `gallery.json` are reachable.
+- For multiple datasets, place each dataset under `frontend/public/datasets/<name>/` with a `gallery.json` inside. Optionally include images in the same folder and reference them with relative paths in `gallery.json` (e.g., `"url": "images/cat.jpg"`).
+- Create a dataset manifest at `frontend/public/datasets/index.json`:
+  - Either an array of strings: `["ISIC2017", "Birds"]`
+  - Or objects: `[{"label":"ISIC 2017","value":"ISIC2017"}]`
+- In standalone mode, the app fetches `./datasets/<name>/gallery.json` and prefixes relative URLs with `./datasets/<name>/`.
+ - To enable metadata axes in standalone (for the "Metadata" projection), generate `gallery_metadata.json` next to your dataset's galleries. Use:
+   - `python backend/export_metadata.py <DATASET_DIR> frontend/public/datasets/<NAME>`
+   - This writes `frontend/public/datasets/<NAME>/gallery_metadata.json` with per-field axes derived from `metadata.csv` in your dataset root.
+   - The app auto-loads `gallery_metadata.json` and merges its `metadata_axes` for all embedding methods.

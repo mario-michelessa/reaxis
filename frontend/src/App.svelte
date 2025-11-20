@@ -1,311 +1,239 @@
 <script>
-  // import ImageGrid from './components/ImageGrid.svelte' // replaced by TextSimilarity view
+  // import ImageGrid from './components/ImageGrid.svelte'
   import { generateDemoImages, sortBySimilarity, clusterKMeans } from './lib/data'
   import { onMount, tick } from 'svelte'
-  import ScatterMinimap from './components/ScatterMinimap.svelte'
-  import AnimatedMinimap from './components/AnimatedMinimap.svelte'
-  import HoverGridMinimap from './components/HoverGridMinimap.svelte'
-  import DiftPartSelector from './components/DiftPartSelector.svelte'
-  import MinimapTextOverlay from './components/MinimapTextOverlay.svelte'
+  import AxesMinimap from './components/AxesMinimap.svelte'
+  import AxesPanel from './components/AxesPanel.svelte'
   import ConceptsPanel from './components/ConceptsPanel.svelte'
-  import TextSimilarity from './components/TextSimilarity.svelte'
-  import ConceptComposer from './components/ConceptComposer.svelte'
-  import CombinedConceptItem from './components/CombinedConceptItem.svelte'
+  
+  // import ConceptComposer from './components/ConceptComposer.svelte'
+  // import CombinedConceptItem from './components/CombinedConceptItem.svelte'
+  import Callout from './components/Callout.svelte'
+  import CombinedSelection from './components/CombinedSelection.svelte'
+  import SelectionComposer from './components/SelectionComposer.svelte'
   
   let allImages = []
   let prevImages = []
   // Cache of gallery responses by key (dataset|embed|method)
   const galleryCache = new Map()
-  let classes = []
-  let classFilter = 'All'
-  let viewMode = 'gallery' // 'gallery' | 'cluster' | 'similarity'
   let selected = new Set()
-  let refId = null
-
-  let filtered = []
-  let clusters = []
   
   // Backend wiring
   // const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://127.0.0.1:5001'
   const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://localhost:5002'
   console.log('[frontend] API_BASE', API_BASE)
   let datasetPath = '' // leave blank to let server pick sample
+  let datasets = []
+
   // Radio selection and effective embed method
-  let embedSelection = 'avg' // 'avg' | 'clip' | 'dino' | 'dift_sd' | 'text'
-  let embedMethod = 'avg' // effective method sent to backend (may be dift_sd_partXY)
-  let gridSize = 0
+  let embedSelection = 'color_rgb' // 'color' | 'clip' | 'shape' | 'meta' | custom
+  let embedMethod = 'color_rgb' // backend method: 'color_rgb' | 'clip' | 'dino' | 'dift_sd_partXY'
   let warningMsg = ''
   // External label storage (object, separate from images)
   let labelDB = {}
-  let labelsMap = new Map()
-  $: goodCount = Object.values(labelDB).filter(v => v === 'good').length
-  $: badCount = Object.values(labelDB).filter(v => v === 'bad').length
+  $: posCount = Object.values(labelDB).filter(v => v === 'pos').length
+  $: negCount = Object.values(labelDB).filter(v => v === 'neg').length
 
   // Scribble controls
-  let scribbleEnabled = false
-  let scribbleLabel = 'good' // 'good' | 'bad'
-  let scribbleRadius = 18
-  let minimapRef
-  let textOverlayRef
+  let scribbleLabel = 'pos' // 'pos' | 'neg'
   let minimapContainerRef
+  
   // Dynamic minimap size based on available space
-  $: minimapSize = (() => {
-    // Recompute when left pane or window resizes
-    void leftWidth; void windowWidth
-    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth || 700) : 700
-    return Math.max(300, Math.min(1200, w))
+  $: minimapW = (() => {
+    void leftWidth; void windowWidth; void leftTileH;
+    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth -470) : 700
+    return Math.max(300, Math.min(2000, w))
   })()
-  let showTextOverlay = false
-  let textSimilarities = {}
-  // Text-driven separation layer state (persists)
-  let textLayerState = { baseEmbed: '', baseCoords: {}, coords: {}, rects: [], gridSize: 0 }
 
-  function scatterToCenter(radius = 0.06) {
-    // Randomly scatter all points around center within a small radius
-    prevImages = allImages
-    const r = Math.max(0.005, Math.min(0.2, Number(radius) || 0.06))
-    allImages = allImages.map((it) => {
-      const ang = Math.random() * Math.PI * 2
-      // sqrt for uniform density in circle
-      const rad = Math.sqrt(Math.random()) * r
-      const nx = Math.max(0, Math.min(1, 0.5 + Math.cos(ang) * rad))
-      const ny = Math.max(0, Math.min(1, 0.5 + Math.sin(ang) * rad))
-      return { ...it, x: nx, y: ny }
-    })
-    // Persist scattered coords into text layer state
-    const next = {}
-    for (const it of allImages) next[it.id] = [it.x, it.y]
-    textLayerState = { ...textLayerState, coords: next }
-  }
+  $: minimapH = (() => {
+    void leftTileH;
+    const h = minimapContainerRef ? Math.floor(minimapContainerRef.clientHeight - 50) : 700
+    return Math.max(300, Math.min(2000, h))
+  })()
+  
+  // Axes state
+  let axes = [] // [{ id, name, coords }]
+  let selectedAxisX = null
+  let selectedAxisY = null
+  // Custom projections created by user
+  // Shape: { id: 'custom:<ts>', name, xAxisId, yAxisId }
+  let customProjections = []
 
-  function ensureTextBase() {
-    if (Object.keys(textLayerState.baseCoords || {}).length > 0) return
-    const baseCoords = {}
-    for (const it of allImages) baseCoords[it.id] = [it.x, it.y]
-    textLayerState = { ...textLayerState, baseCoords, ids: allImages.map(it => it.id) }
-  }
-
-  function applyTextCoordsFromState() {
-    if (!textLayerState || !textLayerState.coords) return
-    const map = textLayerState.coords
-    prevImages = allImages
-    allImages = allImages.map((it) => {
-      const c = map[it.id]
-      return c ? { ...it, x: Number(c[0]), y: Number(c[1]) } : it
-    })
-  }
-  // Split pane state
-  let leftWidth = 760
-  let dragging = false
-  let startX = 0
-  let startLeft = 0
-  let lastMouseX = 0
-  const minLeft = 740 // minimum visible width for the left pane
-  const maxLeft = 1400
-  const collapseThreshold = 700 // drag below this to auto-collapse on release
-  let leftCollapsed = false
-  function startDrag(e) { dragging = true; startX = e.clientX; startLeft = leftWidth; lastMouseX = e.clientX }
-  function onLeftResizerDblClick() {
-    if (leftCollapsed) {
-      leftCollapsed = false
-      leftWidth = Math.max(minLeft, leftWidth)
-    } else {
-      leftCollapsed = true
+  // Debugging: inspect an axis and report how many image ids it covers and sample values
+  function logAxisDebug(axisId, which = '') {
+    try {
+      const ax = (axes || []).find(a => a.id === axisId)
+      if (!ax) { console.warn('[frontend] axis not found', which, axisId); return }
+      const ids = (allImages || []).map(i => i.id)
+      const coordKeys = Object.keys(ax.coords || {})
+      console.log('[frontend] axis keys', which, { id: ax.id, keysCount: coordKeys.length, keysSample: coordKeys.slice(0, 5) })
+      let matched = 0
+      const samples = []
+      for (let i = 0; i < Math.min(ids.length, 50); i++) {
+        const id = ids[i]
+        const v = ax.coords ? ax.coords[id] : undefined
+        if (typeof v === 'number' && isFinite(v)) {
+          matched++
+          if (samples.length < 5) samples.push({ id, v })
+        }
+      }
+      // Count total matches across all ids
+      let totalMatched = 0
+      for (const id of ids) {
+        const v = ax.coords ? ax.coords[id] : undefined
+        if (typeof v === 'number' && isFinite(v)) totalMatched++
+      }
+      console.log('[frontend] axis debug', which, { id: ax.id, name: ax.name, group: ax.group, totalMatched, totalImages: ids.length, samples })
+    } catch (err) {
+      console.warn('[frontend] axis debug error', which, axisId, err)
     }
   }
   
-  // Right pane resizer (between composer and combined concepts)
+  function resetAllStateForDatasetChange() {
+    // Clear in-memory state
+    allImages = []
+    prevImages = []
+    selected = new Set()
+    axes = []
+    selectedAxisX = null
+    selectedAxisY = null
+    customProjections = []
+    selections = []
+    combinedSelections = []
+    labelDB = {}
+    warningMsg = ''
+    // Clear caches
+    galleryCache.clear()
+    // Clear persisted keys
+    try {
+      localStorage.removeItem('promptherder.concepts')
+      localStorage.removeItem('promptherder.combined')
+      
+      localStorage.removeItem('promptherder.axes')
+      localStorage.removeItem('promptherder.customProjections')
+      localStorage.removeItem('promptherder.selections')
+      localStorage.removeItem('promptherder.combinedSelections')
+    } catch (_) {}
+  }
+
+  async function onDatasetSelect(val) {
+    if (val === undefined) return
+    // If the same value, ignore
+    if ((datasetPath || '') === (val || '')) return
+    datasetPath = val
+    resetAllStateForDatasetChange()
+    await loadGallery()
+  }
+
+  // Split pane state
+  let leftWidth = 1200
+  let leftTileH = 920
+  let leftCollapsed = false
+
+  let middleWidth = 700
+  let middleTileH = 600
+  let middleCollapsed = true
+
   let rightWidth = 320 // default ~w-80
-  let draggingRight = false
-  let startXRight = 0
-  let startRight = 0
-  const minRight = 180
-  function startRightDrag(e) { draggingRight = true; startXRight = e.clientX; startRight = rightWidth }
-  function onRightResizerDblClick() {
-    middleCollapsed = !middleCollapsed
+  let rightTileH = 600
+  let rightCollapsed = true
+
+  let minLeft = 500 // tune: minimum visible width for the left pane
+  let maxLeft = 2000 // tune: maximum visible width for the left pane
+  let minRight = 180 // tune: minimum right panel width
+
+  // Corner tile drag resize state
+  let tileDrag = null // { which: 'left'|'middle'|'right', startX, startY, startW, startH }
+  function startLeftTileResize(e) {
+    tileDrag = { which: 'left', startX: e.clientX, startY: e.clientY, startW: leftWidth, startH: leftTileH }
+  }
+  function startMiddleTileResize(e) {
+    tileDrag = { which: 'middle', startX: e.clientX, startY: e.clientY, startW: middleWidth, startH: middleTileH }
+  }
+  function startRightTileResize(e) {
+    tileDrag = { which: 'right', startX: e.clientX, startY: e.clientY, startW: rightWidth, startH: rightTileH }
   }
   
   let windowWidth = 0
-  let rowRef
-  let rowWidth = 0
-  $: rowWidth = rowRef ? rowRef.clientWidth : windowWidth
-  let middleCollapsed = false
+  const projectionOptions = [
+    { value: 'color_rgb', label: 'Color' },
+    { value: 'clip', label: 'Semantic' },
+    { value: 'shape', label: 'Shape' },
+    { value: 'meta', label: 'Metadata' },
+  ]
   function onDrag(e) {
-    lastMouseX = e.clientX
-    if (dragging) {
-      const dx = e.clientX - startX
-      // While dragging, keep within visible bounds; actual collapse applied on mouseup
-      leftWidth = Math.max(minLeft, Math.min(maxLeft, startLeft + dx))
-    }
-    if (draggingRight) {
-      const dxr = startXRight - e.clientX // moving left increases right pane width
-      const tentative = startRight + dxr
-      const RESIZER_PX = 4
-      const leftVisible = leftCollapsed ? 28 : leftWidth
-      const minMiddle = 200 // enforce minimum middle width while dragging
-      const total = rowWidth || windowWidth || 0
-      const allowedMaxRight = Math.max(minRight, total - leftVisible - minMiddle - (2 * RESIZER_PX))
-      rightWidth = Math.max(minRight, Math.min(tentative, allowedMaxRight))
+    if (tileDrag) {
+      const dx = e.clientX - tileDrag.startX
+      const dy = e.clientY - tileDrag.startY
+      if (tileDrag.which === 'left') {
+        leftWidth = Math.max(minLeft, Math.min(maxLeft, tileDrag.startW + dx))
+        leftTileH = Math.max(300, tileDrag.startH + dy)
+      } else if (tileDrag.which === 'middle') {
+        middleWidth = Math.max(400, tileDrag.startW + dx)
+        middleTileH = Math.max(300, tileDrag.startH + dy)
+      } else if (tileDrag.which === 'right') {
+        rightWidth = Math.max(minRight, tileDrag.startW + dx)
+        rightTileH = Math.max(300, tileDrag.startH + dy)
+      }
     }
   }
   function endDrag() {
-    if (dragging) {
-      const tentative = startLeft + (lastMouseX - startX)
-      if (!leftCollapsed && tentative < collapseThreshold) {
-        leftCollapsed = true
-        // Reset to a sensible width for when expanded next time
-        leftWidth = Math.max(minLeft, leftWidth)
-      }
+    tileDrag = null
+  }
+
+  // Create or update the two default axes for the current projection (x,y)
+  function axisPrefixForMethod(method) {
+    if (!method) return 'Axis'
+    if (method === 'color_rgb') return 'RGB'
+    if (method === 'color_hsv') return 'HSV'
+    if (method === 'color_lch') return 'LCh'
+    if (method === 'clip') return 'CLIP'
+    if (method === 'dino') return 'DINO'
+    if (method.startsWith('dift_sd_part')) return `DIFT ${method.replace('dift_sd_part','')}`
+    if (method === 'dift_sd') return 'DIFT'
+    return method
+  }
+
+  function ensureDefaultAxesForCurrentProjection() {
+    const methodName = embedMethod
+    if (!methodName) return
+    const prefix = axisPrefixForMethod(methodName)
+    const idX = `axis:${methodName}:x`
+    const idY = `axis:${methodName}:y`
+    const coordsX = {}
+    const coordsY = {}
+    for (const it of allImages) {
+      coordsX[it.id] = Number(it.x ?? 0)
+      coordsY[it.id] = Number(it.y ?? 0)
     }
-    if (draggingRight) {
-      // Estimate middle width and collapse if too small
-      const RESIZER_PX = 4
-      const leftVisible = leftCollapsed ? 28 : leftWidth
-      const total = rowWidth || windowWidth || 0
-      const estimatedMiddle = Math.max(0, total - leftVisible - rightWidth - (2 * RESIZER_PX))
-      const middleCollapseThreshold = 300
-      if (estimatedMiddle < middleCollapseThreshold) {
-        middleCollapsed = true
-      }
-    }
-    dragging = false; draggingRight = false
+    // Group by projection-level key (color_rgb, shape, clip, or custom id if selected)
+    const projGroup = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
+    let next = axes
+    const axX = { id: idX, name: `${prefix} X`, coords: coordsX, group: projGroup }
+    const axY = { id: idY, name: `${prefix} Y`, coords: coordsY, group: projGroup }
+    const hasX = next.some(a => a.id === idX)
+    const hasY = next.some(a => a.id === idY)
+    if (hasX) next = next.map(a => a.id === idX ? axX : a); else next = [...next, axX]
+    if (hasY) next = next.map(a => a.id === idY ? axY : a); else next = [...next, axY]
+    axes = next
+    // Default selection: take first two axes under this projection group
+    const underGroup = axes.filter(a => (a?.group === projGroup) || idMatchesProjection(projGroup, a?.id || ''))
+    selectedAxisX = underGroup[0]?.id || idX
+    selectedAxisY = underGroup[1]?.id || idY
   }
 
-  // DIFT part selector (for UI display only)
-  let diftPart = '' // e.g., '11', '12', ..., '33'
-
-  // UI aliases for embed methods
-  function methodAlias(m) {
-    if (!m) return ''
-    if (m === 'avg') return 'Color'
-    if (m === 'clip') return 'Content'
-    if (m === 'dino') return 'Global composition'
-    if (m === 'dift_sd') return 'Local composition'
-    if (m === 'text') return 'Text'
-    if (m.startsWith('dift_sd_part')) return `Local composition ${m.replace('dift_sd_part','part ')}`
-    return m
+  function idMatchesProjection(groupKey, axisId) {
+    if (!axisId || !groupKey) return false
+    if (groupKey === 'color_rgb') return axisId.startsWith('axis:color_lch:') || axisId.startsWith('axis:color_hsv:') || axisId.startsWith('axis:color_rgb:')
+    if (groupKey === 'shape') return axisId.startsWith('axis:dino:') || axisId.startsWith('axis:dift_sd_part') || axisId.startsWith('axis:dift_sd:')
+    if (groupKey === 'clip') return axisId.startsWith('axis:clip:')
+    if (groupKey === 'meta') return axisId.startsWith('axis:meta:')
+    return false
   }
 
-  // Concepts: saved sets of labels tied to an embedding method
-  // Shape: { id, name, method, good: string[], bad: string[] }
-  let concepts = []
-  // Saved combined concepts for the right panel
-  let combinedConcepts = []
-  let composerLoadChain = null
-
-  function currentMethodLabel() {
-    // In Text mode, reflect the base embedding, not 'text'
-    if (embedSelection === 'text') {
-      return (textLayerState.baseEmbed && String(textLayerState.baseEmbed)) || (embedMethod || 'clip')
-    }
-    // Prefer effective embedMethod which includes dift part when applicable
-    return embedMethod || (embedSelection === 'dift_sd' && diftPart ? `dift_sd_part${diftPart}` : embedSelection)
-  }
-
-  function createConcept() {
-    const methodName = currentMethodLabel()
-    if (!methodName) {
-      alert('Select an embedding/method before creating a concept.')
-      return
-    }
-    const proposed = prompt('Name this concept', methodName)
-    if (!proposed || !proposed.trim()) {
-      // User cancelled or provided empty name; do not create
-      return
-    }
-    const good = Object.entries(labelDB).filter(([, v]) => v === 'good').map(([k]) => k)
-    const bad = Object.entries(labelDB).filter(([, v]) => v === 'bad').map(([k]) => k)
-    const id = `${methodName}:${Date.now()}`
-    const concept = { id, name: proposed.trim(), method: methodName, good, bad }
-    concepts = [concept, ...concepts]
-    // flush current labels
-    labelsMap = new Map()
-    labelDB = {}
-  }
-
-  function createConceptFromGood(goodIds) {
-    const methodName = currentMethodLabel()
-    if (!methodName) {
-      alert('Select an embedding/method before creating a concept.')
-      return
-    }
-    const id = `${methodName}:${Date.now()}`
-    const concept = { id, name: methodName, method: methodName, good: [...goodIds], bad: [] }
-    concepts = [concept, ...concepts]
-  }
-
-  async function loadConcept(concept) {
-    // Switch embedding selection to the concept's method and reload gallery
-    const m = concept.method || concept.name
-    if (m && m.startsWith('dift_sd_part')) {
-      diftPart = m.replace('dift_sd_part', '')
-      embedSelection = 'dift_sd'
-      embedMethod = `dift_sd_part${diftPart}`
-    } else {
-      embedSelection = m
-      embedMethod = m
-    }
-    await loadGallery()
-    // Restore labels
-    const nextMap = new Map()
-    const nextDB = {}
-    for (const id of concept.good || []) { nextMap.set(id, 'good'); nextDB[id] = 'good' }
-    for (const id of concept.bad || []) { nextMap.set(id, 'bad'); nextDB[id] = 'bad' }
-    labelsMap = nextMap
-    labelDB = nextDB
-  }
-
-  function removeConcept(id) {
-    concepts = concepts.filter(c => c.id !== id)
-  }
-
-  function renameConceptById(id, name) {
-    if (!name || !name.trim()) return
-    concepts = concepts.map(c => c.id === id ? { ...c, name: name.trim() } : c)
-  }
-
-  function addCombinedConcept(detail) {
-    const name = (detail?.name || '').trim() || 'Combined'
-    const methodName = (detail?.method || '').trim() || currentMethodLabel()
-    const id = `${methodName}:${Date.now()}`
-    const good = Array.isArray(detail?.good) ? detail.good : []
-    const bad = Array.isArray(detail?.bad) ? detail.bad : []
-    const chain = detail?.chain || null
-    const concept = { id, name, method: methodName, good, bad, chain }
-    combinedConcepts = [concept, ...combinedConcepts]
-  }
-
-  function applyFilters() {
-    filtered = allImages.filter((i) => classFilter === 'All' || i.className === classFilter)
-    if (viewMode === 'similarity' && refId) {
-      filtered = sortBySimilarity(filtered, refId)
-    }
-    if (viewMode === 'cluster') {
-      clusters = clusterKMeans(filtered, 3)
-    } else {
-      clusters = []
-    }
-  }
-
-  function toggleSelect(id) {
-    if (selected.has(id)) selected.delete(id)
-    else selected.add(id)
-    selected = new Set(selected)
-  }
-
-  function setReference(item) {
-    refId = item.id
-    applyFilters()
-  }
-
-  function clearSelection() {
-    selected = new Set()
-  }
-
-  function selectAllCurrent() {
-    const ids = (viewMode === 'cluster' ? clusters.flatMap((c) => c.items) : filtered).map((i) => i.id)
-    selected = new Set(ids)
-  }
+  // Selections state
+  let selections = []
+  let combinedSelections = []
 
   const THUMB_SIZE = 200
   function toThumbUrl(u) {
@@ -325,6 +253,37 @@
     return u
   }
 
+  // Lightweight prefetch of thumbnails to keep them hot in memory
+  const _prefetched = new Set()
+  function schedulePrefetch(urls) {
+    if (!Array.isArray(urls) || urls.length === 0) return
+    // Stagger prefetch using idle time to avoid blocking UI
+    const run = () => {
+      let count = 0
+      for (const u of urls) {
+        if (!u || _prefetched.has(u)) continue
+        try {
+          const img = new Image()
+          img.decoding = 'async'
+          img.loading = 'eager'
+          img.referrerPolicy = 'no-referrer'
+          img.src = u
+          _prefetched.add(u)
+          count++
+          if (count >= 12) break // limit per tick
+        } catch (_) {}
+      }
+      // If there are more to prefetch, schedule another tick
+      const remaining = urls.filter(u => u && !_prefetched.has(u))
+      if (remaining.length > 0) setTimeout(run, 80)
+    }
+    if ('requestIdleCallback' in window) {
+      try { window.requestIdleCallback(run, { timeout: 300 }) } catch (_) { setTimeout(run, 50) }
+    } else {
+      setTimeout(run, 50)
+    }
+  }
+
   async function loadGallery() {
     const qs = new URLSearchParams()
     if (datasetPath && datasetPath.trim()) qs.set('dataset', datasetPath.trim())
@@ -339,9 +298,20 @@
       warningMsg = ''
       prevImages = allImages
       allImages = cached.items
-      gridSize = Number(cached.n_layer || 0)
-      classes = ['All', ...Array.from(new Set(allImages.map((i) => i.className)))]
-      applyFilters()
+      try { schedulePrefetch(allImages.map(it => it.url)) } catch (_) {}
+      // Populate axes from current projection (x,y)
+      ensureDefaultAxesForCurrentProjection()
+      // Merge cached metadata axes if any
+      try {
+        const metaAxes = Array.isArray(cached.metaAxes) ? cached.metaAxes : []
+        console.log('[frontend] cache metaAxes count', metaAxes.length)
+        if (metaAxes.length > 0) {
+          const incoming = metaAxes.map(a => ({ id: a.id, name: a.name || a.id, coords: a.coords || {}, labels: a.labels || [], label_positions: a.label_positions || [], group: 'meta' }))
+          const existing = new Map(axes.map(a => [a.id, a]))
+          for (const ax of incoming) { if (!existing.has(ax.id)) existing.set(ax.id, ax) }
+          axes = Array.from(existing.values())
+        }
+      } catch (err) { console.warn('[frontend] failed to merge cached metaAxes', err) }
       return
     }
 
@@ -369,365 +339,440 @@
         y: Number(it.y ?? it.gy ?? 0),
         embed: [Number(it.gx ?? it.x ?? 0), Number(it.gy ?? it.y ?? 0)],
       }))
-      gridSize = Number(data.n_layer || 0)
-      classes = ['All', ...Array.from(new Set(allImages.map((i) => i.className)))]
-      // Cache for quick toggling between embeddings
-      galleryCache.set(cacheKey, { items: allImages, n_layer: gridSize })
-      applyFilters()
+      // Cache for quick toggling between embeddings (include metadata axes)
+      const metaAxesRaw = Array.isArray(data.metadata_axes) ? data.metadata_axes : []
+      console.log('[frontend] fetched metaAxes', metaAxesRaw)
+      galleryCache.set(cacheKey, { items: allImages, metaAxes: metaAxesRaw })
+      try { schedulePrefetch(allImages.map(it => it.url)) } catch (_) {}
+      // Populate axes from current projection (x,y)
+      ensureDefaultAxesForCurrentProjection()
+      // Ingest metadata axes if present
+      try {
+        const metaAxes = Array.isArray(data.metadata_axes) ? data.metadata_axes : []
+        if (metaAxes.length > 0) {
+          const imgIds = (allImages || []).map(i => i.id)
+          function urlParts(u) {
+            try {
+              let path = u || ''
+              const idx = path.indexOf('://')
+              if (idx > -1) {
+                const slash3 = path.indexOf('/', idx + 3)
+                path = slash3 > -1 ? path.substring(slash3) : path
+              }
+              const m = path.match(/\/thumb\/(\d+)\/(.*)$/)
+              const rel = m ? m[2] : (path.startsWith('/images/') ? path.substring('/images/'.length) : path)
+              const base = rel.split('/').pop() || rel
+              const dot = base.lastIndexOf('.')
+              const stem = dot>0 ? base.substring(0, dot) : base
+              return { rel, base, stem }
+            } catch (_) { return { rel: '', base: '', stem: '' } }
+          }
+          // Build variant -> imageId map for robust matching
+          const variantToId = new Map()
+          for (const it of (allImages || [])) {
+            const id = it.id
+            const info = urlParts(it.url || '')
+            const variants = new Set([
+              String(id), String(id).toLowerCase(),
+              info.rel, info.rel.toLowerCase(),
+              info.base, info.base.toLowerCase(),
+              info.stem, info.stem.toLowerCase(),
+            ])
+            for (const v of Array.from(variants).filter(Boolean)) {
+              if (!variantToId.has(v)) variantToId.set(v, id)
+              // also map with backslashes/slashes swapped
+              const swap = v.replace(/\\/g,'/').replace(/\//g,'\\')
+              if (swap && !variantToId.has(swap)) variantToId.set(swap, id)
+            }
+          }
+          function normalizeMetaAxis(raw) {
+            const coords = raw.coords || {}
+            const out = {}
+            let matched = 0
+            const keyList = Object.keys(coords)
+            for (const k of keyList) {
+              let v = coords[k]
+              // Coerce numeric strings to numbers
+              if (!(typeof v === 'number')) {
+                const num = Number(v)
+                if (Number.isFinite(num)) v = num
+              }
+              if (!(typeof v === 'number' && isFinite(v))) continue
+              const cand = [k, k.toLowerCase()]
+              // also add stem of k
+              const base = k.split('/').pop() || k
+              const dot = base.lastIndexOf('.')
+              const stem = dot>0 ? base.substring(0, dot) : base
+              cand.push(base, base.toLowerCase(), stem, stem.toLowerCase())
+              let targetId = null
+              for (const c of cand) { if (c && variantToId.has(c)) { targetId = variantToId.get(c); break } }
+              if (targetId) { if (out[targetId] === undefined) { out[targetId] = v; matched++ } }
+            }
+            console.log('[frontend] normalize meta axis', raw.id, raw.name, 'matched', matched, '/', imgIds.length, 'keys', keyList.length)
+            if (matched === 0) {
+              console.warn('[frontend] meta axis produced zero matches; sample keys', keyList.slice(0,5))
+            }
+            // Pass through labels info for axis tick rendering
+            const labels = Array.isArray(raw.labels) ? raw.labels : []
+            const label_positions = Array.isArray(raw.label_positions) ? raw.label_positions : []
+            return { id: raw.id, name: raw.name || raw.id, coords: out, labels, label_positions, group: 'meta' }
+          }
+          const incoming = metaAxes.map(normalizeMetaAxis)
+          const existing = new Map(axes.map(a => [a.id, a]))
+          for (const ax of incoming) { if (!existing.has(ax.id)) existing.set(ax.id, ax) }
+          axes = Array.from(existing.values())
+        } else {
+          console.log('[frontend] no metadata axes in response')
+        }
+      } catch (err) { console.warn('[frontend] meta ingest error', err) }
     } catch (e) {
       console.error('[frontend] fetch error', e)
       // Fallback to demo data
       warningMsg = ''
       allImages = generateDemoImages(48)
-      classes = ['All', ...Array.from(new Set(allImages.map((i) => i.className)))]
-      applyFilters()
     }
   }
 
   onMount(() => {
+    // Try to fetch datasets list for the dropdown; fallback to placeholders above
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/datasets`)
+        if (res.ok) {
+          const data = await res.json()
+          if (Array.isArray(data)) {
+            // Accept an array of strings or objects
+            const mapped = data.map((d) => {
+              if (typeof d === 'string') return { label: d, value: d }
+              if (d && typeof d === 'object') {
+                const label = d.label || d.name || d.id || d.path || 'Dataset'
+                const value = d.value || d.id || d.path || d.name || label
+                return { label, value }
+              }
+              return null
+            }).filter(Boolean)
+            if (mapped.length > 0) datasets = mapped
+          }
+        }
+      } catch (_) { /* ignore, keep placeholders */ }
+    })()
     try {
-      const raw = localStorage.getItem('promptherder.concepts')
-      if (raw) {
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) concepts = parsed
+      
+      const rawAxes = localStorage.getItem('promptherder.axes')
+      if (rawAxes) {
+        const parsedA = JSON.parse(rawAxes)
+        if (Array.isArray(parsedA)) axes = parsedA
       }
-      const rawComb = localStorage.getItem('promptherder.combined')
-      if (rawComb) {
-        const parsedC = JSON.parse(rawComb)
-        if (Array.isArray(parsedC)) combinedConcepts = parsedC
+      const rawCustom = localStorage.getItem('promptherder.customProjections')
+      if (rawCustom) {
+        const parsedCP = JSON.parse(rawCustom)
+        if (Array.isArray(parsedCP)) customProjections = parsedCP
       }
-      const rawText = localStorage.getItem('promptherder.textlayer')
-      if (rawText) {
-        const parsedT = JSON.parse(rawText)
-        if (parsedT && typeof parsedT === 'object') textLayerState = parsedT
+      const rawSel = localStorage.getItem('promptherder.selections')
+      if (rawSel) {
+        const parsedS = JSON.parse(rawSel)
+        if (Array.isArray(parsedS)) selections = parsedS
+      }
+      const rawCombSel = localStorage.getItem('promptherder.combinedSelections')
+      if (rawCombSel) {
+        const parsedCS = JSON.parse(rawCombSel)
+        if (Array.isArray(parsedCS)) combinedSelections = parsedCS
       }
     } catch (e) { /* ignore */ }
     loadGallery()
   })
-
-  $: (function persistConcepts(c) {
-    try { localStorage.setItem('promptherder.concepts', JSON.stringify(c)) } catch (_) {}
-  })(concepts)
-  $: (function persistCombined(c) {
-    try { localStorage.setItem('promptherder.combined', JSON.stringify(c)) } catch (_) {}
-  })(combinedConcepts)
-
-  $: (function persistTextLayer(s) {
-    try { localStorage.setItem('promptherder.textlayer', JSON.stringify(s)) } catch (_) {}
-  })(textLayerState)
+  
+  $: (function persistAxes(a) {
+    try { localStorage.setItem('promptherder.axes', JSON.stringify(a)) } catch (_) {}
+  })(axes)
+  $: (function persistCustomProjections(c) {
+    try { localStorage.setItem('promptherder.customProjections', JSON.stringify(c)) } catch (_) {}
+  })(customProjections)
+  $: (function persistSelections(s) {
+    try { localStorage.setItem('promptherder.selections', JSON.stringify(s)) } catch (_) {}
+  })(selections)
+  $: (function persistCombinedSelections(s) {
+    try { localStorage.setItem('promptherder.combinedSelections', JSON.stringify(s)) } catch (_) {}
+  })(combinedSelections)
 
   function onEmbedChange() {
-    // Compute effective method; if DIFT selected without part, don't fetch yet
-    if (embedSelection === 'dift_sd' && !diftPart) {
-      warningMsg = 'Select a DIFT part (3x3) to load embeddings'
-      embedMethod = ''
-      return
-    }
     warningMsg = ''
-    // Do not set embedMethod to 'text'; preserve last non-text embedding
-    if (embedSelection === 'dift_sd') {
-      embedMethod = `dift_sd_part${diftPart}`
-    } else if (embedSelection !== 'text') {
+    // Compute effective method for each selection
+    if (embedSelection === 'meta') {
+      // Do not change embedMethod or reload; just pick first two metadata axes
+      const underGroup = axes.filter(a => (a?.group === 'meta') || idMatchesProjection('meta', a?.id || ''))
+      console.log('[frontend] selecting meta projection; available meta axes', underGroup.map(a=>a.id))
+      if (underGroup.length >= 2) {
+        selectedAxisX = underGroup[0].id
+        selectedAxisY = underGroup[1].id
+        console.log('[frontend] set meta axes X/Y', selectedAxisX, selectedAxisY)
+      } else {
+        console.warn('[frontend] meta selection but fewer than 2 axes found')
+      }
+      return
+    } else if (embedSelection === 'shape') {
+      // default shape method is dino; DIFT selection overrides embedMethod in handler
+      embedMethod = 'dino'
+    } else if (embedSelection === 'color_rgb') {
+      embedMethod = 'color_rgb'
+    } else {
       embedMethod = embedSelection
     }
-    if (embedSelection === 'text') {
-      // Enter text layer: disable scribble, set base if missing, and apply/preset coords
-      scribbleEnabled = false
-      if (!(textLayerState && Object.keys(textLayerState.baseCoords||{}).length > 0)) {
-        scatterToCenter(0.06)
-        // After scatter, set the base to the scattered positions
-        ensureTextBase()
-      } else if (textLayerState && Object.keys(textLayerState.coords||{}).length > 0) {
-        applyTextCoordsFromState()
-      }
-    } else {
-      // Switching to a normal embed; reload gallery
-      loadGallery()
-    }
+    // Switching to a normal embed; reload gallery
+    loadGallery()
   }
 
   function onScribbleLabel(e) {
-    const { ids, label } = e.detail
-    // Update external label object
-    for (const id of ids) {
-      labelDB[id] = label
+    const { ids, label, updates } = e.detail || {}
+    if (Array.isArray(updates)) {
+      const next = { ...labelDB }
+      for (const u of updates) {
+        if (!u) continue
+        const id = u.id
+        const v = u.label
+        if (v === null || v === undefined || v === 'none') delete next[id]
+        else if (v === 'pos' || v === 'neg') next[id] = v
+      }
+      labelDB = next
+      return
+    }
+    if (Array.isArray(ids)) {
+      const next = { ...labelDB }
+      for (const id of ids) {
+        if (label === null || label === undefined || label === 'none') delete next[id]
+        else next[id] = label
+      }
+      labelDB = next
     }
   }
-
-  function clearAllLabels() {
-    // Clear overlay and labels
-    if (minimapRef && minimapRef.clearScribble) minimapRef.clearScribble()
-    labelsMap = new Map()
-    labelDB = {}
-  }
-
-  function onConfirmRegion(e) {
-    const { rect, text } = e.detail
-    // Update saved rectangles for persistence
-    const nextRects = Array.isArray(textLayerState.rects) ? [...textLayerState.rects] : []
-    nextRects.push({ ...rect, text })
-    // Build ids and base coords array based on initial scattered base
-    const ids = (textLayerState.ids && Array.isArray(textLayerState.ids) && textLayerState.ids.length === allImages.length)
-      ? textLayerState.ids
-      : allImages.map(it => it.id)
-    const baseCoordsArr = ids.map(id => {
-      const bc = textLayerState.baseCoords?.[id]
-      return Array.isArray(bc) ? [Number(bc[0]), Number(bc[1])] : [0.5, 0.5]
-    })
-    fetch(`${API_BASE}/text_forces`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        texts: nextRects.map(r => ({ text: r.text, rect: { x: r.x, y: r.y, w: r.w, h: r.h } })),
-        ids,
-        base_coords: baseCoordsArr,
-        embed: 'clip',
-        method: 'pca',
-        alpha: 0.35
-      })
-    }).then(async (res) => {
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
-      const coords = data.coords || []
-      const packed = data.packed || []
-      const nlayer = Number(data.n_layer || gridSize)
-      const idOrder = Array.isArray(data.ids) ? data.ids : ids
-      // Update coords map according to returned order
-      const nextMap = {}
-      for (let i = 0; i < idOrder.length; i++) {
-        const id = idOrder[i]
-        const c = coords[i]
-        if (Array.isArray(c) && c.length >= 2) nextMap[id] = [Number(c[0]), Number(c[1])]
-      }
-      textLayerState = { ...textLayerState, rects: nextRects, coords: nextMap }
-      // Apply to visible items
-      prevImages = allImages
-      const posById = new Map(Object.entries(nextMap))
-      allImages = allImages.map((it, idx) => ({
-        ...it,
-        x: posById.has(it.id) ? Number(posById.get(it.id)[0]) : it.x,
-        y: posById.has(it.id) ? Number(posById.get(it.id)[1]) : it.y,
-        gx: packed[idx] ? packed[idx][0] : it.gx,
-        gy: packed[idx] ? packed[idx][1] : it.gy,
-      }))
-      gridSize = nlayer
-    }).catch((err) => {
-      console.error('text_forces error', err)
-    })
-  }
+  
 </script>
 
 <svelte:window bind:innerWidth={windowWidth} on:mousemove={onDrag} on:mouseup={endDrag} />
 
-<div class="min-h-screen bg-white text-gray-900">
-  <header class="sticky top-0 z-10">
-    <div class="w-full bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 border-b border-slate-200">
-      <div class="px-4 py-3 flex items-center gap-3">
-        <div class="i-heroicons-photo inline-block text-slate-600 text-2xl" />
-        <div class="text-lg font-semibold tracking-wide text-slate-800">PromptHerder</div>
-        <div class="flex-1" />
+<div class="app-main text-gray-900">
+  <header class="app-header">
+    <div class="app-header-inner">
+      <div class="i-heroicons-sparkles brand-icon" />
+      <div class="brand-name">ReQuest</div>
+      <!-- Dataset selector -->
+      <div class="ml-4 inline-flex items-center gap-2">
+        <label for="dataset-select" class="text-sm text-gray-700">Dataset</label>
+        <select id="dataset-select" class="text-sm"
+                on:change={(e)=> onDatasetSelect(e.currentTarget.value)}>
+          {#each datasets as d}
+            <option value={d.value} selected={(datasetPath||'')===(d.value||'')}>{d.label}</option>
+          {/each}
+        </select>
       </div>
+      <div class="flex-1" />
     </div>
   </header>
 
   {#if warningMsg}
     <div class="bg-yellow-50 border-l-4 border-yellow-400 text-yellow-800 p-3">
       <div class="container mx-auto px-4 text-sm">
-        {warningMsg} — run: <code>python backend/precompute_embeddings.py {datasetPath || '[DATASET_PATH]'} --methods avg,clip,dino,dift_sd</code>
+        {warningMsg} — run: <code>python backend/precompute_embeddings.py {datasetPath || '[DATASET_PATH]'} --methods color_rgb,clip,dino,dift_sd</code>
       </div>
     </div>
   {/if}
 
-  <main class="w-full py-6">
-    <div class="flex gap-0 flex-nowrap overflow-x-auto" bind:this={rowRef}>
+  <main class="app-main w-full py-6">
+    <div class="panels-row flex flex-nowrap overflow-x-auto" >
       <!-- Left minimap + list -->
       {#if leftCollapsed}
-        <div class="shrink-0" style="width:30px; height:200px">
+        <div class="shrink-0" style="width:50px;">
           <button
-            class="w-full h-full flex items-center justify-center text-sm font-semibold mb-2 text-slate-700 border border-slate-200 bg-gradient-to-b from-slate-50 to-slate-200 hover:from-slate-100 hover:to-slate-300"
-            style="writing-mode: vertical-lr; text-orientation: sideways; transform: rotate(180deg);"
-            title="Show Images gallery visualization"
+            class="collapsed-handle rotate tile-header"
+            title="Define projection"
             on:click={() => { leftCollapsed = false; leftWidth = Math.max(minLeft, leftWidth) }}
-          >Images gallery visualization</button>
+          >Define projection</button>
         </div>
       {:else}
-      <aside class="shrink-0 pr-4" style={`width:${leftWidth}px;min-width:${minLeft}px`}>
-          <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-            <span class="i-heroicons-photo text-slate-600" />
-            <span>Images gallery visualization</span>
+      <aside class="shrink-0" style={`width:${leftWidth}px;min-width:${minLeft}px ;max-width:${maxLeft}px;`}>
+            <div class="tile tile-primary">
+              <div class="tile-content" style={`height:${leftTileH}px`}>
+                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { leftCollapsed = true }}>–</button></div>
+                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-photo text-slate-600" /> Define projection</div>
+      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:100%;`}>
+        
+        <div class="flex items-start">
+          <div class="w-100 shrink-0">
+            <AxesPanel
+              {axes}
+              embedSelection={embedSelection}
+              projections={projectionOptions}
+              customProjections={customProjections}
+              on:embedChange={(e) => {
+                const sel = e.detail.selection
+                // If selecting a custom projection, assign its axes and do not reload gallery
+                const cp = (customProjections || []).find(p => p.id === sel)
+                if (cp) {
+                  embedSelection = cp.id
+                  if (cp.xAxisId) selectedAxisX = cp.xAxisId
+                  if (cp.yAxisId) selectedAxisY = cp.yAxisId
+                } else if (sel === 'meta') {
+                  embedSelection = 'meta'
+                  // pick first two metadata axes if available
+                  const underGroup = axes.filter(a => (a?.group === 'meta') || idMatchesProjection('meta', a?.id || ''))
+                  if (underGroup.length >= 2) {
+                    selectedAxisX = underGroup[0].id
+                    selectedAxisY = underGroup[1].id
+                    logAxisDebug(selectedAxisX, 'Meta X')
+                    logAxisDebug(selectedAxisY, 'Meta Y')
+                  }
+                } else {
+                  embedSelection = sel
+                  onEmbedChange()
+                }
+              }}
+              on:setX={(e) => { selectedAxisX = e.detail.id; logAxisDebug(selectedAxisX, 'X') }}
+              on:setY={(e) => { selectedAxisY = e.detail.id; logAxisDebug(selectedAxisY, 'Y') }}
+              on:create={(e) => {
+                const ax = e.detail
+                if (ax && ax.id) {
+                  // Ensure axis is grouped to current projection (not variant)
+                  const groupKey = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
+                  const withGroup = { ...ax, group: ax.group || groupKey }
+                  axes = [withGroup, ...axes]
+                }
+              }}
+              on:delete={(e) => { axes = axes.filter(a => a.id !== e.detail.id) }}
+              on:rename={(e) => { axes = axes.map(a => a.id === e.detail.id ? { ...a, name: e.detail.name } : a) }}
+              on:addCustomProjection={(e) => {
+                const name = (e.detail?.name || '').trim()
+                if (!name) return
+                const id = `custom:${Date.now()}`
+                const xAxisId = selectedAxisX
+                const yAxisId = selectedAxisY
+                customProjections = [{ id, name, xAxisId, yAxisId }, ...customProjections]
+                // Immediately select this custom projection and assign axes
+                embedSelection = id
+                if (xAxisId) selectedAxisX = xAxisId
+                if (yAxisId) selectedAxisY = yAxisId
+              }}
+            />
+            <Callout title="Define projections">
+              <ul class="list-disc list-inside">
+                <li> Start with an initial projection, </li>
+                <li> Define new axes, and drag them to X/Y</li>
+                <li> Save projection </li>
+              </ul>
+            </Callout>
           </div>
-      <div class="flex items-center gap-2 mb-2 text-sm">
-        <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={() => (scribbleEnabled = !scribbleEnabled)}>
-          <span class="i-heroicons-pencil-square" /> {scribbleEnabled ? 'Disable Labeling' : 'Enable Labeling'}
-        </button>
-        <!-- <button class="px-2 py-1 border rounded ml-2 inline-flex items-center gap-1" on:click={async () => { showTextOverlay = !showTextOverlay; if (showTextOverlay) { await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() } }}>
-          <span class="i-heroicons-rectangle-group" /> {showTextOverlay ? 'Hide Text Tool' : 'Add Text'}
-        </button> -->
-        {#if scribbleEnabled}
-          <button class="px-2 py-1 rounded text-white inline-flex items-center gap-1" style="background:#16a34a" on:click={() => (scribbleLabel = 'good')} aria-label="Good">
-            <span class="i-heroicons-hand-thumb-up" /> Positive
-          </button>
-          <button class="px-2 py-1 rounded text-white inline-flex items-center gap-1" style="background:#dc2626" on:click={() => (scribbleLabel = 'bad')} aria-label="Bad">
-            <span class="i-heroicons-hand-thumb-down" /> Negative
-          </button>
-          <!-- <label class="ml-2 inline-flex items-center gap-2">
-            <span class="i-heroicons-arrows-pointing-out" /> Radius
-            <input type="range" min="4" max="60" step="1" bind:value={scribbleRadius} class="align-middle" />
-          </label> -->
-          <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={clearAllLabels}>
-            <span class="i-heroicons-trash" /> Clear
-          </button>
-          <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={createConcept}>
-            <span class="i-heroicons-light-bulb" /> Create concept
-          </button>
-        {/if}
-      </div>
-      {#if embedSelection === 'dift_sd'}
-        <div class="text-sm mb-1">Image-part selection</div>
-        <DiftPartSelector on:select={(e) => { diftPart = e.detail.part; embedMethod = `dift_sd_part${diftPart}`; embedSelection = 'dift_sd'; loadGallery(); }} selected={diftPart} />
-      {/if}
-      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:${minimapSize}px;`}>
-        <!-- Method selection inside minimap -->
-        <div class="absolute top-1 left-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
-          {#each ['avg','clip','dino','dift_sd','text'] as m}
-            <label class="inline-flex items-center gap-1 cursor-pointer">
-              <input type="radio" name="embed" value={m} bind:group={embedSelection} on:change={onEmbedChange} />
-              <span class="inline-flex items-center gap-1">
-                {#if m==='avg'}<span class="i-heroicons-adjustments-horizontal" />{/if}
-                {#if m==='clip'}<span class="i-heroicons-command-line" />{/if}
-                {#if m==='dino'}<span class="i-heroicons-cube-transparent" />{/if}
-                {#if m==='dift_sd'}<span class="i-heroicons-rectangle-stack" />{/if}
-                {#if m==='text'}<span class="i-heroicons-chat-bubble-left-right" />{/if}
-                {methodAlias(m)}
-              </span>
-            </label>
-          {/each}
-        </div>
-        {#if embedSelection === 'text'}
-          <div class="absolute top-1 right-1 z-10 bg-white/90 rounded shadow px-2 py-1 text-xs flex items-center gap-2">
-            <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={async () => { showTextOverlay = true; await tick(); if (textOverlayRef && textOverlayRef.startPlacing) textOverlayRef.startPlacing() }}>
-              <span class="i-heroicons-rectangle-group" /> Add text
-            </button>
-            <button class="px-2 py-1 border rounded inline-flex items-center gap-1" on:click={() => { scatterToCenter(0.06) }}>
-              <span class="i-heroicons-arrow-path" /> Reset
-            </button>
-          </div>
-        {/if}
-        {#if scribbleEnabled && embedSelection !== 'text'}
-          <AnimatedMinimap
+          <div class="flex-1 min-w-0 ml-2">
+          <AxesMinimap
             items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            prevItems={prevImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={minimapSize}
-            height={minimapSize}
-            gridSize={gridSize}
-            bind:this={minimapRef}
-            enableScribble={scribbleEnabled}
-            activeLabel={scribbleLabel}
-            brushRadiusPx={scribbleRadius}
-            bind:labels={labelsMap}
+            selections={selections}
+            axes={axes}
+            width={minimapW}
+            height={minimapH}
+            labels={new Map(Object.entries(labelDB))}
+            bind:selectedX={selectedAxisX}
+            bind:selectedY={selectedAxisY}
+            on:axesChange={(e)=>{ selectedAxisX = e.detail.selectedX; selectedAxisY = e.detail.selectedY; console.log('[frontend] axesChange X/Y', selectedAxisX, selectedAxisY); logAxisDebug(selectedAxisX, 'X'); logAxisDebug(selectedAxisY, 'Y') }}
             on:label={onScribbleLabel}
+            on:create={(e) => {
+              const ax = e.detail
+              if (ax && ax.id) {
+                const groupKey = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
+                const withGroup = { ...ax, group: ax.group || groupKey }
+                axes = [withGroup, ...axes]
+              }
+            }}
+            on:saveSelection={(e) => { const sel = e.detail; if (sel && sel.id) { selections = [sel, ...selections] } }}
           />
-        {:else}
-          <HoverGridMinimap
-            items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            width={minimapSize}
-            height={minimapSize}
-            gridSize={gridSize}
-            viewFrac={0.35}
-            experimentalLocalPacking={true}
-          />
-        {/if}
-        {#if embedSelection === 'text' && showTextOverlay}
-          <MinimapTextOverlay
-            bind:this={textOverlayRef}
-            width={minimapSize}
-            height={minimapSize}
-            rectangles={textLayerState.rects}
-            on:confirmRegion={onConfirmRegion}
-          />
-        {/if}
+          </div>
+          
+        </div>
+        
       </div>
-      <div class="mt-2 text-xs text-gray-600">Positive: {goodCount} • Negative: {badCount}</div>
-
-      <div class="text-sm mb-1 mt-4">Concepts list</div>
-      <ConceptsPanel
-        {concepts}
-        items={allImages}
-        on:select={(e) => loadConcept(e.detail.concept)}
-        on:delete={(e) => removeConcept(e.detail.id)}
-        on:rename={(e) => renameConceptById(e.detail.id, e.detail.name)}
-      />
-
+      <div class="tile-resize-handle" title="Resize" on:mousedown={startLeftTileResize}></div>
+          </div>
         </aside>
       {/if}
-<!-- 
-    <section class="flex-1">
-      <div class="text-sm mb-1">Search images</div>
-      <TextSimilarity
-        items={allImages}
-        apiBase={API_BASE}
-        defaultTopN={10}
-        onCreateConcept={(ids) => createConceptFromGood(ids)}
-        onRefreshGallery={async () => { await loadGallery() }}
-      />
-    </section> 
--->
-
-      <!-- Resizer -->
-      <div class="w-1 bg-gray-200 hover:bg-gray-300 cursor-col-resize" title="Resize left panel (double-click to collapse/expand)" on:mousedown={startDrag} on:dblclick={onLeftResizerDblClick} />
-
-      <!-- Middle: concepts composer -->
-      {#if middleCollapsed}
-        <div class="shrink-0" style="width:30px; height:200px">
+     {#if middleCollapsed}
+        <div class="shrink-0 pr-2" style="width:50px;">
           <button
-            class="w-full h-full flex items-center justify-center text-[11px] text-slate-700 border border-slate-200 bg-gradient-to-b from-slate-50 to-slate-200 hover:from-slate-100 hover:to-slate-300"
-            style="writing-mode: vertical-lr; text-orientation: upright;"
-            title="Show Concept composer"
+            class="collapsed-handle rotate tile-header"
+            title="Define Selections"
             on:click={() => { middleCollapsed = false }}
-          >Concept composer</button>
+          >Define selections</button>
         </div>
       {:else}
-        <section class="flex-1 min-w-0 pl-4 pr-4">
-          <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-            <span class="i-heroicons-adjustments-horizontal text-slate-600" />
-            <span>Concept composer</span>
-          </div>
-          <ConceptComposer
-            {concepts}
-            allIds={allImages.map(i => i.id)}
-            defaultMethod={currentMethodLabel()}
-            items2d={allImages}
-            apiBase={API_BASE}
-            datasetPath={datasetPath}
-            on:create={(e) => addCombinedConcept(e.detail)}
-            loadChain={composerLoadChain}
+        <section class="shrink-0 pl-2 pr-2" style={`width:${middleWidth}px`}>
+          <div class="tile tile-primary">
+            <div class="tile-content" style={`height:${middleTileH}px`}>
+              <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { middleCollapsed = true }}>–</button></div>
+              <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-adjustments-horizontal text-slate-600" /> Define selections</div>
+              
+          <SelectionComposer
+            {selections}
+            items={allImages}
+            on:toggle={(e)=>{ const { id, active } = e.detail; selections = selections.map(s => s.id===id ? { ...s, active: !!active } : s) }}
+            on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; selections = selections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
+            on:delete={(e)=>{ const { id } = e.detail; selections = selections.filter(s => s.id !== id) }}
+            on:combine={(e)=>{ const comb = e.detail; if (comb && comb.id) { combinedSelections = [comb, ...combinedSelections] } }}
           />
+          <Callout title="Combine selections">
+                Activate selections to combine all positives or discard all negatives.
+              </Callout>
+              <div class="tile-resize-handle" title="Resize" on:mousedown={startMiddleTileResize}></div>
+            </div>
+          </div>
+                  <!-- Rightmost: saved combined selections -->
+        {#if true}
+          {#if rightCollapsed}
+            <div class="shrink-0" style="width:50px;">
+              <button
+                class="collapsed-handle rotate tile-header"
+                title="Show Combined selections"
+                on:click={() => { rightCollapsed = false }}
+              >Combined selections</button>
+            </div>
+          {:else}
+            <aside class="shrink-0 mt-2" style={`width:${rightWidth}px;min-width:${minRight}px`}>
+            <div class="tile tile-primary">
+              <div class="tile-content" style={`height:${rightTileH}px`}>
+                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
+                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Combined selections</div>
+                  <div class="grid gap-2">
+                    {#each combinedSelections as cs (cs.id)}
+                      <CombinedSelection
+                        combined={cs}
+                        idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
+                        on:apply={(e)=>{
+                          const { posIds=[], negIds=[] } = e.detail || {}
+                          const next = {}
+                          for (const id of allImages.map(i => i.id)) next[id] = undefined
+                          for (const id of posIds) next[id] = 'pos'
+                          for (const id of negIds) next[id] = 'neg'
+                          labelDB = next
+                        }}
+                        on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; combinedSelections = combinedSelections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
+                        on:delete={(e)=>{ const { id } = e.detail; combinedSelections = combinedSelections.filter(s => s.id !== id) }}
+                        on:sendToSelections={(e)=>{ const { selection } = e.detail || {}; if (selection && selection.id) { selections = [selection, ...selections] } }}
+                      />
+                    {/each}
+                    {#if combinedSelections.length === 0}
+                      <div class="text-sm text-gray-500">No combined selections yet. Use the Selection composer to create one.</div>
+                    {/if}
+                  </div>
+                  <Callout title="Saved">
+                    Apply a combined selection to set current labels, or move to selections to edit.
+                  </Callout>
+                  <div class="tile-resize-handle" title="Resize" on:mousedown={startRightTileResize}></div>
+                </div>
+              </div>
+            </aside>
+          {/if}
+        {/if}
+
         </section>
       {/if}
 
-      <!-- Resizer between composer and right panel -->
-      <div class="w-1 bg-gray-200 hover:bg-gray-300 cursor-col-resize" title="Resize right panel (double-click to collapse/expand middle)" on:mousedown={startRightDrag} on:dblclick={onRightResizerDblClick} />
+      
 
-      <!-- Rightmost: saved combined concepts -->
-      <aside class="shrink-0" style={`width:${rightWidth}px;min-width:${minRight}px`}>
-        <div class="bg-gradient-to-r from-slate-100 via-slate-200 to-slate-100 text-slate-800 px-3 py-2 rounded-md border border-slate-200 text-sm font-semibold mb-2 flex items-center gap-2">
-          <span class="i-heroicons-rectangle-stack text-slate-600" />
-          <span>Saved combined concepts</span>
-        </div>
-        <div class="grid gap-2">
-          {#each combinedConcepts as cc (cc.id)}
-            <CombinedConceptItem
-              combined={cc}
-              idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
-              allIds={allImages.map(i => i.id)}
-              on:load={(e) => { composerLoadChain = e.detail.chain || null }}
-            />
-          {/each}
-          {#if combinedConcepts.length === 0}
-            <div class="text-xs text-gray-500">No combined concepts yet. Use the composer to create one.</div>
-          {/if}
-        </div>
-      </aside>
     </div>
   </main>
 </div>

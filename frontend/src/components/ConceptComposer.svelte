@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte'
   import ConceptTolerance from './ConceptTolerance.svelte'
+  import CombinedConceptItem from './CombinedConceptItem.svelte'
 
   // concepts: [{id, name, method, good:[], bad:[] }]
   export let concepts = []
@@ -13,6 +14,8 @@
   // API base and dataset path for per-concept projection fetching
   export let apiBase = ''
   export let datasetPath = ''
+  // Saved combined concepts to render inside composer
+  export let combinedConcepts = []
 
   const dispatch = createEventDispatcher()
 
@@ -228,7 +231,7 @@
 {/if}
 
 <!-- Save combined concept at the bottom -->
-<div class="mt-4 flex items-center gap-2">
+  <div class="mt-4 flex items-center gap-2">
   <input class="px-2 py-1 border rounded text-sm flex-1 bg-white" placeholder="Name combined concept" bind:value={combinedName} />
   <button class="btn" on:click={() => {
       const ids = combinedGood
@@ -240,6 +243,23 @@
     <span class="i-heroicons-plus-circle mr-1" /> Save Combined
   </button>
 </div>
+
+<!-- Saved combined concepts rendered here instead of App -->
+{#if Array.isArray(combinedConcepts) && combinedConcepts.length > 0}
+  <div class="mt-6">
+    <div class="text-sm font-medium mb-2">Saved combined concepts</div>
+    <div class="grid gap-2">
+      {#each combinedConcepts as cc (cc.id)}
+        <CombinedConceptItem
+          combined={cc}
+          idToUrl={new Map((methodCache.get(cc.method) || items2d || []).map(i => [i.id, i.url]))}
+          allIds={(items2d || []).map(i => i.id)}
+          on:load={(e) => { /* bubble to parent if needed */ }}
+        />
+      {/each}
+    </div>
+  </div>
+{/if}
 
 <style>
 </style>

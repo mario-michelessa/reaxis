@@ -27,17 +27,52 @@ from flask_cors import CORS
 
 from gallery_backend import ImageGalleryEngine
 from embeddings import EmbeddingEngine
+import csv
+import hashlib
 
 
 app = Flask(__name__)
 CORS(app)
 
-# Configure your dataset root here. Set this to your images root folder.
-# Example: DATASET_PATH = Path('/data/my_images')
-DATASET_PATH = Path('../data/datasets/ISIC2017/')
+"""Dataset configuration
+
+- DATASETS_ROOT: base folder containing available datasets
+- DATASET_PATH: default dataset folder (used if no dataset query is provided)
+"""
+DATASETS_ROOT = (Path(__file__).parent.parent / 'data' / 'datasets').resolve()
+DATASET_PATH = (DATASETS_ROOT / 'ISIC2017').resolve()
+
 # Keep the currently active dataset root for serving images
-app.config['DATASET_ROOT'] = str(DATASET_PATH.resolve()) if DATASET_PATH.exists() else None
-print(f'Using DATASET_PATH: {DATASET_PATH}, exists: {DATASET_PATH.exists()}, length: {len(list(DATASET_PATH.rglob("*")))}')
+app.config['DATASET_ROOT'] = str(DATASET_PATH) if DATASET_PATH.exists() else None
+print(f'[server] DATASETS_ROOT={DATASETS_ROOT} exists={DATASETS_ROOT.exists()}')
+print(f'[server] default DATASET_PATH={DATASET_PATH} exists={DATASET_PATH.exists()}')
+
+def list_available_datasets():
+    out = []
+    if not DATASETS_ROOT.exists():
+        return out
+    for p in sorted(DATASETS_ROOT.iterdir()):
+        try:
+            if p.is_dir() and not p.name.startswith('.'):
+                # Heuristic: only include if contains at least one file in subtree
+                any_file = next(p.rglob('*.*'), None)
+                if any_file is not None:
+                    out.append({'label': p.name, 'value': p.name})
+        except Exception:
+            continue
+    return out
+
+def resolve_dataset_root(name_or_none: str | None) -> Path:
+    if not name_or_none:
+        return DATASET_PATH
+    # Only allow names that resolve under DATASETS_ROOT to avoid arbitrary paths
+    candidate = (DATASETS_ROOT / name_or_none).resolve()
+    try:
+        candidate.relative_to(DATASETS_ROOT)
+    except Exception:
+        # Outside datasets root; reject by falling back to default
+        return DATASET_PATH
+    return candidate if candidate.exists() else DATASET_PATH
 
 
 @app.get('/health')
@@ -47,10 +82,12 @@ def health() -> Any:
 
 @app.get('/gallery.json')
 def gallery() -> Any:
-    # Use configured dataset; do not accept dataset via query params
-    dataset = str(DATASET_PATH)
+    # Accept optional dataset name via query params (must exist under DATASETS_ROOT)
+    dataset_name = request.args.get('dataset')
+    dataset_path = resolve_dataset_root(dataset_name)
+    dataset = str(dataset_path)
     method = request.args.get('method', 'pca').lower()
-    embed_method = request.args.get('embed', 'avg').lower()
+    embed_method = request.args.get('embed', 'color_rgb').lower()
     # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
     if embed_method == 'text':
         embed_method = 'clip'
@@ -106,8 +143,139 @@ def gallery() -> Any:
             'gx': float(packed[i, 0]),
             'gy': float(packed[i, 1]),
         })
-    print(f"[gallery] returning items={len(items)}")
-    return jsonify({'items': items, 'dataset': dataset, 'n_layer': eff_layer, 'n_tile': n_tile, 'method': method, 'embed': embed_method, 'warning': None})
+    # Attempt to load per-image metadata axes from metadata.csv in dataset root
+    metadata_axes = []
+    try:
+        meta_path = dataset_root / 'metadata.csv'
+        if meta_path.exists():
+            print(f"[gallery] reading metadata.csv from {meta_path}")
+            # Read CSV rows
+            rows = []
+            with meta_path.open('r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                headers = [h.strip() for h in (reader.fieldnames or [])]
+                if 'image' not in [h.lower() for h in headers]:
+                    print('[gallery] metadata.csv missing image column; skipping')
+                else:
+                    image_col = next(h for h in headers if h.lower() == 'image')
+                    field_cols = [h for h in headers if h != image_col]
+                    print('[gallery] metadata headers:', headers, 'fields:', field_cols)
+                    for r in reader:
+                        # Strip header keys and string values to avoid mismatches
+                        rows.append({(k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v) for k, v in r.items()})
+                    print('[gallery] metadata rows:', len(rows))
+                    for field in field_cols:
+                        raw_map: Dict[str, Any] = {}
+                        for r in rows:
+                            key = str(r.get(image_col) or '').strip()
+                            if not key:
+                                continue
+                            # Match by exact id or by filename (stem/base/rel), case-insensitive
+                            match_id = None
+                            if key in [e.id for e in entries]:
+                                match_id = key
+                            else:
+                                kp = Path(key)
+                                base = kp.name; stem = kp.stem
+                                for e in entries:
+                                    pe = Path(e.path)
+                                    if pe.name.lower() == base.lower() or pe.stem.lower() == stem.lower():
+                                        match_id = e.id
+                                        break
+                            if not match_id:
+                                continue
+                            raw_map[match_id] = r.get(field)
+                        if not raw_map:
+                            print('[gallery] field has no matches:', field)
+                            continue
+                        # Unique values preserving order, then sort small->high where possible
+                        uniq_vals_raw = []
+                        for v in raw_map.values():
+                            sv = '' if v is None else str(v)
+                            if sv not in uniq_vals_raw:
+                                uniq_vals_raw.append(sv)
+                        # Try numeric sort; fallback to case-insensitive alpha
+                        as_num = []
+                        all_numeric = True
+                        for sv in uniq_vals_raw:
+                            try:
+                                as_num.append((float(sv), sv))
+                            except Exception:
+                                all_numeric = False
+                                break
+                        if all_numeric:
+                            uniq_vals_sorted = [sv for _, sv in sorted(as_num, key=lambda x: x[0])]
+                        else:
+                            uniq_vals_sorted = sorted(uniq_vals_raw, key=lambda s: s.lower())
+                        # Number of unique values (n). We'll map categories to k/n with jitter.
+                        n = len(uniq_vals_sorted)
+                        val_to_idx = {v: i for i, v in enumerate(uniq_vals_sorted)}
+                        coords: Dict[str, float] = {}
+                        for img_id, v in raw_map.items():
+                            sv = '' if v is None else str(v)
+                            idx = val_to_idx.get(sv, 0)
+                            # Base position as k/n with k in 1..n
+                            base = (idx + 1) / float(n if n > 0 else 1)
+                            # Deterministic jitter in [-1/(2n), 0] using hash(img_id, field)
+                            if n > 0:
+                                jitter_range = 1.0 / (2.0 * float(n))
+                                h = hashlib.md5(f'{field}|{img_id}'.encode('utf-8')).digest()
+                                u = int.from_bytes(h[:8], 'big') / float(2**64 - 1)
+                                jitter = (u - 1.0) * jitter_range
+                                val = base + jitter
+                            else:
+                                val = base
+                            # Clamp to [0,1]
+                            val = 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
+                            coords[img_id] = float(val)
+                        # Also prepare tick labels and their positions from small->high
+                        label_positions = []
+                        if n > 0:
+                            for i, _sv in enumerate(uniq_vals_sorted):
+                                label_positions.append((i + 0.75) / float(n))
+                        print('[gallery] field coord count:', field, len(coords), 'unique:', n)
+                        axis_id = f'axis:meta:{field}'
+                        axis_name = f'{field}'
+                        metadata_axes.append({'id': axis_id,
+                                              'name': axis_name,
+                                              'coords': coords,
+                                              'labels': uniq_vals_sorted,
+                                              'label_positions': label_positions})
+    except Exception as e:
+        print('[gallery] metadata parse error:', e)
+
+    print(f"[gallery] returning items={len(items)} meta_axes={len(metadata_axes)}")
+    return jsonify({'items': items,
+                    'dataset': dataset,
+                    'n_layer': eff_layer,
+                    'n_tile': n_tile,
+                    'method': method,
+                    'embed': embed_method,
+                    'metadata_axes': metadata_axes,
+                    'warning': None})
+
+
+@app.get('/datasets')
+def datasets_list():
+    """List available datasets under DATASETS_ROOT.
+
+    Returns an array of { label, value } objects, where value can be passed
+    as the 'dataset' query parameter to /gallery.json.
+    """
+    datasets = list_available_datasets()
+    # Always include a default entry at top
+    default_label = DATASET_PATH.name if DATASET_PATH.exists() else 'Default'
+    base = [{'label': default_label, 'value': DATASET_PATH.name}] if DATASET_PATH.exists() else []
+    # De-duplicate by value while preserving order
+    seen = set()
+    out = []
+    for d in base + datasets:
+        v = d.get('value')
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append({'label': d.get('label') or v, 'value': v})
+    return jsonify(out)
 
 
 @app.get('/images/<path:relpath>')
@@ -124,7 +292,12 @@ def serve_image(relpath: str):
     filename = target.name
     if not Path(target).exists():
         return abort(404)
-    return send_from_directory(directory, filename)
+    resp = send_from_directory(directory, filename)
+    try:
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    except Exception:
+        pass
+    return resp
 
 
 @app.get('/thumb/<int:size>/<path:relpath>')
@@ -180,11 +353,21 @@ def serve_thumbnail(size: int, relpath: str):
                 im.save(buf, format='JPEG', quality=85, optimize=True, progressive=True)
                 buf.seek(0)
                 from flask import send_file
-                return send_file(buf, mimetype='image/jpeg')
+                resp = send_file(buf, mimetype='image/jpeg')
+                try:
+                    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+                except Exception:
+                    pass
+                return resp
         except Exception:
             return abort(500, description=f'Failed to generate thumbnail: {e}')
 
-    return send_from_directory(str(cache_file.parent), cache_file.name)
+    resp = send_from_directory(str(cache_file.parent), cache_file.name)
+    try:
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    except Exception:
+        pass
+    return resp
 
 
 @app.post('/text_force')
