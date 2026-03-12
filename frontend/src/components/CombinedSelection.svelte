@@ -34,7 +34,7 @@
     const win = window.open('', '_blank')
     if (!win) return
     const css = `
-      html, body { margin:0; padding:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; background:#fff; color:#111; }
+      html, body { margin:0; padding:0; font-family: Inter, sans-serif; background:#fff; color:#111; }
       .bar { position: sticky; top:0; z-index:10; background:#ffffff; border-bottom:1px solid #e5e7eb; padding:8px 12px; display:flex; align-items:center; gap:12px; }
       .title { font-weight:700; }
       .muted { color:#475569; font-size: 0.9rem; }

@@ -23,8 +23,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
-from embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
-import layout as layout_utils
+try:
+    from .embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
+    from . import layout as layout_utils
+except ImportError:
+    from embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
+    import layout as layout_utils
 
 class ImageGalleryEngine:
     """Orchestrates image discovery, embedding, 2D layout, and grid packing."""
@@ -113,22 +117,46 @@ class ImageGalleryEngine:
             # Full format with validation
             if {'paths', 'embeddings'}.issubset(set(data.files)):
                 print(f"[emb] found full format with paths/embeddings")
-                # Compare by image id (class/filename) only, not absolute paths
-                # Get absolute paths from entries
+                embs = data['embeddings']
+                if embs.ndim != 2 or embs.shape[0] != len(entries):
+                    print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
+                    print(f"[emb] cache format invalid or does not match dataset: {cache}")
+                    return None
+
+                # First try strict absolute-path comparison.
                 current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
                 cached_paths = np.array([str(Path(p).resolve()) for p in data['paths']])
                 paths_match = len(cached_paths) == len(current_paths) and np.all(cached_paths == current_paths)
                 print(f"[emb] validation results - paths match: {paths_match}")
                 if paths_match:
-                    embs = data['embeddings']
                     print(f"[emb] paths match, embeddings shape={embs.shape}")
-                    if embs.ndim == 2 and embs.shape[0] == len(entries):
-                        print(f"[emb] returning full format embeddings")
+                    print(f"[emb] returning full format embeddings")
+                    return embs
+
+                # If path roots differ (common when cache was built from another cwd),
+                # validate and align by image id (filename).
+                current_ids = [str(e.id) for e in entries]
+                cached_ids = [Path(str(p)).name for p in data['paths']]
+
+                if len(cached_ids) == len(current_ids):
+                    if np.all(np.asarray(cached_ids, dtype=object) == np.asarray(current_ids, dtype=object)):
+                        print("[emb] paths mismatch but ids match in order; accepting cache by id")
                         return embs
-                    else:
-                        print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
-                else:
-                    print(f"[emb] cache validation failed for full format (paths mismatch)")
+
+                    id_to_idx: Dict[str, int] = {}
+                    duplicate_id = False
+                    for idx, image_id in enumerate(cached_ids):
+                        if image_id in id_to_idx:
+                            duplicate_id = True
+                            break
+                        id_to_idx[image_id] = idx
+
+                    if (not duplicate_id) and all(image_id in id_to_idx for image_id in current_ids):
+                        remap = np.asarray([id_to_idx[image_id] for image_id in current_ids], dtype=np.int64)
+                        print("[emb] paths mismatch; remapping embeddings by image id order")
+                        return embs[remap]
+
+                print(f"[emb] cache validation failed for full format (paths/id mismatch)")
         except Exception:
             print(f"[emb] failed to load/validate cache: {cache}")
             return None
@@ -136,21 +164,10 @@ class ImageGalleryEngine:
         return None
 
     def _load_or_compute_coords(self, entries: List[ImageEntry], embs: np.ndarray, method: str, red_method: str) -> np.ndarray:
-        # Always cache PCA coordinates as primary; if UMAP requested and available, skip cache
+        cached_coords = self._load_cached_coords(entries, method=method)
+        if red_method.lower() == 'pca' and cached_coords is not None:
+            return cached_coords
         cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
-        current_ids = np.array([e.id for e in entries])
-        if red_method.lower() == 'pca' and cache.exists():
-            try:
-                data = np.load(cache, allow_pickle=False)
-                if 'paths' in data.files:
-                    cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
-                else:
-                    cached_ids = None
-                if (cached_ids is not None and len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids)):
-                    print(f"[coords] loaded cached PCA coords shape={tuple(data['coords'].shape)}")
-                    return data['coords']
-            except Exception:
-                pass
         print(f"[coords] computing coords method={red_method} for embs shape={tuple(embs.shape)}")
         coords2d = self.reduce_to_2d(embs, method=red_method)
         if red_method.lower() == 'pca':
@@ -163,6 +180,38 @@ class ImageGalleryEngine:
             except Exception:
                 pass
         return coords2d
+
+    def _load_cached_coords(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
+        # Always cache PCA coordinates as primary.
+        cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
+        current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
+        current_names = np.array([Path(e.path).name for e in entries])
+        if not cache.exists():
+            return None
+        try:
+            data = np.load(cache, allow_pickle=False)
+            if 'paths' in data.files:
+                cached_paths = np.array([str(Path(p).resolve()) for p in data['paths']])
+                cached_names = np.array([Path(p).name for p in data['paths']])
+            else:
+                cached_paths = None
+                cached_names = None
+            paths_match = (
+                cached_paths is not None
+                and len(cached_paths) == len(current_paths)
+                and np.all(cached_paths == current_paths)
+            )
+            names_match = (
+                cached_names is not None
+                and len(cached_names) == len(current_names)
+                and np.all(cached_names == current_names)
+            )
+            if paths_match or names_match:
+                print(f"[coords] loaded cached PCA coords shape={tuple(data['coords'].shape)}")
+                return data['coords']
+        except Exception:
+            return None
+        return None
 
     def export_gallery_json(self, out_path: str, base_url: Optional[str] = None,
                              n_layer: int = 64, n_tile: int = 8,
@@ -215,7 +264,10 @@ class ImageGalleryEngine:
         if embs.ndim == 2 and embs.shape[0] == 2 and embs.shape[1] != 2 and embs.shape[1] == len(entries):
             print(f"Transposing embeddings from {embs.shape} to ({len(entries)}, 2) assumption")
             embs = embs.T
-        coords2d = self.reduce_to_2d(embs, method=method)
+        coords2d = self._load_cached_coords(entries, method=embed_method)
+        if coords2d is None:
+            print(f"[build] No cached 2D coords found for method={embed_method}")
+            return None, None, None, 0
         # Sanity: coords must be (N,2). If (2,N), transpose.
         if coords2d.ndim == 2 and coords2d.shape[0] == 2 and coords2d.shape[1] == len(entries):
             print(f"Transposing coords2d from {coords2d.shape} to ({len(entries)}, 2)")

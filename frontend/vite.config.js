@@ -5,7 +5,7 @@ import Unocss from 'unocss/vite';
 export default defineConfig({
   plugins: [svelte(), Unocss()],
   server: {
-    port: 5173,
+    port: 5174,
     strictPort: false,
     cors: true
   }

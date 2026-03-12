@@ -5,25 +5,18 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 
-import grid as grid_utils
+try:
+    from . import grid as grid_utils
+except ImportError:
+    import grid as grid_utils
 
-# Create a fixed random reference at import time and project it to 2D via PCA.
-# We will align all subsequent 2D projections (PCA/UMAP) to this reference
-# using an orthogonal Procrustes rotation to stabilize orientation.
+# Create a fixed deterministic 2D reference at import time without heavy linear
+# algebra. Using SVD here can trigger OpenMP shared-memory initialization during
+# module import, which prevents the backend from starting in restricted runtime
+# environments.
 _REF_ROWS = 8192
-_REF_DIM = 64
 _rng = np.random.default_rng(12345)
-_REF_X = _rng.standard_normal((_REF_ROWS, _REF_DIM)).astype(np.float32)
-
-
-def _pca_2d(X: np.ndarray) -> np.ndarray:
-    Xc = X - X.mean(axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-    comps = Vt[:2]
-    return (Xc @ comps.T)
-
-
-_REF_2D = _pca_2d(_REF_X)  # shape (_REF_ROWS, 2)
+_REF_2D = _rng.standard_normal((_REF_ROWS, 2)).astype(np.float32)
 
 
 def _orthogonal_procrustes(A: np.ndarray, B: np.ndarray) -> np.ndarray:

@@ -1,280 +1,300 @@
 <script>
-  // import ImageGrid from './components/ImageGrid.svelte'
-  import { generateDemoImages, sortBySimilarity, clusterKMeans } from './lib/data'
-  import { onMount, tick } from 'svelte'
+  import { onDestroy, onMount } from 'svelte'
   import AxesMinimap from './components/AxesMinimap.svelte'
-  import AxesPanel from './components/AxesPanel.svelte'
-  import ConceptsPanel from './components/ConceptsPanel.svelte'
-  
-  // import ConceptComposer from './components/ConceptComposer.svelte'
-  // import CombinedConceptItem from './components/CombinedConceptItem.svelte'
-  import Callout from './components/Callout.svelte'
-  import CombinedSelection from './components/CombinedSelection.svelte'
-  import SelectionComposer from './components/SelectionComposer.svelte'
-  
-  let allImages = []
-  let prevImages = []
-  // Cache of gallery responses by key (dataset|embed|method)
-  const galleryCache = new Map()
-  let selected = new Set()
-  
-  // Backend wiring
-  // const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://127.0.0.1:5001'
-  const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE) ? import.meta.env.VITE_API_BASE : 'http://localhost:5002'
-  console.log('[frontend] API_BASE', API_BASE)
-  let datasetPath = '' // leave blank to let server pick sample
+  import PromptSidebar from './components/PromptSidebar.svelte'
+  import { axisBuildersStore } from './lib/axisBuilderStore'
+
+  const API_BASE = (() => {
+    const fromEnv = (import.meta.env && import.meta.env.VITE_API_BASE) ? String(import.meta.env.VITE_API_BASE).trim() : ''
+    if (fromEnv) return fromEnv
+    if (typeof window !== 'undefined' && window.location) {
+      const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
+      const host = window.location.hostname || '127.0.0.1'
+      return `${protocol}//${host}:5002`
+    }
+    return 'http://127.0.0.1:5002'
+  })()
+
   let datasets = []
-
-  // Radio selection and effective embed method
-  let embedSelection = 'color_rgb' // 'color' | 'clip' | 'shape' | 'meta' | custom
-  let embedMethod = 'color_rgb' // backend method: 'color_rgb' | 'clip' | 'dino' | 'dift_sd_partXY'
+  let datasetPath = ''
+  let allImages = []
   let warningMsg = ''
-  // External label storage (object, separate from images)
   let labelDB = {}
-  $: posCount = Object.values(labelDB).filter(v => v === 'pos').length
-  $: negCount = Object.values(labelDB).filter(v => v === 'neg').length
 
-  // Scribble controls
-  let scribbleLabel = 'pos' // 'pos' | 'neg'
-  let minimapContainerRef
-  
-  // Dynamic minimap size based on available space
-  $: minimapW = (() => {
-    void leftWidth; void windowWidth; void leftTileH;
-    const w = minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth -470) : 700
-    return Math.max(300, Math.min(2000, w))
-  })()
-
-  $: minimapH = (() => {
-    void leftTileH;
-    const h = minimapContainerRef ? Math.floor(minimapContainerRef.clientHeight - 50) : 700
-    return Math.max(300, Math.min(2000, h))
-  })()
-  
-  // Axes state
-  let axes = [] // [{ id, name, coords }]
+  let axes = []
   let selectedAxisX = null
   let selectedAxisY = null
-  // Custom projections created by user
-  // Shape: { id: 'custom:<ts>', name, xAxisId, yAxisId }
-  let customProjections = []
+  let embedMethod = 'clip'
+  let histogramSlices = []
+  let minimapSizeOffset = 0
+  let minimapFocusRequest = null
+  let savedAxesOpen = false
+  let savedAxes = []
+  let savedAxesLoading = false
+  let savedAxesSaving = false
+  let savedAxesBusyId = ''
+  let savedAxesError = ''
 
-  // Debugging: inspect an axis and report how many image ids it covers and sample values
-  function logAxisDebug(axisId, which = '') {
-    try {
-      const ax = (axes || []).find(a => a.id === axisId)
-      if (!ax) { console.warn('[frontend] axis not found', which, axisId); return }
-      const ids = (allImages || []).map(i => i.id)
-      const coordKeys = Object.keys(ax.coords || {})
-      console.log('[frontend] axis keys', which, { id: ax.id, keysCount: coordKeys.length, keysSample: coordKeys.slice(0, 5) })
-      let matched = 0
-      const samples = []
-      for (let i = 0; i < Math.min(ids.length, 50); i++) {
-        const id = ids[i]
-        const v = ax.coords ? ax.coords[id] : undefined
-        if (typeof v === 'number' && isFinite(v)) {
-          matched++
-          if (samples.length < 5) samples.push({ id, v })
-        }
-      }
-      // Count total matches across all ids
-      let totalMatched = 0
-      for (const id of ids) {
-        const v = ax.coords ? ax.coords[id] : undefined
-        if (typeof v === 'number' && isFinite(v)) totalMatched++
-      }
-      console.log('[frontend] axis debug', which, { id: ax.id, name: ax.name, group: ax.group, totalMatched, totalImages: ids.length, samples })
-    } catch (err) {
-      console.warn('[frontend] axis debug error', which, axisId, err)
+  let minimapContainerRef
+  let windowWidth = 0
+  let windowHeight = 0
+  let leftPanelWidth = 480
+  let sidebarResize = null
+  const MINIMAP_MIN_SIDE = 180
+
+  const galleryCache = new Map()
+  const prefetched = new Set()
+  const MINIMAP_THUMB_SIZE = 64
+  const PREFETCH_MAX = 320
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v))
+  }
+
+  function apiUrl(path) {
+    const base = String(API_BASE || '').trim().replace(/\/+$/, '')
+    return `${base}${path}`
+  }
+
+  async function postJson(path, body) {
+    const res = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    })
+    if (!res.ok) {
+      let details = ''
+      try { details = await res.text() } catch (_) {}
+      throw new Error(`HTTP ${res.status} ${details}`.trim())
+    }
+    return res.json()
+  }
+
+  function sidebarWidthMax() {
+    return clamp(Math.floor(windowWidth * 0.65), 420, 840)
+  }
+
+  function onSidebarResizeStart(e) {
+    sidebarResize = {
+      startX: Number(e.clientX || 0),
+      startWidth: Number(leftPanelWidth || 480),
+    }
+    window.addEventListener('pointermove', onSidebarResizeMove)
+    window.addEventListener('pointerup', onSidebarResizeEnd)
+    try { e.preventDefault() } catch (_) {}
+  }
+
+  function onSidebarResizeMove(e) {
+    if (!sidebarResize) return
+    const dx = Number(e.clientX || 0) - sidebarResize.startX
+    leftPanelWidth = clamp(sidebarResize.startWidth + dx, 360, sidebarWidthMax())
+  }
+
+  function onSidebarResizeEnd() {
+    sidebarResize = null
+    window.removeEventListener('pointermove', onSidebarResizeMove)
+    window.removeEventListener('pointerup', onSidebarResizeEnd)
+  }
+
+  function sessionFromAxisResponse(label, data) {
+    const axis = data?.axis
+    if (!axis?.id || !axis?.coords) return null
+    const name = String(label || axis?.name || data?.q || '').trim()
+    return {
+      axisId: axis.id,
+      q: String(data?.q || name || axis?.name || '').trim(),
+      axis: {
+        ...axis,
+        name: name || axis.name,
+      },
+      ids: Array.isArray(data?.ids) ? data.ids.map((v) => String(v || '').trim()) : [],
+      projectionValues: Array.isArray(data?.projection_values) ? data.projection_values.map((v) => Number(v) || 0) : [],
+      projectionMin: Number(data?.projection_min || 0),
+      projectionMax: Number(data?.projection_max || 0),
+      scores: Array.isArray(data?.scores) ? data.scores.map((v) => Number(v) || 0) : [],
+      std: Array.isArray(data?.std) ? data.std.map((v) => Number(v) || 0) : [],
+      decileExemplars: Array.isArray(data?.decile_exemplars) ? data.decile_exemplars : [],
+      hotspots: Array.isArray(data?.hotspots) ? data.hotspots : [],
+      moveCount: Number(data?.move_count || 0),
+      maxMoves: Number(data?.max_moves || 0),
+      moves: Array.isArray(data?.moves) ? data.moves : [],
+      undefinedIds: Array.isArray(data?.undefined_ids) ? data.undefined_ids.map((v) => String(v || '').trim()).filter(Boolean) : [],
+      w0Summary: data?.w0_summary || {},
+      moveHistory: [],
     }
   }
-  
-  function resetAllStateForDatasetChange() {
-    // Clear in-memory state
+
+  async function loadSavedAxesLibrary() {
+    savedAxesLoading = true
+    savedAxesError = ''
+    try {
+      const res = await fetch(apiUrl('/axis/library'))
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      savedAxes = Array.isArray(data?.items) ? data.items : []
+    } catch (e) {
+      savedAxes = []
+      savedAxesError = `Failed to load saved axes: ${String(e)}`
+    } finally {
+      savedAxesLoading = false
+    }
+  }
+
+  async function saveAxisToLibrary(e) {
+    const axisId = String(e?.detail?.axisId || '').trim()
+    const axisName = String(e?.detail?.axisName || '').trim()
+    const q = String(e?.detail?.q || axisName).trim()
+    const modelType = String(e?.detail?.modelType || '').trim()
+    if (!axisId || !axisName || !q) return
+    savedAxesSaving = true
+    savedAxesError = ''
+    try {
+      const data = await postJson('/axis/library/save', {
+        axis_id: axisId,
+        name: axisName,
+        q,
+        dataset: datasetPath || undefined,
+        origin_dataset: datasetPath || undefined,
+        model_type: modelType || undefined,
+      })
+      savedAxes = Array.isArray(data?.items) ? data.items : savedAxes
+      savedAxesOpen = true
+    } catch (err) {
+      savedAxesError = `Save failed: ${String(err)}`
+    } finally {
+      savedAxesSaving = false
+    }
+  }
+
+  async function projectSavedAxis(item) {
+    if (!item?.id) return
+    savedAxesBusyId = String(item.id)
+    savedAxesError = ''
+    try {
+      const data = await postJson('/axis/library/project', {
+        library_axis_id: item.id,
+        dataset: datasetPath || undefined,
+        collection_id: datasetPath || undefined,
+      })
+      if (data?.axis?.id) {
+        upsertAxisValue({ ...data.axis, group: data.axis.group || 'prompt' })
+        const session = sessionFromAxisResponse(item.name, data)
+        if (session) axisBuildersStore.upsert(session)
+      }
+    } catch (err) {
+      savedAxesError = `Load failed: ${String(err)}`
+    } finally {
+      savedAxesBusyId = ''
+    }
+  }
+
+  async function removeSavedAxis(itemId) {
+    const id = String(itemId || '').trim()
+    if (!id) return
+    savedAxesBusyId = id
+    savedAxesError = ''
+    try {
+      const res = await fetch(apiUrl(`/axis/library/${encodeURIComponent(id)}`), { method: 'DELETE' })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      savedAxes = Array.isArray(data?.items) ? data.items : savedAxes.filter((it) => String(it?.id || '') !== id)
+    } catch (err) {
+      savedAxesError = `Delete failed: ${String(err)}`
+    } finally {
+      savedAxesBusyId = ''
+    }
+  }
+
+  $: panelHeight = Math.max(320, windowHeight - 120 - (warningMsg ? 56 : 0))
+  $: minimapAvailWidth = (() => {
+    void windowWidth
+    return minimapContainerRef ? Math.floor(minimapContainerRef.clientWidth) : Math.max(320, windowWidth - leftPanelWidth - 84)
+  })()
+  $: minimapAvailHeight = (() => {
+    void windowHeight
+    return minimapContainerRef ? Math.floor(minimapContainerRef.clientHeight) : panelHeight
+  })()
+  $: minimapMaxSide = Math.max(MINIMAP_MIN_SIDE, Math.min(minimapAvailWidth, minimapAvailHeight))
+  $: minimapSide = clamp(minimapMaxSide + minimapSizeOffset, MINIMAP_MIN_SIDE, minimapMaxSide)
+  $: minimapItems = (allImages || []).map((item) => ({
+    id: item.id,
+    url: item.url,
+    thumbUrl: item.thumbUrl,
+    fullUrl: item.url,
+    gx: item.gx,
+    gy: item.gy,
+    x: item.x,
+    y: item.y,
+    embed: item.embed,
+  }))
+
+  function resetStateForDatasetChange() {
     allImages = []
-    prevImages = []
-    selected = new Set()
     axes = []
     selectedAxisX = null
     selectedAxisY = null
-    customProjections = []
-    selections = []
-    combinedSelections = []
     labelDB = {}
+    histogramSlices = []
     warningMsg = ''
-    // Clear caches
     galleryCache.clear()
-    // Clear persisted keys
-    try {
-      localStorage.removeItem('promptherder.concepts')
-      localStorage.removeItem('promptherder.combined')
-      
-      localStorage.removeItem('promptherder.axes')
-      localStorage.removeItem('promptherder.customProjections')
-      localStorage.removeItem('promptherder.selections')
-      localStorage.removeItem('promptherder.combinedSelections')
-    } catch (_) {}
-  }
-
-  async function onDatasetSelect(val) {
-    if (val === undefined) return
-    // If the same value, ignore
-    if ((datasetPath || '') === (val || '')) return
-    datasetPath = val
-    resetAllStateForDatasetChange()
-    await loadGallery()
-  }
-
-  // Split pane state
-  let leftWidth = 1200
-  let leftTileH = 920
-  let leftCollapsed = false
-
-  let middleWidth = 700
-  let middleTileH = 600
-  let middleCollapsed = true
-
-  let rightWidth = 320 // default ~w-80
-  let rightTileH = 600
-  let rightCollapsed = true
-
-  let minLeft = 500 // tune: minimum visible width for the left pane
-  let maxLeft = 2000 // tune: maximum visible width for the left pane
-  let minRight = 180 // tune: minimum right panel width
-
-  // Corner tile drag resize state
-  let tileDrag = null // { which: 'left'|'middle'|'right', startX, startY, startW, startH }
-  function startLeftTileResize(e) {
-    tileDrag = { which: 'left', startX: e.clientX, startY: e.clientY, startW: leftWidth, startH: leftTileH }
-  }
-  function startMiddleTileResize(e) {
-    tileDrag = { which: 'middle', startX: e.clientX, startY: e.clientY, startW: middleWidth, startH: middleTileH }
-  }
-  function startRightTileResize(e) {
-    tileDrag = { which: 'right', startX: e.clientX, startY: e.clientY, startW: rightWidth, startH: rightTileH }
-  }
-  
-  let windowWidth = 0
-  const projectionOptions = [
-    { value: 'color_rgb', label: 'Color' },
-    { value: 'clip', label: 'Semantic' },
-    { value: 'shape', label: 'Shape' },
-    { value: 'meta', label: 'Metadata' },
-  ]
-  function onDrag(e) {
-    if (tileDrag) {
-      const dx = e.clientX - tileDrag.startX
-      const dy = e.clientY - tileDrag.startY
-      if (tileDrag.which === 'left') {
-        leftWidth = Math.max(minLeft, Math.min(maxLeft, tileDrag.startW + dx))
-        leftTileH = Math.max(300, tileDrag.startH + dy)
-      } else if (tileDrag.which === 'middle') {
-        middleWidth = Math.max(400, tileDrag.startW + dx)
-        middleTileH = Math.max(300, tileDrag.startH + dy)
-      } else if (tileDrag.which === 'right') {
-        rightWidth = Math.max(minRight, tileDrag.startW + dx)
-        rightTileH = Math.max(300, tileDrag.startH + dy)
-      }
-    }
-  }
-  function endDrag() {
-    tileDrag = null
-  }
-
-  // Create or update the two default axes for the current projection (x,y)
-  function axisPrefixForMethod(method) {
-    if (!method) return 'Axis'
-    if (method === 'color_rgb') return 'RGB'
-    if (method === 'color_hsv') return 'HSV'
-    if (method === 'color_lch') return 'LCh'
-    if (method === 'clip') return 'CLIP'
-    if (method === 'dino') return 'DINO'
-    if (method.startsWith('dift_sd_part')) return `DIFT ${method.replace('dift_sd_part','')}`
-    if (method === 'dift_sd') return 'DIFT'
-    return method
   }
 
   function ensureDefaultAxesForCurrentProjection() {
-    const methodName = embedMethod
-    if (!methodName) return
-    const prefix = axisPrefixForMethod(methodName)
+    const methodName = String(embedMethod || 'color_rgb')
     const idX = `axis:${methodName}:x`
     const idY = `axis:${methodName}:y`
+
     const coordsX = {}
     const coordsY = {}
-    for (const it of allImages) {
-      coordsX[it.id] = Number(it.x ?? 0)
-      coordsY[it.id] = Number(it.y ?? 0)
+    for (const item of allImages) {
+      coordsX[item.id] = Number(item.x ?? 0)
+      coordsY[item.id] = Number(item.y ?? 0)
     }
-    // Group by projection-level key (color_rgb, shape, clip, or custom id if selected)
-    const projGroup = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
-    let next = axes
-    const axX = { id: idX, name: `${prefix} X`, coords: coordsX, group: projGroup }
-    const axY = { id: idY, name: `${prefix} Y`, coords: coordsY, group: projGroup }
-    const hasX = next.some(a => a.id === idX)
-    const hasY = next.some(a => a.id === idY)
-    if (hasX) next = next.map(a => a.id === idX ? axX : a); else next = [...next, axX]
-    if (hasY) next = next.map(a => a.id === idY ? axY : a); else next = [...next, axY]
-    axes = next
-    // Default selection: take first two axes under this projection group
-    const underGroup = axes.filter(a => (a?.group === projGroup) || idMatchesProjection(projGroup, a?.id || ''))
-    selectedAxisX = underGroup[0]?.id || idX
-    selectedAxisY = underGroup[1]?.id || idY
+
+    const next = new Map(axes.map((axis) => [axis.id, axis]))
+    next.set(idX, { id: idX, name: 'Embedding X', coords: coordsX, group: 'base' })
+    next.set(idY, { id: idY, name: 'Embedding Y', coords: coordsY, group: 'base' })
+    axes = Array.from(next.values())
+
+    if (!selectedAxisX || !next.has(selectedAxisX)) selectedAxisX = idX
+    if (!selectedAxisY || !next.has(selectedAxisY)) selectedAxisY = idY
   }
 
-  function idMatchesProjection(groupKey, axisId) {
-    if (!axisId || !groupKey) return false
-    if (groupKey === 'color_rgb') return axisId.startsWith('axis:color_lch:') || axisId.startsWith('axis:color_hsv:') || axisId.startsWith('axis:color_rgb:')
-    if (groupKey === 'shape') return axisId.startsWith('axis:dino:') || axisId.startsWith('axis:dift_sd_part') || axisId.startsWith('axis:dift_sd:')
-    if (groupKey === 'clip') return axisId.startsWith('axis:clip:')
-    if (groupKey === 'meta') return axisId.startsWith('axis:meta:')
-    return false
-  }
-
-  // Selections state
-  let selections = []
-  let combinedSelections = []
-
-  const THUMB_SIZE = 200
-  function toThumbUrl(u) {
+  function toThumbPath(u, size = MINIMAP_THUMB_SIZE) {
     if (!u) return ''
-    // Map '/images/rel' -> `/thumb/<THUMB_SIZE>/rel`
-    if (u.startsWith('/images/')) {
-      return `/thumb/${THUMB_SIZE}${u.substring('/images'.length)}`
-    }
+    if (u.startsWith('/images/')) return `/thumb/${Math.max(16, Math.min(1024, Number(size) || MINIMAP_THUMB_SIZE))}${u.substring('/images'.length)}`
     return u
   }
+
   function prefixUrl(u) {
     if (!u) return ''
     if (u.startsWith('http://') || u.startsWith('https://')) return u
-    // Prefer thumbnails for local image paths
-    const maybeThumb = toThumbUrl(u)
-    if (maybeThumb.startsWith('/')) return API_BASE + maybeThumb
+    if (u.startsWith('/')) return API_BASE + u
     return u
   }
 
-  // Lightweight prefetch of thumbnails to keep them hot in memory
-  const _prefetched = new Set()
+  function thumbUrl(u, size = MINIMAP_THUMB_SIZE) {
+    return prefixUrl(toThumbPath(u, size))
+  }
+
   function schedulePrefetch(urls) {
     if (!Array.isArray(urls) || urls.length === 0) return
-    // Stagger prefetch using idle time to avoid blocking UI
     const run = () => {
       let count = 0
-      for (const u of urls) {
-        if (!u || _prefetched.has(u)) continue
+      for (const url of urls) {
+        if (!url || prefetched.has(url)) continue
         try {
           const img = new Image()
           img.decoding = 'async'
           img.loading = 'eager'
           img.referrerPolicy = 'no-referrer'
-          img.src = u
-          _prefetched.add(u)
-          count++
-          if (count >= 12) break // limit per tick
+          img.src = url
+          prefetched.add(url)
+          count += 1
+          if (count >= 12) break
         } catch (_) {}
       }
-      // If there are more to prefetch, schedule another tick
-      const remaining = urls.filter(u => u && !_prefetched.has(u))
+      const remaining = urls.filter((url) => url && !prefetched.has(url))
       if (remaining.length > 0) setTimeout(run, 80)
     }
     if ('requestIdleCallback' in window) {
@@ -284,254 +304,113 @@
     }
   }
 
-  async function loadGallery() {
-    const qs = new URLSearchParams()
-    if (datasetPath && datasetPath.trim()) qs.set('dataset', datasetPath.trim())
-    if (embedMethod) qs.set('embed', embedMethod)
-    // Use PCA for stable, deterministic 2D coordinates
-    qs.set('method', 'pca')
+  async function loadDatasets() {
+    try {
+      const res = await fetch(`${API_BASE}/datasets`)
+      if (!res.ok) throw new Error(`datasets ${res.status}`)
+      const data = await res.json()
+      if (!Array.isArray(data) || data.length === 0) throw new Error('empty datasets')
+      datasets = data.map((d) => ({
+        label: d?.label || d?.value || 'Dataset',
+        value: d?.value || d?.label || '',
+      }))
+      if (!datasetPath && datasets.length > 0) datasetPath = datasets[0].value
+      return
+    } catch (e) {
+      datasets = []
+      datasetPath = ''
+      warningMsg = `Failed to load datasets from backend: ${String(e)}`
+    }
+  }
 
-    const cacheKey = `${datasetPath || ''}|${embedMethod}|pca`
+  async function loadGallery() {
+    const cacheKey = `${datasetPath}|${embedMethod}|pca`
     if (galleryCache.has(cacheKey)) {
-      console.log('[frontend] cache hit', cacheKey)
       const cached = galleryCache.get(cacheKey)
-      warningMsg = ''
-      prevImages = allImages
       allImages = cached.items
-      try { schedulePrefetch(allImages.map(it => it.url)) } catch (_) {}
-      // Populate axes from current projection (x,y)
+      warningMsg = cached.warning || ''
       ensureDefaultAxesForCurrentProjection()
-      // Merge cached metadata axes if any
-      try {
-        const metaAxes = Array.isArray(cached.metaAxes) ? cached.metaAxes : []
-        console.log('[frontend] cache metaAxes count', metaAxes.length)
-        if (metaAxes.length > 0) {
-          const incoming = metaAxes.map(a => ({ id: a.id, name: a.name || a.id, coords: a.coords || {}, labels: a.labels || [], label_positions: a.label_positions || [], group: 'meta' }))
-          const existing = new Map(axes.map(a => [a.id, a]))
-          for (const ax of incoming) { if (!existing.has(ax.id)) existing.set(ax.id, ax) }
-          axes = Array.from(existing.values())
-        }
-      } catch (err) { console.warn('[frontend] failed to merge cached metaAxes', err) }
       return
     }
 
+    const qs = new URLSearchParams()
+    qs.set('method', 'pca')
+    qs.set('embed', embedMethod)
+    if (datasetPath) qs.set('dataset', datasetPath)
+
     try {
-      const url = `${API_BASE}/gallery.json?${qs.toString()}`
-      console.log('[frontend] fetch', url)
-      const res = await fetch(url)
-      if (!res.ok) throw new Error('Failed to fetch gallery')
+      const res = await fetch(`${API_BASE}/gallery.json?${qs.toString()}`)
+      if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
-      console.log('[frontend] response items', data?.items?.length ?? 0, 'n_layer', data?.n_layer)
       if (!data || !Array.isArray(data.items)) throw new Error('Invalid gallery payload')
 
+      allImages = data.items.map((item) => ({
+        ...(() => {
+          const base = item.url || item.path || ''
+          return {
+            url: prefixUrl(base),
+            thumbUrl: thumbUrl(base, MINIMAP_THUMB_SIZE),
+          }
+        })(),
+        id: item.id,
+        className: item.className || 'Unknown',
+        label: item.id,
+        gx: Number(item.gx ?? item.x ?? 0),
+        gy: Number(item.gy ?? item.y ?? 0),
+        x: Number(item.x ?? item.gx ?? 0),
+        y: Number(item.y ?? item.gy ?? 0),
+        embed: Array.isArray(item.embed)
+          ? item.embed.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+          : [Number(item.x ?? item.gx ?? 0), Number(item.y ?? item.gy ?? 0)],
+      }))
       warningMsg = data.warning || ''
 
-      // Save previous state for animation before replacing
-      prevImages = allImages
-      allImages = data.items.map((it) => ({
-        id: it.id,
-        url: prefixUrl(it.url || it.path),
-        className: it.className || 'Unknown',
-        label: it.id,
-        gx: Number(it.gx ?? it.x ?? 0),
-        gy: Number(it.gy ?? it.y ?? 0),
-        x: Number(it.x ?? it.gx ?? 0),
-        y: Number(it.y ?? it.gy ?? 0),
-        embed: [Number(it.gx ?? it.x ?? 0), Number(it.gy ?? it.y ?? 0)],
-      }))
-      // Cache for quick toggling between embeddings (include metadata axes)
-      const metaAxesRaw = Array.isArray(data.metadata_axes) ? data.metadata_axes : []
-      console.log('[frontend] fetched metaAxes', metaAxesRaw)
-      galleryCache.set(cacheKey, { items: allImages, metaAxes: metaAxesRaw })
-      try { schedulePrefetch(allImages.map(it => it.url)) } catch (_) {}
-      // Populate axes from current projection (x,y)
+      const incomingMeta = Array.isArray(data.metadata_axes) ? data.metadata_axes : []
+      if (incomingMeta.length > 0) {
+        const existing = new Map(axes.map((axis) => [axis.id, axis]))
+        for (const axis of incomingMeta) {
+          if (!axis?.id || existing.has(axis.id)) continue
+          existing.set(axis.id, {
+            id: axis.id,
+            name: axis.name || axis.id,
+            coords: axis.coords || {},
+            labels: axis.labels || [],
+            label_positions: axis.label_positions || [],
+            group: 'meta',
+          })
+        }
+        axes = Array.from(existing.values())
+      }
+
+      galleryCache.set(cacheKey, { items: allImages, warning: warningMsg })
+      schedulePrefetch(allImages.slice(0, PREFETCH_MAX).map((item) => item.thumbUrl || item.url))
       ensureDefaultAxesForCurrentProjection()
-      // Ingest metadata axes if present
-      try {
-        const metaAxes = Array.isArray(data.metadata_axes) ? data.metadata_axes : []
-        if (metaAxes.length > 0) {
-          const imgIds = (allImages || []).map(i => i.id)
-          function urlParts(u) {
-            try {
-              let path = u || ''
-              const idx = path.indexOf('://')
-              if (idx > -1) {
-                const slash3 = path.indexOf('/', idx + 3)
-                path = slash3 > -1 ? path.substring(slash3) : path
-              }
-              const m = path.match(/\/thumb\/(\d+)\/(.*)$/)
-              const rel = m ? m[2] : (path.startsWith('/images/') ? path.substring('/images/'.length) : path)
-              const base = rel.split('/').pop() || rel
-              const dot = base.lastIndexOf('.')
-              const stem = dot>0 ? base.substring(0, dot) : base
-              return { rel, base, stem }
-            } catch (_) { return { rel: '', base: '', stem: '' } }
-          }
-          // Build variant -> imageId map for robust matching
-          const variantToId = new Map()
-          for (const it of (allImages || [])) {
-            const id = it.id
-            const info = urlParts(it.url || '')
-            const variants = new Set([
-              String(id), String(id).toLowerCase(),
-              info.rel, info.rel.toLowerCase(),
-              info.base, info.base.toLowerCase(),
-              info.stem, info.stem.toLowerCase(),
-            ])
-            for (const v of Array.from(variants).filter(Boolean)) {
-              if (!variantToId.has(v)) variantToId.set(v, id)
-              // also map with backslashes/slashes swapped
-              const swap = v.replace(/\\/g,'/').replace(/\//g,'\\')
-              if (swap && !variantToId.has(swap)) variantToId.set(swap, id)
-            }
-          }
-          function normalizeMetaAxis(raw) {
-            const coords = raw.coords || {}
-            const out = {}
-            let matched = 0
-            const keyList = Object.keys(coords)
-            for (const k of keyList) {
-              let v = coords[k]
-              // Coerce numeric strings to numbers
-              if (!(typeof v === 'number')) {
-                const num = Number(v)
-                if (Number.isFinite(num)) v = num
-              }
-              if (!(typeof v === 'number' && isFinite(v))) continue
-              const cand = [k, k.toLowerCase()]
-              // also add stem of k
-              const base = k.split('/').pop() || k
-              const dot = base.lastIndexOf('.')
-              const stem = dot>0 ? base.substring(0, dot) : base
-              cand.push(base, base.toLowerCase(), stem, stem.toLowerCase())
-              let targetId = null
-              for (const c of cand) { if (c && variantToId.has(c)) { targetId = variantToId.get(c); break } }
-              if (targetId) { if (out[targetId] === undefined) { out[targetId] = v; matched++ } }
-            }
-            console.log('[frontend] normalize meta axis', raw.id, raw.name, 'matched', matched, '/', imgIds.length, 'keys', keyList.length)
-            if (matched === 0) {
-              console.warn('[frontend] meta axis produced zero matches; sample keys', keyList.slice(0,5))
-            }
-            // Pass through labels info for axis tick rendering
-            const labels = Array.isArray(raw.labels) ? raw.labels : []
-            const label_positions = Array.isArray(raw.label_positions) ? raw.label_positions : []
-            return { id: raw.id, name: raw.name || raw.id, coords: out, labels, label_positions, group: 'meta' }
-          }
-          const incoming = metaAxes.map(normalizeMetaAxis)
-          const existing = new Map(axes.map(a => [a.id, a]))
-          for (const ax of incoming) { if (!existing.has(ax.id)) existing.set(ax.id, ax) }
-          axes = Array.from(existing.values())
-        } else {
-          console.log('[frontend] no metadata axes in response')
-        }
-      } catch (err) { console.warn('[frontend] meta ingest error', err) }
-    } catch (e) {
-      console.error('[frontend] fetch error', e)
-      // Fallback to demo data
-      warningMsg = ''
-      allImages = generateDemoImages(48)
-    }
-  }
-
-  onMount(() => {
-    // Try to fetch datasets list for the dropdown; fallback to placeholders above
-    ;(async () => {
-      try {
-        const res = await fetch(`${API_BASE}/datasets`)
-        if (res.ok) {
-          const data = await res.json()
-          if (Array.isArray(data)) {
-            // Accept an array of strings or objects
-            const mapped = data.map((d) => {
-              if (typeof d === 'string') return { label: d, value: d }
-              if (d && typeof d === 'object') {
-                const label = d.label || d.name || d.id || d.path || 'Dataset'
-                const value = d.value || d.id || d.path || d.name || label
-                return { label, value }
-              }
-              return null
-            }).filter(Boolean)
-            if (mapped.length > 0) datasets = mapped
-          }
-        }
-      } catch (_) { /* ignore, keep placeholders */ }
-    })()
-    try {
-      
-      const rawAxes = localStorage.getItem('promptherder.axes')
-      if (rawAxes) {
-        const parsedA = JSON.parse(rawAxes)
-        if (Array.isArray(parsedA)) axes = parsedA
-      }
-      const rawCustom = localStorage.getItem('promptherder.customProjections')
-      if (rawCustom) {
-        const parsedCP = JSON.parse(rawCustom)
-        if (Array.isArray(parsedCP)) customProjections = parsedCP
-      }
-      const rawSel = localStorage.getItem('promptherder.selections')
-      if (rawSel) {
-        const parsedS = JSON.parse(rawSel)
-        if (Array.isArray(parsedS)) selections = parsedS
-      }
-      const rawCombSel = localStorage.getItem('promptherder.combinedSelections')
-      if (rawCombSel) {
-        const parsedCS = JSON.parse(rawCombSel)
-        if (Array.isArray(parsedCS)) combinedSelections = parsedCS
-      }
-    } catch (e) { /* ignore */ }
-    loadGallery()
-  })
-  
-  $: (function persistAxes(a) {
-    try { localStorage.setItem('promptherder.axes', JSON.stringify(a)) } catch (_) {}
-  })(axes)
-  $: (function persistCustomProjections(c) {
-    try { localStorage.setItem('promptherder.customProjections', JSON.stringify(c)) } catch (_) {}
-  })(customProjections)
-  $: (function persistSelections(s) {
-    try { localStorage.setItem('promptherder.selections', JSON.stringify(s)) } catch (_) {}
-  })(selections)
-  $: (function persistCombinedSelections(s) {
-    try { localStorage.setItem('promptherder.combinedSelections', JSON.stringify(s)) } catch (_) {}
-  })(combinedSelections)
-
-  function onEmbedChange() {
-    warningMsg = ''
-    // Compute effective method for each selection
-    if (embedSelection === 'meta') {
-      // Do not change embedMethod or reload; just pick first two metadata axes
-      const underGroup = axes.filter(a => (a?.group === 'meta') || idMatchesProjection('meta', a?.id || ''))
-      console.log('[frontend] selecting meta projection; available meta axes', underGroup.map(a=>a.id))
-      if (underGroup.length >= 2) {
-        selectedAxisX = underGroup[0].id
-        selectedAxisY = underGroup[1].id
-        console.log('[frontend] set meta axes X/Y', selectedAxisX, selectedAxisY)
-      } else {
-        console.warn('[frontend] meta selection but fewer than 2 axes found')
-      }
       return
-    } else if (embedSelection === 'shape') {
-      // default shape method is dino; DIFT selection overrides embedMethod in handler
-      embedMethod = 'dino'
-    } else if (embedSelection === 'color_rgb') {
-      embedMethod = 'color_rgb'
-    } else {
-      embedMethod = embedSelection
+    } catch (e) {
+      warningMsg = `Failed to load gallery from backend: ${String(e)}`
+      allImages = []
+      ensureDefaultAxesForCurrentProjection()
     }
-    // Switching to a normal embed; reload gallery
-    loadGallery()
   }
+
+  onMount(async () => {
+    await loadDatasets()
+    await loadGallery()
+    await loadSavedAxesLibrary()
+  })
+
+  onDestroy(() => {
+    onSidebarResizeEnd()
+  })
 
   function onScribbleLabel(e) {
     const { ids, label, updates } = e.detail || {}
     if (Array.isArray(updates)) {
       const next = { ...labelDB }
-      for (const u of updates) {
-        if (!u) continue
-        const id = u.id
-        const v = u.label
-        if (v === null || v === undefined || v === 'none') delete next[id]
-        else if (v === 'pos' || v === 'neg') next[id] = v
+      for (const update of updates) {
+        if (!update) continue
+        if (update.label === null || update.label === undefined || update.label === 'none') delete next[update.id]
+        else if (update.label === 'pos' || update.label === 'neg') next[update.id] = update.label
       }
       labelDB = next
       return
@@ -545,23 +424,74 @@
       labelDB = next
     }
   }
-  
+
+  function upsertAxisValue(axis) {
+    if (!axis || !axis.id) return
+    let found = false
+    const next = axes.map((existing) => {
+      if (existing.id !== axis.id) return existing
+      found = true
+      return { ...existing, ...axis }
+    })
+    axes = found ? next : [{ ...axis, group: axis.group || 'prompt' }, ...next]
+  }
+
+  function upsertAxis(e) {
+    upsertAxisValue(e.detail?.axis)
+  }
+
+  function fallbackAxisId(slot, nextAxes) {
+    const preferred = `axis:${String(embedMethod || 'color_rgb')}:${slot}`
+    if (Array.isArray(nextAxes) && nextAxes.some((axis) => axis?.id === preferred)) return preferred
+    return Array.isArray(nextAxes) && nextAxes.length > 0 ? nextAxes[0].id : null
+  }
+
+  function removeAxisValue(axisId) {
+    const id = String(axisId || '').trim()
+    if (!id) return
+    const next = (axes || []).filter((axis) => axis?.id !== id)
+    axes = next
+    if (selectedAxisX === id) selectedAxisX = fallbackAxisId('x', next)
+    if (selectedAxisY === id) selectedAxisY = fallbackAxisId('y', next)
+    if (Array.isArray(histogramSlices) && histogramSlices.length > 0) {
+      histogramSlices = histogramSlices.filter((slice) => String(slice?.axisId || '').trim() !== id)
+    }
+  }
+
+  function onRemoveAxis(e) {
+    removeAxisValue(e.detail?.id)
+  }
 </script>
 
-<svelte:window bind:innerWidth={windowWidth} on:mousemove={onDrag} on:mouseup={endDrag} />
+<svelte:window bind:innerWidth={windowWidth} bind:innerHeight={windowHeight} />
 
-<div class="app-main text-gray-900">
+<div class="app-main app-shell text-gray-900">
   <header class="app-header">
     <div class="app-header-inner">
       <div class="i-heroicons-sparkles brand-icon" />
       <div class="brand-name">ReQuest</div>
-      <!-- Dataset selector -->
-      <div class="ml-4 inline-flex items-center gap-2">
-        <label for="dataset-select" class="text-sm text-gray-700">Dataset</label>
-        <select id="dataset-select" class="text-sm"
-                on:change={(e)=> onDatasetSelect(e.currentTarget.value)}>
+      <button
+        type="button"
+        class="btn btn-icon btn-ui-secondary saved-axes-toggle"
+        aria-label="Open saved axes"
+        title="Saved axes"
+        on:click={() => { savedAxesOpen = !savedAxesOpen }}
+      >☰</button>
+      <div class="inline-flex items-center gap-2">
+        <label for="dataset-select" class="text-xs text-gray-700">Dataset</label>
+        <select
+          id="dataset-select"
+          class="text-xs"
+          on:change={async (e) => {
+            const next = e.currentTarget.value
+            if ((datasetPath || '') === (next || '')) return
+            datasetPath = next
+            resetStateForDatasetChange()
+            await loadGallery()
+          }}
+        >
           {#each datasets as d}
-            <option value={d.value} selected={(datasetPath||'')===(d.value||'')}>{d.label}</option>
+            <option value={d.value} selected={(datasetPath || '') === (d.value || '')}>{d.label}</option>
           {/each}
         </select>
       </div>
@@ -571,212 +501,439 @@
 
   {#if warningMsg}
     <div class="bg-yellow-50 border-l-4 border-yellow-400 text-yellow-800 p-3">
-      <div class="container mx-auto px-4 text-sm">
-        {warningMsg} — run: <code>python backend/precompute_embeddings.py {datasetPath || '[DATASET_PATH]'} --methods color_rgb,clip,dino,dift_sd</code>
-      </div>
+      <div class="text-sm px-4">{warningMsg}</div>
     </div>
   {/if}
 
-  <main class="app-main w-full py-6">
-    <div class="panels-row flex flex-nowrap overflow-x-auto" >
-      <!-- Left minimap + list -->
-      {#if leftCollapsed}
-        <div class="shrink-0" style="width:50px;">
-          <button
-            class="collapsed-handle rotate tile-header"
-            title="Define projection"
-            on:click={() => { leftCollapsed = false; leftWidth = Math.max(minLeft, leftWidth) }}
-          >Define projection</button>
-        </div>
-      {:else}
-      <aside class="shrink-0" style={`width:${leftWidth}px;min-width:${minLeft}px ;max-width:${maxLeft}px;`}>
-            <div class="tile tile-primary">
-              <div class="tile-content" style={`height:${leftTileH}px`}>
-                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { leftCollapsed = true }}>–</button></div>
-                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-photo text-slate-600" /> Define projection</div>
-      <div class="relative" bind:this={minimapContainerRef} style={`width:100%;height:100%;`}>
-        
-        <div class="flex items-start">
-          <div class="w-100 shrink-0">
-            <AxesPanel
+  <main class="app-main app-workspace w-full py-3">
+    <div class="workspace-grid px-3">
+      <aside class="workspace-sidebar shrink-0" style={`width:${leftPanelWidth}px;min-width:360px;`}>
+        <div class="tile tile-primary">
+          <div class="tile-header mb-1 flex items-center gap-2">
+            <span class="i-heroicons-chat-bubble-left-right text-slate-600" />
+            Axes creation
+          </div>
+          <div class="tile-content">
+            <PromptSidebar
               {axes}
-              embedSelection={embedSelection}
-              projections={projectionOptions}
-              customProjections={customProjections}
-              on:embedChange={(e) => {
-                const sel = e.detail.selection
-                // If selecting a custom projection, assign its axes and do not reload gallery
-                const cp = (customProjections || []).find(p => p.id === sel)
-                if (cp) {
-                  embedSelection = cp.id
-                  if (cp.xAxisId) selectedAxisX = cp.xAxisId
-                  if (cp.yAxisId) selectedAxisY = cp.yAxisId
-                } else if (sel === 'meta') {
-                  embedSelection = 'meta'
-                  // pick first two metadata axes if available
-                  const underGroup = axes.filter(a => (a?.group === 'meta') || idMatchesProjection('meta', a?.id || ''))
-                  if (underGroup.length >= 2) {
-                    selectedAxisX = underGroup[0].id
-                    selectedAxisY = underGroup[1].id
-                    logAxisDebug(selectedAxisX, 'Meta X')
-                    logAxisDebug(selectedAxisY, 'Meta Y')
-                  }
-                } else {
-                  embedSelection = sel
-                  onEmbedChange()
-                }
+              items={allImages}
+              externalSlices={histogramSlices}
+              selectedX={selectedAxisX}
+              selectedY={selectedAxisY}
+              apiBase={API_BASE}
+              dataset={datasetPath}
+              on:upsertAxis={upsertAxis}
+              on:removeAxis={onRemoveAxis}
+              on:setX={(e) => { if (e.detail?.id) selectedAxisX = e.detail.id }}
+              on:setY={(e) => { if (e.detail?.id) selectedAxisY = e.detail.id }}
+              on:sliceChange={(e) => {
+                const many = Array.isArray(e.detail?.slices) ? e.detail.slices : null
+                const single = e.detail?.slice
+                histogramSlices = many || (single ? [single] : [])
               }}
-              on:setX={(e) => { selectedAxisX = e.detail.id; logAxisDebug(selectedAxisX, 'X') }}
-              on:setY={(e) => { selectedAxisY = e.detail.id; logAxisDebug(selectedAxisY, 'Y') }}
+              on:openImage={(e) => {
+                const imageId = String(e.detail?.imageId || '').trim()
+                if (!imageId) return
+                minimapFocusRequest = { imageId, nonce: Date.now() }
+              }}
+              on:saveAxis={saveAxisToLibrary}
+            />
+          </div>
+        </div>
+      </aside>
+
+      <div
+        class="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize axes sidebar"
+        title="Drag to resize sidebar"
+        on:pointerdown={onSidebarResizeStart}
+      />
+
+      <section class="workspace-center min-w-0 flex-1">
+        <div class="tile tile-primary scatter-workspace-tile">
+          <div class="tile-header mb-1 flex items-center gap-2">
+            <span class="i-heroicons-chart-bar-square text-slate-600" />
+            Visualization
+          </div>
+          <div class="tile-content flush minimap-panel" bind:this={minimapContainerRef}>
+            <AxesMinimap
+              items={minimapItems}
+              apiBase={API_BASE}
+              selections={[]}
+              axes={axes}
+              width={minimapSide}
+              height={minimapSide}
+              focusImageRequest={minimapFocusRequest}
+              labels={new Map(Object.entries(labelDB))}
+              histogramSlices={histogramSlices}
+              selectionToolsEnabled={false}
+              bind:selectedX={selectedAxisX}
+              bind:selectedY={selectedAxisY}
+              on:sliceChange={(e) => {
+                const many = Array.isArray(e.detail?.slices) ? e.detail.slices : null
+                const single = e.detail?.slice
+                histogramSlices = many || (single ? [single] : [])
+              }}
+              on:axesChange={(e) => {
+                selectedAxisX = e.detail.selectedX
+                selectedAxisY = e.detail.selectedY
+              }}
+              on:label={onScribbleLabel}
               on:create={(e) => {
-                const ax = e.detail
-                if (ax && ax.id) {
-                  // Ensure axis is grouped to current projection (not variant)
-                  const groupKey = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
-                  const withGroup = { ...ax, group: ax.group || groupKey }
-                  axes = [withGroup, ...axes]
-                }
+                const axis = e.detail
+                if (!axis || !axis.id) return
+                upsertAxisValue({ ...axis, group: axis.group || 'prompt' })
               }}
-              on:delete={(e) => { axes = axes.filter(a => a.id !== e.detail.id) }}
-              on:rename={(e) => { axes = axes.map(a => a.id === e.detail.id ? { ...a, name: e.detail.name } : a) }}
-              on:addCustomProjection={(e) => {
-                const name = (e.detail?.name || '').trim()
-                if (!name) return
-                const id = `custom:${Date.now()}`
-                const xAxisId = selectedAxisX
-                const yAxisId = selectedAxisY
-                customProjections = [{ id, name, xAxisId, yAxisId }, ...customProjections]
-                // Immediately select this custom projection and assign axes
-                embedSelection = id
-                if (xAxisId) selectedAxisX = xAxisId
-                if (yAxisId) selectedAxisY = yAxisId
+              on:resizeMinimap={(e) => {
+                const deltaPx = Number(e.detail?.deltaPx || 0)
+                if (!Number.isFinite(deltaPx) || Math.abs(deltaPx) < 0.001) return
+                minimapSizeOffset = clamp(minimapSizeOffset + deltaPx, -560, 1400)
               }}
             />
-            <Callout title="Define projections">
-              <ul class="list-disc list-inside">
-                <li> Start with an initial projection, </li>
-                <li> Define new axes, and drag them to X/Y</li>
-                <li> Save projection </li>
-              </ul>
-            </Callout>
           </div>
-          <div class="flex-1 min-w-0 ml-2">
-          <AxesMinimap
-            items={allImages.map(i => ({ id: i.id, url: i.url, gx: i.gx, gy: i.gy, x: i.x, y: i.y }))}
-            selections={selections}
-            axes={axes}
-            width={minimapW}
-            height={minimapH}
-            labels={new Map(Object.entries(labelDB))}
-            bind:selectedX={selectedAxisX}
-            bind:selectedY={selectedAxisY}
-            on:axesChange={(e)=>{ selectedAxisX = e.detail.selectedX; selectedAxisY = e.detail.selectedY; console.log('[frontend] axesChange X/Y', selectedAxisX, selectedAxisY); logAxisDebug(selectedAxisX, 'X'); logAxisDebug(selectedAxisY, 'Y') }}
-            on:label={onScribbleLabel}
-            on:create={(e) => {
-              const ax = e.detail
-              if (ax && ax.id) {
-                const groupKey = (embedSelection && String(embedSelection).startsWith('custom:')) ? embedSelection : (embedSelection || 'color_rgb')
-                const withGroup = { ...ax, group: ax.group || groupKey }
-                axes = [withGroup, ...axes]
-              }
-            }}
-            on:saveSelection={(e) => { const sel = e.detail; if (sel && sel.id) { selections = [sel, ...selections] } }}
-          />
-          </div>
-          
         </div>
-        
-      </div>
-      <div class="tile-resize-handle" title="Resize" on:mousedown={startLeftTileResize}></div>
-          </div>
-        </aside>
-      {/if}
-     {#if middleCollapsed}
-        <div class="shrink-0 pr-2" style="width:50px;">
-          <button
-            class="collapsed-handle rotate tile-header"
-            title="Define Selections"
-            on:click={() => { middleCollapsed = false }}
-          >Define selections</button>
-        </div>
-      {:else}
-        <section class="shrink-0 pl-2 pr-2" style={`width:${middleWidth}px`}>
-          <div class="tile tile-primary">
-            <div class="tile-content" style={`height:${middleTileH}px`}>
-              <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { middleCollapsed = true }}>–</button></div>
-              <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-adjustments-horizontal text-slate-600" /> Define selections</div>
-              
-          <SelectionComposer
-            {selections}
-            items={allImages}
-            on:toggle={(e)=>{ const { id, active } = e.detail; selections = selections.map(s => s.id===id ? { ...s, active: !!active } : s) }}
-            on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; selections = selections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
-            on:delete={(e)=>{ const { id } = e.detail; selections = selections.filter(s => s.id !== id) }}
-            on:combine={(e)=>{ const comb = e.detail; if (comb && comb.id) { combinedSelections = [comb, ...combinedSelections] } }}
-          />
-          <Callout title="Combine selections">
-                Activate selections to combine all positives or discard all negatives.
-              </Callout>
-              <div class="tile-resize-handle" title="Resize" on:mousedown={startMiddleTileResize}></div>
-            </div>
-          </div>
-                  <!-- Rightmost: saved combined selections -->
-        {#if true}
-          {#if rightCollapsed}
-            <div class="shrink-0" style="width:50px;">
-              <button
-                class="collapsed-handle rotate tile-header"
-                title="Show Combined selections"
-                on:click={() => { rightCollapsed = false }}
-              >Combined selections</button>
-            </div>
-          {:else}
-            <aside class="shrink-0 mt-2" style={`width:${rightWidth}px;min-width:${minRight}px`}>
-            <div class="tile tile-primary">
-              <div class="tile-content" style={`height:${rightTileH}px`}>
-                <div class="panel-actions"><button class="btn btn-xs btn-ui-secondary" title="Minimize" on:click={() => { rightCollapsed = true }}>–</button></div>
-                <div class="tile-header mb-2 flex items-center gap-2"><span class="i-heroicons-rectangle-stack text-slate-600" /> Combined selections</div>
-                  <div class="grid gap-2">
-                    {#each combinedSelections as cs (cs.id)}
-                      <CombinedSelection
-                        combined={cs}
-                        idToUrl={new Map(allImages.map(i => [i.id, i.url]))}
-                        on:apply={(e)=>{
-                          const { posIds=[], negIds=[] } = e.detail || {}
-                          const next = {}
-                          for (const id of allImages.map(i => i.id)) next[id] = undefined
-                          for (const id of posIds) next[id] = 'pos'
-                          for (const id of negIds) next[id] = 'neg'
-                          labelDB = next
-                        }}
-                        on:rename={(e)=>{ const { id, name } = e.detail; if (!name) return; combinedSelections = combinedSelections.map(s => s.id===id ? { ...s, name: name.trim() } : s) }}
-                        on:delete={(e)=>{ const { id } = e.detail; combinedSelections = combinedSelections.filter(s => s.id !== id) }}
-                        on:sendToSelections={(e)=>{ const { selection } = e.detail || {}; if (selection && selection.id) { selections = [selection, ...selections] } }}
-                      />
-                    {/each}
-                    {#if combinedSelections.length === 0}
-                      <div class="text-sm text-gray-500">No combined selections yet. Use the Selection composer to create one.</div>
-                    {/if}
-                  </div>
-                  <Callout title="Saved">
-                    Apply a combined selection to set current labels, or move to selections to edit.
-                  </Callout>
-                  <div class="tile-resize-handle" title="Resize" on:mousedown={startRightTileResize}></div>
-                </div>
-              </div>
-            </aside>
-          {/if}
-        {/if}
-
-        </section>
-      {/if}
-
-      
-
+      </section>
     </div>
   </main>
+
+  {#if savedAxesOpen}
+    <button
+      class="saved-axes-scrim"
+      aria-label="Close saved axes sidebar"
+      on:click={() => { savedAxesOpen = false }}
+    />
+  {/if}
+  <aside class={`saved-axes-drawer ${savedAxesOpen ? 'open' : ''}`} aria-hidden={!savedAxesOpen}>
+    <div class="saved-axes-header">
+      <div class="saved-axes-title">Saved axes</div>
+      <button type="button" class="saved-axes-close" aria-label="Close saved axes sidebar" on:click={() => { savedAxesOpen = false }}>×</button>
+    </div>
+    {#if savedAxesError}
+      <div class="saved-axes-error">{savedAxesError}</div>
+    {/if}
+    <div class="saved-axes-body">
+      {#if savedAxesLoading}
+        <div class="saved-axes-empty">Loading...</div>
+      {:else if savedAxes.length === 0}
+        <div class="saved-axes-empty">No saved axes</div>
+      {:else}
+        {#each savedAxes as item (item.id)}
+          <div class="saved-axis-row">
+            <button
+              type="button"
+              class="saved-axis-load"
+              disabled={savedAxesBusyId === item.id}
+              on:click={() => projectSavedAxis(item)}
+            >
+              <div class="saved-axis-name">{item.name || item.q || item.id}</div>
+              <div class="saved-axis-origin">{item.origin_dataset || 'unknown'}</div>
+            </button>
+            <button
+              type="button"
+              class="saved-axis-delete"
+              aria-label="Remove saved axis"
+              title="Remove saved axis"
+              disabled={savedAxesBusyId === item.id}
+              on:click|stopPropagation={() => removeSavedAxis(item.id)}
+            >×</button>
+          </div>
+        {/each}
+      {/if}
+    </div>
+    <div class="saved-axes-footer">
+      {#if savedAxesSaving}
+        <span>Saving...</span>
+      {:else}
+        <span>{savedAxes.length} axes</span>
+      {/if}
+    </div>
+  </aside>
 </div>
 
 <style>
   :global(html, body, #app) { height: 100%; }
+
+  .app-shell {
+    height: 100vh;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .app-workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .scatter-workspace-tile {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .workspace-grid {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0;
+    align-items: stretch;
+    height: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .sidebar-resizer {
+    flex: none;
+    width: 14px;
+    align-self: stretch;
+    min-height: 100%;
+    position: relative;
+    cursor: col-resize;
+  }
+
+  .sidebar-resizer::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    border-radius: 999px;
+    background: #dbe2ec;
+  }
+
+  .sidebar-resizer:hover::before {
+    background: #93c5fd;
+  }
+
+  .workspace-center {
+    padding-left: 12px;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .workspace-sidebar {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .workspace-sidebar .tile,
+  .workspace-center .tile {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .workspace-sidebar .tile-content,
+  .workspace-center .tile-content {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .minimap-panel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .workspace-sidebar .tile-content {
+    overflow: hidden;
+  }
+
+  .saved-axes-toggle {
+    margin-left: 4px;
+    width: 28px;
+    height: 28px;
+    color: #0f172a;
+    border-color: #d5dde8;
+  }
+
+  .saved-axes-scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.16);
+    border: 0;
+    margin: 0;
+    padding: 0;
+    z-index: 120;
+    cursor: pointer;
+  }
+
+  .saved-axes-drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(340px, 92vw);
+    background: #ffffff;
+    border-left: 1px solid #dbe2ec;
+    box-shadow: -14px 0 28px rgba(15, 23, 42, 0.16);
+    z-index: 121;
+    display: flex;
+    flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 180ms ease;
+  }
+
+  .saved-axes-drawer.open {
+    transform: translateX(0);
+  }
+
+  .saved-axes-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 12px 12px 8px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .saved-axes-title {
+    font-size: var(--font-size-title);
+    font-weight: 700;
+    color: #1e293b;
+  }
+
+  .saved-axes-close {
+    width: 26px;
+    height: 26px;
+    border: 1px solid #d5dde8;
+    border-radius: 6px;
+    background: #ffffff;
+    color: #475569;
+    font-size: 16px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .saved-axes-error {
+    margin: 10px 12px 0;
+    color: #dc2626;
+    font-size: var(--font-size-small);
+    line-height: 1.3;
+  }
+
+  .saved-axes-body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 10px 12px;
+    display: grid;
+    align-content: start;
+    gap: 8px;
+  }
+
+  .saved-axis-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 6px;
+    align-items: start;
+  }
+
+  .saved-axis-load {
+    text-align: left;
+    border: 1px solid #dbe2ec;
+    border-radius: 8px;
+    background: #ffffff;
+    padding: 8px 9px;
+    color: #0f172a;
+    min-width: 0;
+  }
+
+  .saved-axis-load:disabled {
+    opacity: 0.65;
+  }
+
+  .saved-axis-name {
+    font-size: var(--font-size-body);
+    font-weight: 600;
+    color: #0f172a;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .saved-axis-origin {
+    margin-top: 2px;
+    font-size: var(--font-size-small);
+    color: #64748b;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .saved-axis-delete {
+    width: 26px;
+    height: 26px;
+    border: 1px solid #efc8d0;
+    border-radius: 6px;
+    background: #fff7f8;
+    color: #d46d7f;
+    font-size: 15px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .saved-axes-empty {
+    border: 1px dashed #dbe2ec;
+    border-radius: 8px;
+    padding: 12px 10px;
+    color: #64748b;
+    font-size: var(--font-size-small);
+    text-align: center;
+  }
+
+  .saved-axes-footer {
+    padding: 8px 12px;
+    border-top: 1px solid #e2e8f0;
+    color: #64748b;
+    font-size: var(--font-size-small);
+  }
+
+  @media (max-width: 1080px) {
+    .workspace-grid {
+      flex-direction: column;
+      overflow-x: visible;
+      gap: 12px;
+    }
+
+    .workspace-sidebar {
+      width: 100% !important;
+      min-width: 0 !important;
+    }
+
+    .sidebar-resizer {
+      display: none;
+    }
+
+    .workspace-center {
+      padding-left: 0;
+      height: auto;
+    }
+
+    .workspace-sidebar,
+    .workspace-center {
+      height: auto;
+    }
+
+    .workspace-sidebar .tile,
+    .workspace-center .tile {
+      height: auto;
+    }
+  }
 </style>

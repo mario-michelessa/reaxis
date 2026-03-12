@@ -34,6 +34,7 @@
   function onPointerDown(e) {
     if (!enabled) return
     e.preventDefault()
+    e.stopPropagation()
     drawing = true
     const p = toLocal(e)
     points = [p]
@@ -44,6 +45,7 @@
   function onPointerMove(e) {
     if (!enabled || !drawing) return
     e.preventDefault()
+    e.stopPropagation()
     const p = toLocal(e)
     const now = performance.now()
     const dx = p.x - (lastPoint?.x ?? p.x)
@@ -58,6 +60,7 @@
   function onPointerUp(e) {
     if (!enabled) return
     e.preventDefault()
+    e.stopPropagation()
     if (drawing) {
       drawing = false
       finalizeSelection()
