@@ -1,7 +1,9 @@
 <script>
-  import { createEventDispatcher, onDestroy } from 'svelte'
+  import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte'
   import AxisBuilder from './AxisBuilder.svelte'
+  import MaterialIcon from './MaterialIcon.svelte'
   import { axisBuildersStore } from '../lib/axisBuilderStore'
+  import { selectRepresentativeImageIds } from '../lib/representativeImages'
 
   export let axes = []
   export let items = []
@@ -25,16 +27,23 @@
   let dragSlice = null
   let dragCalibration = null
   let recommendingScatterplots = false
+  let promptUpdatingAxisId = ''
   let recommendationInfo = ''
   let recommendations = []
   let manualAxisText = ''
   let hoveredExplainChipId = ''
+  let promptSupportFlowEl = null
+  let promptSupportTextEl = null
+  let supportConnector = null
+  const chipRefs = new Map()
+  let connectorMeasureScheduled = false
   const HISTOGRAM_MAX_BINS = 6
   $: showLoadingBackdrop = Boolean(extracting || creatingAxes)
   $: loadingBackdropText = extracting ? 'Running LLM...' : 'Creating axes...'
 
   $: axisById = new Map((axes || []).map((axis) => [axis.id, axis]))
   $: itemById = new Map((items || []).map((item) => [String(item?.id || ''), item]).filter((row) => row[0]))
+  $: datasetRepresentativeImageIds = selectRepresentativeImageIds(items, 10)
   $: selectedChips = Array.isArray(attributeChips) ? attributeChips.filter((chip) => chip?.selected) : []
   $: selectedChipCount = selectedChips.length
   $: hoveredExplainChip = Array.isArray(attributeChips)
@@ -44,6 +53,12 @@
     extractedPromptText || promptText,
     hoveredExplainChip?.supportSpans || [],
   )
+  $: {
+    extractedPromptText
+    hoveredExplainChipId
+    promptSupportSegments
+    scheduleSupportConnectorMeasure()
+  }
   $: axisBuilders = $axisBuildersStore
   $: candidateAxes = Array.isArray(axes)
     ? axes
@@ -357,6 +372,12 @@
     return `${base}${path}`
   }
 
+  function capitalizeLeading(value) {
+    const text = String(value || '').trim()
+    if (!text) return ''
+    return `${text.charAt(0).toUpperCase()}${text.slice(1)}`
+  }
+
   function toggleAttributeChip(chipId) {
     attributeChips = (attributeChips || []).map((chip) => {
       if (chip?.id !== chipId) return chip
@@ -364,7 +385,7 @@
       return {
         ...chip,
         selected: nextSelected,
-        customName: String(chip.customName || chip.name || '').trim(),
+        customName: capitalizeLeading(String(chip.customName || chip.name || '').trim()),
       }
     })
   }
@@ -392,7 +413,7 @@
   function finishAttributeChipEdit(chipId) {
     attributeChips = (attributeChips || []).map((chip) => {
       if (chip?.id !== chipId) return chip
-      const nextName = String(chip.customName || chip.name || '').trim() || String(chip.name || '').trim()
+      const nextName = capitalizeLeading(String(chip.customName || chip.name || '').trim() || String(chip.name || '').trim())
       return {
         ...chip,
         editing: false,
@@ -408,7 +429,7 @@
       return {
         ...chip,
         editing: false,
-        customName: String(chip.editBackup || chip.customName || chip.name || '').trim() || String(chip.name || '').trim(),
+        customName: capitalizeLeading(String(chip.editBackup || chip.customName || chip.name || '').trim() || String(chip.name || '').trim()),
         editBackup: '',
       }
     })
@@ -531,6 +552,68 @@
     return segments
   }
 
+  function setExplainChipRef(chipId, el) {
+    const key = String(chipId || '').trim()
+    if (!key) return
+    if (el) chipRefs.set(key, el)
+    else chipRefs.delete(key)
+    scheduleSupportConnectorMeasure()
+  }
+
+  function computeSupportConnector() {
+    if (!promptSupportFlowEl || !promptSupportTextEl || !hoveredExplainChipId) {
+      supportConnector = null
+      return
+    }
+    const chipEl = chipRefs.get(String(hoveredExplainChipId || '').trim())
+    if (!chipEl) {
+      supportConnector = null
+      return
+    }
+    const activeEls = Array.from(promptSupportTextEl.querySelectorAll('.prompt-support-segment.active'))
+    if (activeEls.length === 0) {
+      supportConnector = null
+      return
+    }
+    const wrapperRect = promptSupportFlowEl.getBoundingClientRect()
+    const chipRect = chipEl.getBoundingClientRect()
+    let left = Number.POSITIVE_INFINITY
+    let right = Number.NEGATIVE_INFINITY
+    let bottom = Number.NEGATIVE_INFINITY
+    for (const el of activeEls) {
+      const rect = el.getBoundingClientRect()
+      left = Math.min(left, rect.left)
+      right = Math.max(right, rect.right)
+      bottom = Math.max(bottom, rect.bottom)
+    }
+    if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(bottom)) {
+      supportConnector = null
+      return
+    }
+    const chipX = chipRect.left + (chipRect.width * 0.5) - wrapperRect.left
+    const chipY = chipRect.top - wrapperRect.top
+    const targetX = ((left + right) * 0.5) - wrapperRect.left
+    const targetY = bottom - wrapperRect.top
+    const bendY = chipY - Math.max(14, Math.abs(chipY - targetY) * 0.45)
+    supportConnector = {
+      chipX,
+      chipY,
+      targetX,
+      targetY,
+      bendY,
+    }
+  }
+
+  async function scheduleSupportConnectorMeasure() {
+    if (connectorMeasureScheduled) return
+    connectorMeasureScheduled = true
+    await tick()
+    requestAnimationFrame(() => {
+      connectorMeasureScheduled = false
+      computeSupportConnector()
+    })
+  }
+
   function compressHistogram(countsRaw, labelsRaw = [], maxBins = HISTOGRAM_MAX_BINS) {
     const counts = Array.isArray(countsRaw) ? countsRaw.map((v) => Number(v) || 0) : []
     const labels = Array.isArray(labelsRaw) ? labelsRaw.map((v) => String(v || '').trim()) : []
@@ -645,8 +728,17 @@
     window.removeEventListener('pointermove', onWindowPointerMove)
   }
 
+  onMount(() => {
+    window.addEventListener('resize', scheduleSupportConnectorMeasure)
+    scheduleSupportConnectorMeasure()
+    return () => {
+      window.removeEventListener('resize', scheduleSupportConnectorMeasure)
+    }
+  })
+
   onDestroy(() => {
     window.removeEventListener('pointermove', onWindowPointerMove)
+    window.removeEventListener('resize', scheduleSupportConnectorMeasure)
   })
 
   async function postJson(path, body) {
@@ -766,6 +858,7 @@
       } else {
         name = String(entry || '').trim()
       }
+      name = capitalizeLeading(name)
       if (!name) continue
       out.push({
         id: `chip:${i}:${name.toLowerCase().replace(/\s+/g, '-')}`,
@@ -931,7 +1024,8 @@
   }
 
   async function addManualAxis() {
-    const query = String(manualAxisText || '').trim()
+    const rawQuery = String(manualAxisText || '').trim()
+    const query = rawQuery ? `${rawQuery.charAt(0).toUpperCase()}${rawQuery.slice(1)}` : ''
     errorMsg = ''
     clearSlice()
     if (!query) {
@@ -999,6 +1093,37 @@
     }
   }
 
+  async function onAxisBuilderUpdatePrompts(e) {
+    const axisId = String(e?.detail?.axisId || '').trim()
+    const posPrompts = Array.isArray(e?.detail?.posPrompts) ? e.detail.posPrompts : []
+    const negPrompts = Array.isArray(e?.detail?.negPrompts) ? e.detail.negPrompts : []
+    const onSuccess = typeof e?.detail?.onSuccess === 'function' ? e.detail.onSuccess : null
+    const onError = typeof e?.detail?.onError === 'function' ? e.detail.onError : null
+    if (!axisId) return
+
+    const current = (axisBuilders || []).find((entry) => entry?.axisId === axisId)
+    errorMsg = ''
+    promptUpdatingAxisId = axisId
+    try {
+      const data = await postJson('/axis/update_prompts', {
+        axis_id: axisId,
+        pos_prompts: posPrompts,
+        neg_prompts: negPrompts,
+      })
+      const updated = sessionFromAxisResponse(current || {}, data)
+      if (!updated) throw new Error('Invalid axis prompt update response')
+      updated.moveHistory = Array.isArray(current?.moveHistory) ? current.moveHistory : []
+      axisBuildersStore.upsert(updated)
+      if (updated?.axis?.id) emitAxis(updated.axis)
+      if (onSuccess) onSuccess(updated)
+    } catch (err) {
+      errorMsg = `Axis prompt update failed: ${String(err)}`
+      if (onError) onError(err)
+    } finally {
+      if (promptUpdatingAxisId === axisId) promptUpdatingAxisId = ''
+    }
+  }
+
   function onAxisBuilderRemove(e) {
     const axisId = String(e?.detail?.axisId || '').trim()
     if (!axisId) return
@@ -1024,19 +1149,25 @@
 
 <div class="prompt-sidebar">
   <div class="subtile">
-    <textarea
-      id="prompt-input"
-      class="prompt-input"
-      bind:value={promptText}
-      placeholder="What do you want to visualize?"
-    />
+    <div class="prompt-entry-row">
+      <textarea
+        id="prompt-input"
+        class="prompt-input"
+        rows="2"
+        bind:value={promptText}
+        placeholder="What do you want to visualize?"
+      />
+      <button
+        class="btn btn-primary btn-xs btn-icon"
+        disabled={extracting || creatingAxes}
+        on:click={extractAttributes}
+        aria-label={extracting ? 'Analyzing' : 'Analyze'}
+        title={extracting ? 'Analyzing' : 'Analyze'}
+      >
+        <MaterialIcon name="send" />
+      </button>
+    </div>
     <div class="mt-2 flex items-center gap-2">
-      <button class="btn btn-primary btn-xs" disabled={extracting || creatingAxes} on:click={extractAttributes}>
-        {extracting ? 'Analyzing...' : 'Analyze'}
-      </button>
-      <button class="btn btn-ui-secondary btn-xs" disabled={extracting || creatingAxes} on:click={clearPromptWorkflow}>
-        Clear
-      </button>
       {#if activeSlices.length > 0}
         <button class="btn btn-ui-secondary btn-xs" on:click={clearSlice}>
           Unslice
@@ -1047,87 +1178,106 @@
       <div class="mt-2 text-sm text-red-600">{errorMsg}</div>
     {/if}
 
-    {#if extractedPromptText}
-      <div class="mt-2 prompt-support-card">
-        <div class="prompt-support-label">
-          {#if hoveredExplainChip}
-            {String(hoveredExplainChip.customName || hoveredExplainChip.name || '').trim()}
-          {:else}
-            Prompt support
-          {/if}
-        </div>
-        <div class="prompt-support-text">
-          {#each promptSupportSegments as segment, idx (`segment:${idx}:${segment.start}`)}
+    {#if extractedPromptText || attributeChips.length > 0}
+      <div class="mt-2 prompt-support-flow" bind:this={promptSupportFlowEl}>
+        {#if extractedPromptText}
+          <div class="prompt-support-card">
+            <div class="prompt-support-text" bind:this={promptSupportTextEl}>
+              {#each promptSupportSegments as segment, idx (`segment:${idx}:${segment.start}`)}
+                <span
+                  class={`prompt-support-segment ${segment.active ? 'active' : ''}`}
+                  style={segment.active ? `--support-alpha:${(0.12 + (segment.score * 0.28)).toFixed(3)};` : ''}
+                >{segment.text}</span>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        {#if attributeChips.length > 0}
+          <div class={`chip-grid ${extractedPromptText ? 'mt-2' : ''}`}>
+            {#each attributeChips as chip (chip.id)}
+              <div
+                role="group"
+                class={`dim-chip ${chip.selected ? 'selected' : ''} ${hoveredExplainChipId === chip.id ? 'explaining' : ''}`}
+                on:mouseenter={(e) => { setExplainChipRef(chip.id, e.currentTarget); hoveredExplainChipId = chip.id }}
+                on:mouseleave={() => { if (hoveredExplainChipId === chip.id) hoveredExplainChipId = '' }}
+                on:focusin={(e) => { setExplainChipRef(chip.id, e.currentTarget); hoveredExplainChipId = chip.id }}
+                on:focusout={() => { if (hoveredExplainChipId === chip.id) hoveredExplainChipId = '' }}
+              >
+                <div class="dim-chip-row">
+                  {#if chip.editing}
+                    <input
+                      class="dim-chip-rename"
+                      type="text"
+                      value={chip.customName}
+                      on:input={(e) => renameAttributeChip(chip.id, e.currentTarget.value)}
+                      on:blur={() => finishAttributeChipEdit(chip.id)}
+                      on:keydown={(e) => onAttributeChipKeydown(chip.id, e)}
+                      placeholder="Rename axis"
+                    />
+                  {:else}
+                    <button
+                      type="button"
+                      class="dim-chip-toggle"
+                      on:click={() => toggleAttributeChip(chip.id)}
+                      title={chip.selected ? 'Deselect dimension' : 'Select dimension'}
+                    >
+                      <span class="dim-chip-label">{String(chip.customName || chip.name || '').trim() || chip.name}</span>
+                    </button>
+                  {/if}
+                  <div class="dim-chip-tools">
+                    <button
+                      type="button"
+                      class="dim-chip-edit"
+                      aria-label="Rename suggested attribute"
+                      title={chip.supportPhrases?.length ? `Rename suggested attribute. Support: ${chip.supportPhrases.join(' | ')}` : 'Rename suggested attribute'}
+                      on:click|stopPropagation={() => startAttributeChipEdit(chip.id)}
+                    >
+                      <MaterialIcon name="edit" />
+                    </button>
+                    <span
+                      class={`axis-type-icon ${attributeTypeIconClass(chip.type)}`}
+                      role="img"
+                      aria-label={formatTypeLabel(chip.type)}
+                      title={formatTypeLabel(chip.type)}
+                    />
+                  </div>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#if supportConnector}
+          <div class="prompt-support-connector-layer" aria-hidden="true">
             <span
-              class={`prompt-support-segment ${segment.active ? 'active' : ''}`}
-              style={segment.active ? `--support-alpha:${(0.12 + (segment.score * 0.28)).toFixed(3)};` : ''}
-            >{segment.text}</span>
-          {/each}
-        </div>
+              class="prompt-support-connector-segment vertical"
+              style={`left:${supportConnector.chipX}px;top:${Math.min(supportConnector.bendY, supportConnector.chipY)}px;height:${Math.abs(supportConnector.chipY - supportConnector.bendY)}px;`}
+            />
+            <span
+              class="prompt-support-connector-segment horizontal"
+              style={`left:${Math.min(supportConnector.chipX, supportConnector.targetX)}px;top:${supportConnector.bendY}px;width:${Math.abs(supportConnector.targetX - supportConnector.chipX)}px;`}
+            />
+            <span
+              class="prompt-support-connector-segment vertical"
+              style={`left:${supportConnector.targetX}px;top:${Math.min(supportConnector.bendY, supportConnector.targetY)}px;height:${Math.abs(supportConnector.targetY - supportConnector.bendY)}px;`}
+            />
+          </div>
+        {/if}
       </div>
     {/if}
 
     {#if attributeChips.length > 0}
-      <div class="mt-2 chip-grid">
-        {#each attributeChips as chip (chip.id)}
-          <div
-            role="group"
-            class={`dim-chip ${chip.selected ? 'selected' : ''} ${hoveredExplainChipId === chip.id ? 'explaining' : ''}`}
-            on:mouseenter={() => { hoveredExplainChipId = chip.id }}
-            on:mouseleave={() => { if (hoveredExplainChipId === chip.id) hoveredExplainChipId = '' }}
-            on:focusin={() => { hoveredExplainChipId = chip.id }}
-            on:focusout={() => { if (hoveredExplainChipId === chip.id) hoveredExplainChipId = '' }}
-          >
-            <div class="dim-chip-row">
-              <button
-                type="button"
-                class="dim-chip-toggle"
-                on:click={() => toggleAttributeChip(chip.id)}
-                title={chip.selected ? 'Deselect dimension' : 'Select dimension'}
-              >
-                <span class="truncate">{String(chip.customName || chip.name || '').trim() || chip.name}</span>
-              </button>
-              <div class="dim-chip-tools">
-                <button
-                  type="button"
-                class="dim-chip-edit"
-                aria-label="Rename suggested attribute"
-                  title={chip.supportPhrases?.length ? `Rename suggested attribute. Support: ${chip.supportPhrases.join(' | ')}` : 'Rename suggested attribute'}
-                  on:click|stopPropagation={() => startAttributeChipEdit(chip.id)}
-                >
-                  <span class="i-heroicons-pencil-square" />
-                </button>
-                <span
-                  class={`axis-type-icon ${attributeTypeIconClass(chip.type)}`}
-                  role="img"
-                  aria-label={formatTypeLabel(chip.type)}
-                  title={formatTypeLabel(chip.type)}
-                />
-              </div>
-            </div>
-            {#if chip.editing}
-              <input
-                class="dim-chip-rename"
-                type="text"
-                value={chip.customName}
-                on:input={(e) => renameAttributeChip(chip.id, e.currentTarget.value)}
-                on:blur={() => finishAttributeChipEdit(chip.id)}
-                on:keydown={(e) => onAttributeChipKeydown(chip.id, e)}
-                placeholder="Rename axis"
-              />
-            {/if}
-          </div>
-        {/each}
-      </div>
-      <div class="mt-2 flex items-center justify-between gap-3">
+      <div class="mt-2 flex items-center justify-end gap-3">
         <button
-          class="btn btn-primary btn-xs"
+          class="btn btn-primary btn-xs btn-icon"
           disabled={creatingAxes || extracting || selectedChipCount === 0}
           on:click={createAxesFromSelectedChips}
+          aria-label={creatingAxes ? 'Creating axes' : 'Create axes'}
+          title={creatingAxes ? 'Creating axes' : 'Create axes'}
         >
-          {creatingAxes ? 'Creating...' : 'Create axes'}
+          <MaterialIcon name={creatingAxes ? 'hourglass_top' : 'add_circle'} />
         </button>
-        <div class="text-xs text-slate-500">{selectedChipCount}/{attributeChips.length}</div>
       </div>
     {/if}
   </div>
@@ -1135,7 +1285,6 @@
   <div class="subtile">
     <div class="flex items-center justify-between gap-2">
       <div class="sidebar-section-title">Axes</div>
-      <div class="text-xs text-slate-500">{axisBuilders.length}</div>
     </div>
     <div class="axis-entry-row mt-2">
       <input
@@ -1151,11 +1300,13 @@
         }}
       />
       <button
-        class="btn btn-primary btn-xs"
+        class="btn btn-primary btn-xs btn-icon"
         disabled={creatingAxes || extracting || !String(manualAxisText || '').trim()}
         on:click={addManualAxis}
+        aria-label="Add"
+        title="Add"
       >
-        Add
+        <MaterialIcon name="add_circle" />
       </button>
     </div>
 
@@ -1167,11 +1318,14 @@
           <AxisBuilder
             session={builder}
             itemsById={itemById}
+            representativeImageIds={datasetRepresentativeImageIds}
             {selectedX}
             {selectedY}
             activeSlice={sliceForAxis(builder.axisId)}
             busy={false}
+            promptUpdateBusy={promptUpdatingAxisId === builder.axisId}
             on:move={onAxisBuilderMove}
+            on:updatePrompts={onAxisBuilderUpdatePrompts}
             on:sliceChange={(e) => {
               const nextSlice = e.detail?.slice || null
               if (nextSlice) updateActiveSlice(nextSlice)
@@ -1251,7 +1405,8 @@
   .prompt-sidebar {
     position: relative;
     height: 100%;
-    overflow: auto;
+    overflow-y: auto;
+    overflow-x: visible;
     padding-right: 4px;
     display: flex;
     flex-direction: column;
@@ -1259,14 +1414,23 @@
   }
 
   .sidebar-bottom {
+    display: none;
     margin-top: auto;
+  }
+
+  .prompt-entry-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
   }
 
   .prompt-input {
     width: 100%;
-    margin: 6px 0 0;
-    min-height: 88px;
-    resize: vertical;
+    margin: 0;
+    min-height: 52px;
+    max-height: 56px;
+    resize: none;
     padding: 10px 12px;
     font-size: var(--font-size-body);
     line-height: 1.4;
@@ -1274,6 +1438,7 @@
     border-radius: 8px;
     background: #ffffff;
     color: #0f172a;
+    overflow-y: auto;
   }
 
   .prompt-input::placeholder {
@@ -1281,9 +1446,16 @@
   }
 
   .chip-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 6px;
+  }
+
+  .prompt-support-flow {
+    position: relative;
+    display: grid;
+    align-content: start;
   }
 
   .prompt-support-card {
@@ -1293,11 +1465,8 @@
     padding: 8px 10px;
     display: grid;
     gap: 6px;
-  }
-
-  .prompt-support-label {
-    font-size: var(--font-size-small);
-    color: #64748b;
+    position: relative;
+    z-index: 1;
   }
 
   .prompt-support-text {
@@ -1317,20 +1486,46 @@
     box-shadow: inset 0 -1px 0 rgba(59, 130, 246, 0.18);
   }
 
+  .prompt-support-connector-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  .prompt-support-connector-segment {
+    position: absolute;
+    display: block;
+    background: rgba(37, 99, 235, 0.44);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.72);
+    border-radius: 999px;
+  }
+
+  .prompt-support-connector-segment.vertical {
+    width: 2px;
+    transform: translateX(-50%);
+  }
+
+  .prompt-support-connector-segment.horizontal {
+    height: 2px;
+    transform: translateY(-50%);
+  }
+
   .dim-chip {
     border: 1px solid #dbe2ec;
-    border-radius: 8px;
+    border-radius: 999px;
     background: #fff;
-    padding: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+    padding: 4px 8px;
+    display: inline-flex;
+    align-self: flex-start;
+    width: fit-content;
+    max-width: 100%;
   }
 
   .dim-chip.selected {
-    border-color: #93c5fd;
-    box-shadow: inset 0 0 0 1px #bfdbfe;
-    background: #f8fbff;
+    border-color: #2563eb;
+    box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.14);
+    background: #2563eb;
   }
 
   .dim-chip.explaining {
@@ -1341,14 +1536,15 @@
   .dim-chip-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 4px;
+    min-width: 0;
   }
 
   .dim-chip-toggle {
     display: flex;
     align-items: center;
     min-width: 0;
-    flex: 1;
+    flex: none;
     margin: 0;
     padding: 0;
     border: 0;
@@ -1357,22 +1553,36 @@
     color: #0f172a;
   }
 
+  .dim-chip.selected .dim-chip-toggle,
+  .dim-chip.selected .axis-type-icon {
+    color: #ffffff;
+  }
+
+  .dim-chip-label {
+    white-space: nowrap;
+  }
+
   .dim-chip-tools {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 4px;
     flex: none;
   }
 
   .dim-chip-edit {
     display: grid;
     place-items: center;
-    width: 24px;
-    height: 24px;
-    border: 1px solid #dbe2ec;
-    border-radius: 6px;
-    background: #ffffff;
-    color: #64748b;
+    width: 20px;
+    height: 20px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: #111827;
+    padding: 0;
+  }
+
+  .dim-chip.selected .dim-chip-edit {
+    color: #ffffff;
   }
 
   .axis-type-icon {
@@ -1384,9 +1594,10 @@
   .dim-chip-rename {
     margin: 0;
     width: 100%;
-    padding: 4px 6px;
+    min-width: 110px;
+    padding: 2px 6px;
     font-size: var(--font-size-body);
-    border-radius: 6px;
+    border-radius: 999px;
     border: 1px solid #cbd5e1;
     color: #0f172a;
     background: #ffffff;
@@ -1395,12 +1606,19 @@
   .axis-entry-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+  }
+
+  .prompt-entry-row :global(button),
+  .axis-entry-row :global(button) {
+    margin: 0;
+    align-self: center;
   }
 
   .manual-axis-input {
     flex: 1;
     min-width: 0;
+    margin: 0;
     border: 1px solid #d5dde8;
     border-radius: 6px;
     padding: 6px 8px;

@@ -35,7 +35,7 @@ import csv
 import hashlib
 try:
     from .gallery_backend import ImageGalleryEngine
-    from .embeddings import EmbeddingEngine
+    from .embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, normalize_multimodal_method
     from .constants import (
         BACKEND_HOST,
         BACKEND_PORT,
@@ -47,6 +47,7 @@ try:
         AXIS_BAYES_BIAS_ALPHA,
         AXIS_BAYES_MODE,
         AXIS_BAYES_FEATURE_SPACE,
+        AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BAYES_CLIP_WEIGHT,
         AXIS_BAYES_DINO_WEIGHT,
         AXIS_PIECEWISE_NUM_EXPERTS,
@@ -76,6 +77,12 @@ try:
         AXIS_BAYES_HOTSPOT_TAU,
         AXIS_BAYES_HOTSPOT_K,
         AXIS_BAYES_EXEMPLAR_K,
+        AXIS_RESIDUAL_ALPHA,
+        AXIS_RESIDUAL_BETA,
+        AXIS_RESIDUAL_LAMBDA,
+        AXIS_RESIDUAL_SIGMA_Y,
+        AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+        AXIS_RESIDUAL_JITTER,
         ZERO_SHOT_HISTOGRAM_BINS,
     )
     from .axis_bayes import AxisBayesEngine
@@ -83,7 +90,7 @@ try:
     from .zero_shot_regressor import ZeroShotAttributeRegressor, slugify
 except ImportError:
     from gallery_backend import ImageGalleryEngine
-    from embeddings import EmbeddingEngine
+    from embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, normalize_multimodal_method
     from constants import (
         BACKEND_HOST,
         BACKEND_PORT,
@@ -95,6 +102,7 @@ except ImportError:
         AXIS_BAYES_BIAS_ALPHA,
         AXIS_BAYES_MODE,
         AXIS_BAYES_FEATURE_SPACE,
+        AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BAYES_CLIP_WEIGHT,
         AXIS_BAYES_DINO_WEIGHT,
         AXIS_PIECEWISE_NUM_EXPERTS,
@@ -124,6 +132,12 @@ except ImportError:
         AXIS_BAYES_HOTSPOT_TAU,
         AXIS_BAYES_HOTSPOT_K,
         AXIS_BAYES_EXEMPLAR_K,
+        AXIS_RESIDUAL_ALPHA,
+        AXIS_RESIDUAL_BETA,
+        AXIS_RESIDUAL_LAMBDA,
+        AXIS_RESIDUAL_SIGMA_Y,
+        AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+        AXIS_RESIDUAL_JITTER,
         ZERO_SHOT_HISTOGRAM_BINS,
     )
     from axis_bayes import AxisBayesEngine
@@ -141,7 +155,10 @@ CORS(app)
 """
 DATASETS_ROOT = (Path(__file__).parent.parent / 'data' / 'datasets').resolve()
 DATASET_PATH = (DATASETS_ROOT / 'ISIC2017').resolve()
-AXIS_LIBRARY_PATH = (Path(__file__).parent.parent / 'data' / 'axis_library.json').resolve()
+SESSIONS_ROOT = (Path(__file__).parent.parent / 'data' / 'sessions').resolve()
+LEGACY_AXIS_LIBRARY_PATH = (Path(__file__).parent.parent / 'data' / 'axis_library.json').resolve()
+DEFAULT_SESSION_NAME = 'P0'
+SESSION_NAMES = tuple(f'P{i}' for i in range(16))
 
 # Keep the currently active dataset root for serving images
 app.config['DATASET_ROOT'] = str(DATASET_PATH) if DATASET_PATH.exists() else None
@@ -156,6 +173,7 @@ AXIS_BAYES_ENGINE = AxisBayesEngine(
     model_type=AXIS_MODEL_TYPE,
     mode=AXIS_BAYES_MODE,
     feature_space=AXIS_BAYES_FEATURE_SPACE,
+    semantic_method=AXIS_BAYES_SEMANTIC_METHOD,
     clip_weight=AXIS_BAYES_CLIP_WEIGHT,
     dino_weight=AXIS_BAYES_DINO_WEIGHT,
     piecewise_num_experts=AXIS_PIECEWISE_NUM_EXPERTS,
@@ -183,6 +201,12 @@ AXIS_BAYES_ENGINE = AxisBayesEngine(
     rank_anchor_k=AXIS_BAYES_RANK_ANCHOR_K,
     rank_anchor_delta=AXIS_BAYES_RANK_ANCHOR_DELTA,
     rank_max_pairs=AXIS_BAYES_RANK_MAX_PAIRS,
+    residual_alpha=AXIS_RESIDUAL_ALPHA,
+    residual_beta=AXIS_RESIDUAL_BETA,
+    residual_lambda=AXIS_RESIDUAL_LAMBDA,
+    residual_sigma_y=AXIS_RESIDUAL_SIGMA_Y,
+    residual_lengthscale_multiplier=AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+    residual_jitter=AXIS_RESIDUAL_JITTER,
     max_moves=AXIS_BAYES_MAX_MOVES,
     hotspot_boundary=AXIS_BAYES_HOTSPOT_BOUNDARY,
     hotspot_tau=AXIS_BAYES_HOTSPOT_TAU,
@@ -196,8 +220,13 @@ def _llm_api_log(req_id: str, message: str):
 
 def _dataset_has_required_axis_embeddings(dataset_dir: Path) -> bool:
     cache_dir = dataset_dir / '.cache'
-    clip_cache = cache_dir / 'embeddings_clip.npz'
-    if not clip_cache.exists():
+    semantic_candidates = []
+    preferred = normalize_multimodal_method(AXIS_BAYES_SEMANTIC_METHOD)
+    if preferred in {'clip', 'siglip2'}:
+        semantic_candidates.append(preferred)
+    if 'clip' not in semantic_candidates:
+        semantic_candidates.append('clip')
+    if not any((cache_dir / f'embeddings_{method}.npz').exists() for method in semantic_candidates):
         return False
     if str(AXIS_BAYES_FEATURE_SPACE).strip().lower() == 'clip_dino':
         dino_cache = cache_dir / 'embeddings_dino.npz'
@@ -232,6 +261,45 @@ def resolve_dataset_root(name_or_none: str | None) -> Path:
     return candidate if candidate.exists() else DATASET_PATH
 
 
+def _normalize_session_name(value: Any) -> str:
+    session = str(value or '').strip()
+    if session in SESSION_NAMES:
+        return session
+    return DEFAULT_SESSION_NAME
+
+
+def _resolve_session_from_payload(payload: Dict[str, Any] | None) -> str:
+    session_name = None
+    if isinstance(payload, dict):
+        session_name = payload.get('session')
+    if session_name is None:
+        session_name = request.args.get('session')
+    return _normalize_session_name(session_name)
+
+
+def _session_dir(session_name: str) -> Path:
+    session = _normalize_session_name(session_name)
+    path = (SESSIONS_ROOT / session).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _session_axes_path(session_name: str) -> Path:
+    return _session_dir(session_name) / 'axes.json'
+
+
+def _session_visualizations_path(session_name: str) -> Path:
+    return _session_dir(session_name) / 'visualizations.json'
+
+
+def _axis_library_key(raw: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        str(raw.get('name') or '').strip().lower(),
+        str(raw.get('q') or '').strip().lower(),
+        str(raw.get('origin_dataset') or '').strip().lower(),
+    )
+
+
 def _axis_library_item(raw: Any, include_artifact: bool = False) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
@@ -261,8 +329,11 @@ def _axis_library_item(raw: Any, include_artifact: bool = False) -> Optional[Dic
     return item
 
 
-def _axis_library_read(include_artifact: bool = False) -> List[Dict[str, Any]]:
-    path = AXIS_LIBRARY_PATH
+def _read_library_file(
+    path: Path,
+    item_parser,
+    include_artifact: bool = False,
+) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -274,26 +345,197 @@ def _axis_library_read(include_artifact: bool = False) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(rows, list):
         for row in rows:
-            item = _axis_library_item(row, include_artifact=include_artifact)
+            item = item_parser(row, include_artifact=include_artifact)
             if item:
                 out.append(item)
-    # newest first
     out.sort(key=lambda it: str(it.get('updated_at') or it.get('created_at') or ''), reverse=True)
     return out
 
 
-def _axis_library_write(items: List[Dict[str, Any]]) -> None:
-    path = AXIS_LIBRARY_PATH
+def _write_library_file(path: Path, items: List[Dict[str, Any]], item_parser) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     clean = []
     for row in items:
-        item = _axis_library_item(row, include_artifact=True)
+        item = item_parser(row, include_artifact=True)
         if item:
             clean.append(item)
     tmp = path.with_suffix('.json.tmp')
     with tmp.open('w', encoding='utf-8') as f:
         json.dump(clean, f, indent=2)
     tmp.replace(path)
+
+
+def _migrate_legacy_axes_to_default_session() -> None:
+    legacy_path = LEGACY_AXIS_LIBRARY_PATH
+    if not legacy_path.exists():
+        return
+    target_path = _session_axes_path(DEFAULT_SESSION_NAME)
+    existing = _read_library_file(target_path, _axis_library_item, include_artifact=True)
+    existing_keys = {_axis_library_key(item) for item in existing}
+    legacy_items = _read_library_file(legacy_path, _axis_library_item, include_artifact=True)
+    merged = list(existing)
+    changed = False
+    for item in legacy_items:
+        key = _axis_library_key(item)
+        if key in existing_keys:
+            continue
+        merged.append(item)
+        existing_keys.add(key)
+        changed = True
+    if changed or (legacy_items and not target_path.exists()):
+        _write_library_file(target_path, merged, _axis_library_item)
+
+
+def _axis_library_read(session_name: str = DEFAULT_SESSION_NAME, include_artifact: bool = False) -> List[Dict[str, Any]]:
+    _migrate_legacy_axes_to_default_session()
+    return _read_library_file(_session_axes_path(session_name), _axis_library_item, include_artifact=include_artifact)
+
+
+def _axis_library_write(session_name: str, items: List[Dict[str, Any]]) -> None:
+    _write_library_file(_session_axes_path(session_name), items, _axis_library_item)
+
+
+def _visualization_library_item(raw: Any, include_artifact: bool = False) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    item_id = str(raw.get('id') or '').strip()
+    name = str(raw.get('name') or '').strip()
+    dataset = str(raw.get('dataset') or '').strip()
+    created_at = str(raw.get('created_at') or '').strip()
+    updated_at = str(raw.get('updated_at') or '').strip()
+    selected_x = str(raw.get('selected_x') or '').strip()
+    selected_y = str(raw.get('selected_y') or '').strip()
+    selected_x_name = str(raw.get('selected_x_name') or '').strip()
+    selected_y_name = str(raw.get('selected_y_name') or '').strip()
+    if not item_id or not name or not dataset:
+        return None
+    custom_axes = raw.get('custom_axes') if isinstance(raw.get('custom_axes'), list) else []
+    subset_filter = raw.get('subset_filter') if isinstance(raw.get('subset_filter'), dict) else None
+    item = {
+        'id': item_id,
+        'name': name,
+        'dataset': dataset,
+        'selected_x': selected_x,
+        'selected_y': selected_y,
+        'selected_x_name': selected_x_name,
+        'selected_y_name': selected_y_name,
+        'created_at': created_at,
+        'updated_at': updated_at,
+        'custom_axis_count': len(custom_axes),
+        'subset_active': bool(isinstance(subset_filter, dict) and subset_filter.get('ids')),
+    }
+    if include_artifact:
+        item['histogram_slices'] = raw.get('histogram_slices') if isinstance(raw.get('histogram_slices'), list) else []
+        item['subset_filter'] = subset_filter or None
+        item['view_state'] = raw.get('view_state') if isinstance(raw.get('view_state'), dict) else {}
+        item['minimap_size_offset'] = float(raw.get('minimap_size_offset') or 0.0)
+        item['custom_axes'] = custom_axes
+        item['axes_manifest'] = raw.get('axes_manifest') if isinstance(raw.get('axes_manifest'), list) else []
+    return item
+
+
+def _visualization_library_read(
+    session_name: str = DEFAULT_SESSION_NAME,
+    include_artifact: bool = False,
+) -> List[Dict[str, Any]]:
+    return _read_library_file(
+        _session_visualizations_path(session_name),
+        _visualization_library_item,
+        include_artifact=include_artifact,
+    )
+
+
+def _visualization_library_write(session_name: str, items: List[Dict[str, Any]]) -> None:
+    _write_library_file(_session_visualizations_path(session_name), items, _visualization_library_item)
+
+
+def _project_saved_axis_payload(
+    *,
+    serialized_axis: Optional[Dict[str, Any]],
+    dataset_root: Path,
+    collection_id: str,
+    q: str,
+    axis_name: str,
+    mode: Optional[str],
+    model_type: Optional[str],
+) -> Dict[str, Any]:
+    if serialized_axis is None:
+        return AXIS_BAYES_ENGINE.create_axis(
+            collection_id=collection_id,
+            dataset_root=str(dataset_root),
+            q=q,
+            mode=mode,
+            model_type=model_type,
+        )
+
+    clip_scale = float(serialized_axis.get('clip_scale') or 1.0)
+    dino_scale = float(serialized_axis.get('dino_scale') or 0.0)
+    artifact_engine = AxisBayesEngine(
+        model_type=str(serialized_axis.get('model_type') or model_type or AXIS_MODEL_TYPE),
+        mode=str(serialized_axis.get('mode') or mode or AXIS_BAYES_MODE),
+        feature_space=str(serialized_axis.get('feature_space') or AXIS_BAYES_FEATURE_SPACE),
+        semantic_method=str(serialized_axis.get('semantic_method') or AXIS_BAYES_SEMANTIC_METHOD),
+        clip_weight=max(1e-6, clip_scale * clip_scale),
+        dino_weight=max(1e-6, dino_scale * dino_scale) if dino_scale > 0 else 1e-6,
+        piecewise_num_experts=int(serialized_axis.get('piecewise_num_experts') or AXIS_PIECEWISE_NUM_EXPERTS),
+        piecewise_use_gating=bool(
+            serialized_axis.get('piecewise_use_gating')
+            if 'piecewise_use_gating' in serialized_axis else AXIS_PIECEWISE_USE_GATING
+        ),
+        piecewise_aggregator=str(serialized_axis.get('piecewise_aggregator') or AXIS_PIECEWISE_AGGREGATOR),
+        piecewise_clip_scale=float(serialized_axis.get('piecewise_clip_scale') or AXIS_PIECEWISE_CLIP_SCALE),
+        piecewise_dino_scale=float(serialized_axis.get('piecewise_dino_scale') or AXIS_PIECEWISE_DINO_SCALE),
+        pairwise_from_scalar_margin=float(
+            serialized_axis.get('pairwise_from_scalar_margin') or AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN
+        ),
+        piecewise_prior_strength=float(serialized_axis.get('piecewise_prior_strength') or AXIS_PIECEWISE_PRIOR_STRENGTH),
+        piecewise_expert_diversity_strength=float(
+            serialized_axis.get('piecewise_diversity_strength') or AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH
+        ),
+        piecewise_l2_reg=float(serialized_axis.get('piecewise_l2_reg') or AXIS_PIECEWISE_L2_REG),
+        piecewise_learning_rate=float(serialized_axis.get('piecewise_learning_rate') or AXIS_PIECEWISE_LEARNING_RATE),
+        piecewise_max_refine_steps=int(
+            serialized_axis.get('piecewise_max_refine_steps') or AXIS_PIECEWISE_MAX_REFINE_STEPS
+        ),
+        alpha=float(serialized_axis.get('alpha') or AXIS_BAYES_ALPHA),
+        dino_alpha=float(serialized_axis.get('dino_alpha') or AXIS_BAYES_DINO_ALPHA),
+        bias_alpha=float(serialized_axis.get('bias_alpha') or AXIS_BAYES_BIAS_ALPHA),
+        sigma2=float(serialized_axis.get('sigma2') or AXIS_BAYES_SIGMA2),
+        graph_knn_k=int(serialized_axis.get('graph_knn_k') or AXIS_BAYES_GRAPH_KNN_K),
+        graph_lambda_smooth=float(
+            serialized_axis.get('graph_lambda_smooth') or AXIS_BAYES_GRAPH_LAMBDA_SMOOTH
+        ),
+        graph_lambda_prior=float(serialized_axis.get('graph_lambda_prior') or AXIS_BAYES_GRAPH_LAMBDA_PRIOR),
+        graph_jitter=float(serialized_axis.get('graph_jitter') or AXIS_BAYES_GRAPH_JITTER),
+        move_trust=AXIS_BAYES_MOVE_TRUST,
+        move_mag_gain=AXIS_BAYES_MOVE_MAG_GAIN,
+        rank_eta=float(serialized_axis.get('rank_eta') or AXIS_BAYES_RANK_ETA),
+        rank_anchor_k=int(serialized_axis.get('rank_anchor_k') or AXIS_BAYES_RANK_ANCHOR_K),
+        rank_anchor_delta=float(serialized_axis.get('rank_anchor_delta') or AXIS_BAYES_RANK_ANCHOR_DELTA),
+        rank_max_pairs=int(serialized_axis.get('rank_max_pairs') or AXIS_BAYES_RANK_MAX_PAIRS),
+        residual_alpha=float(serialized_axis.get('residual_alpha') or AXIS_RESIDUAL_ALPHA),
+        residual_beta=float(serialized_axis.get('residual_beta') or AXIS_RESIDUAL_BETA),
+        residual_lambda=float(serialized_axis.get('residual_lambda') or AXIS_RESIDUAL_LAMBDA),
+        residual_sigma_y=float(serialized_axis.get('residual_sigma_y') or AXIS_RESIDUAL_SIGMA_Y),
+        residual_lengthscale_multiplier=float(
+            serialized_axis.get('residual_lengthscale_multiplier') or AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER
+        ),
+        residual_jitter=float(serialized_axis.get('residual_jitter') or AXIS_RESIDUAL_JITTER),
+        hotspot_boundary=AXIS_BAYES_HOTSPOT_BOUNDARY,
+        hotspot_tau=AXIS_BAYES_HOTSPOT_TAU,
+        hotspot_k=AXIS_BAYES_HOTSPOT_K,
+        exemplar_k=AXIS_BAYES_EXEMPLAR_K,
+        max_moves=AXIS_BAYES_MAX_MOVES,
+        llm_engine=LLM_ENGINE,
+    )
+    projected_blob = artifact_engine.project_serialized_axis(
+        payload=serialized_axis,
+        collection_id=collection_id,
+        dataset_root=str(dataset_root),
+        axis_name=axis_name,
+    )
+    state = AXIS_BAYES_ENGINE.deserialize_axis(projected_blob)
+    return AXIS_BAYES_ENGINE._state_payload(state)
 
 
 def _resolve_dataset_from_payload(payload: Dict[str, Any] | None) -> Path:
@@ -333,18 +575,38 @@ def _metadata_field_names(dataset_root: Path) -> List[str]:
     return out
 
 
-def _load_clip_embeddings(dataset_root: Path):
+def _semantic_method_or_default(method: str) -> str:
+    normalized = normalize_multimodal_method(method)
+    if normalized in {'clip', 'siglip2'}:
+        return normalized
+    return DEFAULT_SEMANTIC_EMBED_METHOD
+
+
+def _load_semantic_embeddings(dataset_root: Path, preferred_method: str = DEFAULT_SEMANTIC_EMBED_METHOD):
     engine = ImageGalleryEngine(str(dataset_root))
     entries = engine.list_images()
     if not entries:
         abort(400, description='No images found in dataset')
-    embs = engine._load_embeddings_only(entries, method='clip')
-    if embs is None:
-        abort(400, description='CLIP embeddings not available. Precompute with --methods clip')
-    embs = np.asarray(embs, dtype=np.float32)
-    if embs.ndim != 2 or embs.shape[0] != len(entries):
-        abort(500, description='Invalid CLIP embedding shape')
-    return entries, embs
+    methods = []
+    preferred = _semantic_method_or_default(preferred_method)
+    for candidate in (preferred, 'clip'):
+        if candidate not in methods:
+            methods.append(candidate)
+    for method in methods:
+        embs = engine._load_embeddings_only(entries, method=method)
+        if embs is None:
+            continue
+        embs = np.asarray(embs, dtype=np.float32)
+        if embs.ndim != 2 or embs.shape[0] != len(entries):
+            abort(500, description=f'Invalid {method} embedding shape')
+        return entries, embs, method
+    abort(
+        400,
+        description=(
+            f'No semantic embeddings available. Tried {methods}. '
+            f'Precompute with --methods {preferred}'
+        ),
+    )
 
 
 def _string_list(v: Any) -> List[str]:
@@ -956,10 +1218,10 @@ def gallery() -> Any:
     dataset_path = resolve_dataset_root(dataset_name)
     dataset = str(dataset_path)
     method = request.args.get('method', 'pca').lower()
-    embed_method = request.args.get('embed', 'color_rgb').lower()
+    embed_method = normalize_multimodal_method(request.args.get('embed', DEFAULT_SEMANTIC_EMBED_METHOD))
     # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
     if embed_method == 'text':
-        embed_method = 'clip'
+        embed_method = DEFAULT_SEMANTIC_EMBED_METHOD
 
     print("[gallery] start",
           f"dataset={dataset}",
@@ -985,9 +1247,18 @@ def gallery() -> Any:
     print(f"[gallery] images found: {len(entries_probe)}")
     # Load only precomputed embeddings; do not compute on the fly.
     # Note: embed_method may include part suffix (e.g., dift_sd_part11), which maps to embeddings_{embed_method}.npz
+    warning = None
     entries, coords2d, packed, eff_layer = engine.build_gallery_from_precomputed(
         n_layer=n_layer, n_tile=n_tile, method=method, embed_method=embed_method
     )
+    if (entries is None or coords2d is None or packed is None) and embed_method == DEFAULT_SEMANTIC_EMBED_METHOD:
+        fallback_method = 'clip'
+        entries, coords2d, packed, eff_layer = engine.build_gallery_from_precomputed(
+            n_layer=n_layer, n_tile=n_tile, method=method, embed_method=fallback_method
+        )
+        if entries is not None and coords2d is not None and packed is not None:
+            warning = f'{DEFAULT_SEMANTIC_EMBED_METHOD} cache missing; fell back to {fallback_method}'
+            embed_method = fallback_method
     if entries is None or coords2d is None or packed is None:
         # Return explicit error to surface missing precompute
         abort(500, description=f'Precomputed embeddings not found for method {embed_method}')
@@ -1027,7 +1298,7 @@ def gallery() -> Any:
                     'method': method,
                     'embed': embed_method,
                     'metadata_axes': metadata_axes,
-                    'warning': None})
+                    'warning': warning})
 
 
 @app.get('/datasets')
@@ -1449,15 +1720,61 @@ def axis_move():
     return jsonify(result)
 
 
+@app.post('/axis/update_prompts')
+def axis_update_prompts():
+    payload = request.get_json(silent=True) or {}
+    axis_id = str(payload.get('axis_id') or payload.get('axisId') or '').strip()
+    pos_prompts = payload.get('pos_prompts', payload.get('posPrompts'))
+    neg_prompts = payload.get('neg_prompts', payload.get('negPrompts'))
+    if not axis_id:
+        abort(400, description='Missing axis_id')
+    if not isinstance(pos_prompts, list) or not isinstance(neg_prompts, list):
+        abort(400, description='pos_prompts and neg_prompts must be arrays')
+
+    try:
+        result = AXIS_BAYES_ENGINE.update_axis_prompts(
+            axis_id=axis_id,
+            pos_prompts=pos_prompts,
+            neg_prompts=neg_prompts,
+        )
+    except KeyError as e:
+        abort(404, description=str(e))
+    except ValueError as e:
+        abort(400, description=str(e))
+    except Exception as e:
+        abort(500, description=f'Axis prompt update failed: {e}')
+    return jsonify(result)
+
+
+@app.get('/sessions')
+def sessions_list():
+    _migrate_legacy_axes_to_default_session()
+    items = []
+    for session_name in SESSION_NAMES:
+        session_dir = _session_dir(session_name)
+        axes_count = len(_axis_library_read(session_name=session_name, include_artifact=False))
+        visualizations_count = len(_visualization_library_read(session_name=session_name, include_artifact=False))
+        items.append({
+            'id': session_name,
+            'label': session_name,
+            'path': str(session_dir),
+            'axes_count': axes_count,
+            'visualizations_count': visualizations_count,
+        })
+    return jsonify({'items': items, 'default': DEFAULT_SESSION_NAME})
+
+
 @app.get('/axis/library')
 def axis_library_list():
-    items = _axis_library_read(include_artifact=False)
-    return jsonify({'items': items})
+    session_name = _resolve_session_from_payload(None)
+    items = _axis_library_read(session_name=session_name, include_artifact=False)
+    return jsonify({'session': session_name, 'items': items})
 
 
 @app.post('/axis/library/save')
 def axis_library_save():
     payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
     dataset_root = _resolve_dataset_from_payload(payload)
     axis_id = str(payload.get('axis_id') or payload.get('axisId') or '').strip()
     name = str(payload.get('name') or payload.get('axis_name') or '').strip()
@@ -1490,7 +1807,7 @@ def axis_library_save():
         if not q:
             q = str(serialized_axis.get('q') or '').strip() or q
 
-    items = _axis_library_read(include_artifact=True)
+    items = _axis_library_read(session_name=session_name, include_artifact=True)
     key_name = name.lower()
     key_q = q.lower()
     key_origin = origin_dataset.lower()
@@ -1509,8 +1826,13 @@ def axis_library_save():
             existing['mode'] = mode
             existing['model_type'] = model_type
             existing['updated_at'] = datetime.now(timezone.utc).isoformat()
-            _axis_library_write(items)
-        return jsonify({'ok': True, 'item': _axis_library_item(existing), 'items': _axis_library_read()})
+            _axis_library_write(session_name, items)
+        return jsonify({
+            'ok': True,
+            'session': session_name,
+            'item': _axis_library_item(existing),
+            'items': _axis_library_read(session_name=session_name),
+        })
 
     item = {
         'id': f'axlib:{uuid.uuid4().hex[:12]}',
@@ -1524,31 +1846,38 @@ def axis_library_save():
         'serialized_axis': serialized_axis,
     }
     items.append(item)
-    _axis_library_write(items)
-    return jsonify({'ok': True, 'item': _axis_library_item(item), 'items': _axis_library_read()})
+    _axis_library_write(session_name, items)
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'item': _axis_library_item(item),
+        'items': _axis_library_read(session_name=session_name),
+    })
 
 
 @app.delete('/axis/library/<path:item_id>')
 def axis_library_delete(item_id: str):
+    session_name = _resolve_session_from_payload(None)
     axis_lib_id = str(item_id or '').strip()
     if not axis_lib_id:
         abort(400, description='Missing item id')
-    items = _axis_library_read()
+    items = _axis_library_read(session_name=session_name, include_artifact=True)
     next_items = [it for it in items if str(it.get('id') or '').strip() != axis_lib_id]
     if len(next_items) == len(items):
         abort(404, description='Axis library item not found')
-    _axis_library_write(next_items)
-    return jsonify({'ok': True, 'items': _axis_library_read()})
+    _axis_library_write(session_name, next_items)
+    return jsonify({'ok': True, 'session': session_name, 'items': _axis_library_read(session_name=session_name)})
 
 
 @app.post('/axis/library/project')
 def axis_library_project():
     payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
     axis_lib_id = str(payload.get('library_axis_id') or payload.get('id') or '').strip()
     if not axis_lib_id:
         abort(400, description='Missing library_axis_id')
 
-    items = _axis_library_read(include_artifact=True)
+    items = _axis_library_read(session_name=session_name, include_artifact=True)
     item = next((it for it in items if str(it.get('id') or '').strip() == axis_lib_id), None)
     if not item:
         abort(404, description='Axis library item not found')
@@ -1563,74 +1892,15 @@ def axis_library_project():
     model_type = str(item.get('model_type') or '').strip() or None
     try:
         serialized_axis = item.get('serialized_axis') if isinstance(item.get('serialized_axis'), dict) else None
-        if serialized_axis is not None:
-            clip_scale = float(serialized_axis.get('clip_scale') or 1.0)
-            dino_scale = float(serialized_axis.get('dino_scale') or 0.0)
-            artifact_engine = AxisBayesEngine(
-                model_type=str(serialized_axis.get('model_type') or model_type or AXIS_MODEL_TYPE),
-                mode=str(serialized_axis.get('mode') or mode or AXIS_BAYES_MODE),
-                feature_space=str(serialized_axis.get('feature_space') or AXIS_BAYES_FEATURE_SPACE),
-                clip_weight=max(1e-6, clip_scale * clip_scale),
-                dino_weight=max(1e-6, dino_scale * dino_scale) if dino_scale > 0 else 1e-6,
-                piecewise_num_experts=int(serialized_axis.get('piecewise_num_experts') or AXIS_PIECEWISE_NUM_EXPERTS),
-                piecewise_use_gating=bool(
-                    serialized_axis.get('piecewise_use_gating')
-                    if 'piecewise_use_gating' in serialized_axis else AXIS_PIECEWISE_USE_GATING
-                ),
-                piecewise_aggregator=str(serialized_axis.get('piecewise_aggregator') or AXIS_PIECEWISE_AGGREGATOR),
-                piecewise_clip_scale=float(serialized_axis.get('piecewise_clip_scale') or AXIS_PIECEWISE_CLIP_SCALE),
-                piecewise_dino_scale=float(serialized_axis.get('piecewise_dino_scale') or AXIS_PIECEWISE_DINO_SCALE),
-                pairwise_from_scalar_margin=float(
-                    serialized_axis.get('pairwise_from_scalar_margin') or AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN
-                ),
-                piecewise_prior_strength=float(serialized_axis.get('piecewise_prior_strength') or AXIS_PIECEWISE_PRIOR_STRENGTH),
-                piecewise_expert_diversity_strength=float(
-                    serialized_axis.get('piecewise_diversity_strength') or AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH
-                ),
-                piecewise_l2_reg=float(serialized_axis.get('piecewise_l2_reg') or AXIS_PIECEWISE_L2_REG),
-                piecewise_learning_rate=float(serialized_axis.get('piecewise_learning_rate') or AXIS_PIECEWISE_LEARNING_RATE),
-                piecewise_max_refine_steps=int(
-                    serialized_axis.get('piecewise_max_refine_steps') or AXIS_PIECEWISE_MAX_REFINE_STEPS
-                ),
-                alpha=float(serialized_axis.get('alpha') or AXIS_BAYES_ALPHA),
-                dino_alpha=float(serialized_axis.get('dino_alpha') or AXIS_BAYES_DINO_ALPHA),
-                bias_alpha=float(serialized_axis.get('bias_alpha') or AXIS_BAYES_BIAS_ALPHA),
-                sigma2=float(serialized_axis.get('sigma2') or AXIS_BAYES_SIGMA2),
-                graph_knn_k=int(serialized_axis.get('graph_knn_k') or AXIS_BAYES_GRAPH_KNN_K),
-                graph_lambda_smooth=float(
-                    serialized_axis.get('graph_lambda_smooth') or AXIS_BAYES_GRAPH_LAMBDA_SMOOTH
-                ),
-                graph_lambda_prior=float(serialized_axis.get('graph_lambda_prior') or AXIS_BAYES_GRAPH_LAMBDA_PRIOR),
-                graph_jitter=float(serialized_axis.get('graph_jitter') or AXIS_BAYES_GRAPH_JITTER),
-                move_trust=AXIS_BAYES_MOVE_TRUST,
-                move_mag_gain=AXIS_BAYES_MOVE_MAG_GAIN,
-                rank_eta=float(serialized_axis.get('rank_eta') or AXIS_BAYES_RANK_ETA),
-                rank_anchor_k=int(serialized_axis.get('rank_anchor_k') or AXIS_BAYES_RANK_ANCHOR_K),
-                rank_anchor_delta=float(serialized_axis.get('rank_anchor_delta') or AXIS_BAYES_RANK_ANCHOR_DELTA),
-                rank_max_pairs=int(serialized_axis.get('rank_max_pairs') or AXIS_BAYES_RANK_MAX_PAIRS),
-                hotspot_boundary=AXIS_BAYES_HOTSPOT_BOUNDARY,
-                hotspot_tau=AXIS_BAYES_HOTSPOT_TAU,
-                hotspot_k=AXIS_BAYES_HOTSPOT_K,
-                exemplar_k=AXIS_BAYES_EXEMPLAR_K,
-                max_moves=AXIS_BAYES_MAX_MOVES,
-                llm_engine=LLM_ENGINE,
-            )
-            projected_blob = artifact_engine.project_serialized_axis(
-                payload=serialized_axis,
-                collection_id=collection_id,
-                dataset_root=str(dataset_root),
-                axis_name=str(item.get('name') or q),
-            )
-            state = AXIS_BAYES_ENGINE.deserialize_axis(projected_blob)
-            result = AXIS_BAYES_ENGINE._state_payload(state)
-        else:
-            result = AXIS_BAYES_ENGINE.create_axis(
-                collection_id=collection_id,
-                dataset_root=str(dataset_root),
-                q=q,
-                mode=mode,
-                model_type=model_type,
-            )
+        result = _project_saved_axis_payload(
+            serialized_axis=serialized_axis,
+            dataset_root=dataset_root,
+            collection_id=collection_id,
+            q=q,
+            axis_name=str(item.get('name') or q),
+            mode=mode,
+            model_type=model_type,
+        )
     except Exception as e:
         abort(500, description=f'Saved axis projection failed: {e}')
 
@@ -1651,8 +1921,206 @@ def axis_library_project():
         'id': str(item.get('id') or ''),
         'name': axis_name,
         'origin_dataset': str(item.get('origin_dataset') or ''),
+        'session': session_name,
     }
     return jsonify(result)
+
+
+@app.get('/visualization/library')
+def visualization_library_list():
+    session_name = _resolve_session_from_payload(None)
+    items = _visualization_library_read(session_name=session_name, include_artifact=False)
+    return jsonify({'session': session_name, 'items': items})
+
+
+@app.post('/visualization/library/save')
+def visualization_library_save():
+    payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
+    dataset_root = _resolve_dataset_from_payload(payload)
+    dataset_name = str(payload.get('dataset') or dataset_root.name).strip() or dataset_root.name
+    name = str(payload.get('name') or '').strip()
+    if not name:
+        abort(400, description='Missing visualization name')
+
+    axis_ids = [str(v).strip() for v in (payload.get('axis_ids') or []) if str(v).strip()]
+    axes_manifest = payload.get('axes_manifest') if isinstance(payload.get('axes_manifest'), list) else []
+    manifest_by_id = {
+        str(entry.get('id') or '').strip(): entry
+        for entry in axes_manifest
+        if isinstance(entry, dict) and str(entry.get('id') or '').strip()
+    }
+    custom_axes = []
+    for axis_id in axis_ids:
+        try:
+            serialized_axis = AXIS_BAYES_ENGINE.serialize_portable_axis(axis_id)
+        except Exception:
+            continue
+        manifest = manifest_by_id.get(axis_id) or {}
+        custom_axes.append({
+            'source_axis_id': axis_id,
+            'name': str(manifest.get('name') or serialized_axis.get('axis_name') or serialized_axis.get('q') or axis_id),
+            'group': str(manifest.get('group') or '').strip(),
+            'serialized_axis': serialized_axis,
+        })
+
+    histogram_slices = payload.get('histogram_slices') if isinstance(payload.get('histogram_slices'), list) else []
+    subset_filter = payload.get('subset_filter') if isinstance(payload.get('subset_filter'), dict) else None
+    view_state = payload.get('view_state') if isinstance(payload.get('view_state'), dict) else {}
+    minimap_size_offset = float(payload.get('minimap_size_offset') or 0.0)
+    selected_x = str(payload.get('selected_x') or '').strip()
+    selected_y = str(payload.get('selected_y') or '').strip()
+    selected_x_name = str(payload.get('selected_x_name') or '').strip()
+    selected_y_name = str(payload.get('selected_y_name') or '').strip()
+
+    items = _visualization_library_read(session_name=session_name, include_artifact=True)
+    existing = next(
+        (
+            it for it in items
+            if str(it.get('name') or '').strip().lower() == name.lower()
+            and str(it.get('dataset') or '').strip().lower() == dataset_name.lower()
+        ),
+        None,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if existing:
+        existing.update({
+            'dataset': dataset_name,
+            'selected_x': selected_x,
+            'selected_y': selected_y,
+            'selected_x_name': selected_x_name,
+            'selected_y_name': selected_y_name,
+            'histogram_slices': histogram_slices,
+            'subset_filter': subset_filter,
+            'view_state': view_state,
+            'minimap_size_offset': minimap_size_offset,
+            'custom_axes': custom_axes,
+            'axes_manifest': axes_manifest,
+            'updated_at': now_iso,
+        })
+        _visualization_library_write(session_name, items)
+        return jsonify({
+            'ok': True,
+            'session': session_name,
+            'item': _visualization_library_item(existing),
+            'items': _visualization_library_read(session_name=session_name),
+        })
+
+    item = {
+        'id': f'vizlib:{uuid.uuid4().hex[:12]}',
+        'name': name,
+        'dataset': dataset_name,
+        'selected_x': selected_x,
+        'selected_y': selected_y,
+        'selected_x_name': selected_x_name,
+        'selected_y_name': selected_y_name,
+        'histogram_slices': histogram_slices,
+        'subset_filter': subset_filter,
+        'view_state': view_state,
+        'minimap_size_offset': minimap_size_offset,
+        'custom_axes': custom_axes,
+        'axes_manifest': axes_manifest,
+        'created_at': now_iso,
+        'updated_at': now_iso,
+    }
+    items.append(item)
+    _visualization_library_write(session_name, items)
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'item': _visualization_library_item(item),
+        'items': _visualization_library_read(session_name=session_name),
+    })
+
+
+@app.delete('/visualization/library/<path:item_id>')
+def visualization_library_delete(item_id: str):
+    session_name = _resolve_session_from_payload(None)
+    viz_id = str(item_id or '').strip()
+    if not viz_id:
+        abort(400, description='Missing item id')
+    items = _visualization_library_read(session_name=session_name, include_artifact=True)
+    next_items = [it for it in items if str(it.get('id') or '').strip() != viz_id]
+    if len(next_items) == len(items):
+        abort(404, description='Visualization item not found')
+    _visualization_library_write(session_name, next_items)
+    return jsonify({'ok': True, 'session': session_name, 'items': _visualization_library_read(session_name=session_name)})
+
+
+@app.post('/visualization/library/project')
+def visualization_library_project():
+    payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
+    visualization_id = str(payload.get('visualization_id') or payload.get('id') or '').strip()
+    if not visualization_id:
+        abort(400, description='Missing visualization_id')
+
+    items = _visualization_library_read(session_name=session_name, include_artifact=True)
+    item = next((it for it in items if str(it.get('id') or '').strip() == visualization_id), None)
+    if not item:
+        abort(404, description='Visualization item not found')
+
+    dataset_name = str(payload.get('dataset') or item.get('dataset') or '').strip()
+    dataset_root = resolve_dataset_root(dataset_name)
+    collection_id = str(payload.get('collection_id') or dataset_root.name).strip() or dataset_root.name
+
+    projected_axes: List[Dict[str, Any]] = []
+    axis_id_map: Dict[str, str] = {}
+    for raw_axis in item.get('custom_axes') if isinstance(item.get('custom_axes'), list) else []:
+        if not isinstance(raw_axis, dict):
+            continue
+        serialized_axis = raw_axis.get('serialized_axis') if isinstance(raw_axis.get('serialized_axis'), dict) else None
+        source_axis_id = str(raw_axis.get('source_axis_id') or '').strip()
+        axis_name = str(
+            raw_axis.get('name')
+            or (serialized_axis or {}).get('axis_name')
+            or (serialized_axis or {}).get('q')
+            or source_axis_id
+            or 'Axis'
+        ).strip()
+        q = str((serialized_axis or {}).get('q') or axis_name).strip() or axis_name
+        mode = str((serialized_axis or {}).get('mode') or '').strip() or None
+        model_type = str((serialized_axis or {}).get('model_type') or '').strip() or None
+        try:
+            projected = _project_saved_axis_payload(
+                serialized_axis=serialized_axis,
+                dataset_root=dataset_root,
+                collection_id=collection_id,
+                q=q,
+                axis_name=axis_name,
+                mode=mode,
+                model_type=model_type,
+            )
+        except Exception as e:
+            abort(500, description=f'Visualization projection failed for axis {axis_name}: {e}')
+        axis_obj = projected.get('axis')
+        axis_id = str(projected.get('axis_id') or (axis_obj or {}).get('id') or '').strip()
+        if source_axis_id and axis_id:
+            axis_id_map[source_axis_id] = axis_id
+        projected_axes.append(projected)
+
+    visualization = {
+        'id': str(item.get('id') or ''),
+        'name': str(item.get('name') or ''),
+        'dataset': dataset_root.name,
+        'selected_x': str(item.get('selected_x') or ''),
+        'selected_y': str(item.get('selected_y') or ''),
+        'selected_x_name': str(item.get('selected_x_name') or ''),
+        'selected_y_name': str(item.get('selected_y_name') or ''),
+        'histogram_slices': item.get('histogram_slices') if isinstance(item.get('histogram_slices'), list) else [],
+        'subset_filter': item.get('subset_filter') if isinstance(item.get('subset_filter'), dict) else None,
+        'view_state': item.get('view_state') if isinstance(item.get('view_state'), dict) else {},
+        'minimap_size_offset': float(item.get('minimap_size_offset') or 0.0),
+        'axes_manifest': item.get('axes_manifest') if isinstance(item.get('axes_manifest'), list) else [],
+        'session': session_name,
+    }
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'visualization': visualization,
+        'projected_axes': projected_axes,
+        'axis_id_map': axis_id_map,
+    })
 
 
 @app.post('/llm/extract_attributes')
@@ -1767,7 +2235,7 @@ def llm_suggest_values():
 
 @app.post('/llm/attribute_distribution')
 def llm_attribute_distribution():
-    """Score all images in [0,1] for an attribute, with type-dependent LLM+CLIP logic."""
+    """Score all images in [0,1] for an attribute, with type-dependent LLM+VLM logic."""
     req_id = uuid.uuid4().hex[:8]
     t0 = time.time()
     payload = request.get_json(silent=True) or {}
@@ -1829,10 +2297,17 @@ def llm_attribute_distribution():
     )
 
     dataset_root = _resolve_dataset_from_payload(payload)
-    entries, image_embs = _load_clip_embeddings(dataset_root)
+    entries, image_embs, semantic_method = _load_semantic_embeddings(
+        dataset_root,
+        preferred_method=DEFAULT_SEMANTIC_EMBED_METHOD,
+    )
+    regressor = ZeroShotAttributeRegressor(text_method=semantic_method)
     _llm_api_log(
         req_id,
-        f'attribute_distribution embeddings loaded dataset={dataset_root.name} images={len(entries)} dim={int(image_embs.shape[1])}',
+        (
+            f'attribute_distribution embeddings loaded dataset={dataset_root.name} '
+            f'images={len(entries)} dim={int(image_embs.shape[1])} method={semantic_method}'
+        ),
     )
     ids = [e.id for e in entries]
 
@@ -1864,7 +2339,7 @@ def llm_attribute_distribution():
         )
         try:
             _llm_api_log(req_id, 'attribute_distribution zero_shot_classification start')
-            reg = ZERO_SHOT_REGRESSOR.score_discrete(
+            reg = regressor.score_discrete(
                 image_embeddings=image_embs,
                 attribute=attribute,
                 categories=values,
@@ -1901,7 +2376,7 @@ def llm_attribute_distribution():
         )
         try:
             _llm_api_log(req_id, 'attribute_distribution clip_direction_projection start')
-            reg = ZERO_SHOT_REGRESSOR.score_continuous_anchors(
+            reg = regressor.score_continuous_anchors(
                 image_embeddings=image_embs,
                 attribute=attribute,
                 low_anchor=low_anchor,
@@ -2067,7 +2542,7 @@ def text_force():
     Body JSON:
     - text: string (required)
     - rect: { x, y, w, h } in normalized [0,1] (required)
-    - embed: embedding method for text/image space, e.g., 'clip' (default 'clip')
+    - embed: embedding method for text/image space, e.g., 'siglip2' (default 'siglip2')
     - alpha: float force strength (default 0.25)
     - method: 'pca' or 'umap' for 2D reduction (default 'pca')
     """
@@ -2077,7 +2552,7 @@ def text_force():
     payload = request.get_json(silent=True) or {}
     text = payload.get('text', '').strip()
     rect = payload.get('rect') or {}
-    embed_method = (payload.get('embed') or 'clip').lower()
+    embed_method = normalize_multimodal_method(payload.get('embed') or DEFAULT_SEMANTIC_EMBED_METHOD)
     red_method = (payload.get('method') or 'pca').lower()
     alpha = float(payload.get('alpha') or 0.25)
     if not text or not isinstance(rect, dict) or not all(k in rect for k in ('x','y','w','h')):
@@ -2095,12 +2570,10 @@ def text_force():
         abort(400, description=f'Embeddings not available for method {embed_method}')
     coords2d = engine.reduce_to_2d(embs_for_layout, method=red_method)
 
-    # Always compute similarities in CLIP space to match text embedding dimension
-    embs_for_sim = engine._load_embeddings_only(entries, method='clip')
-    if embs_for_sim is None:
-        abort(400, description='CLIP embeddings not available. Precompute with --methods clip')
+    # Use the selected semantic space when available; otherwise fall back to the default VLM.
+    _, embs_for_sim, sim_method = _load_semantic_embeddings(Path(dataset), preferred_method=embed_method)
     emb_engine = EmbeddingEngine(dataset)
-    tvec = emb_engine.text_embedding('clip', text)
+    tvec = emb_engine.text_embedding(sim_method, text)
     if tvec is None:
         # No-op similarities
         sims = np.zeros((coords2d.shape[0],), dtype=np.float32)
@@ -2139,7 +2612,7 @@ def text_forces():
     - texts: [{ text: str, rect: {x,y,w,h} }]
     - ids: [str] optional — order of images in base_coords and desired output order
     - base_coords: [[x,y], ...] optional — initial positions; if missing, uses 2D coords from embed
-    - embed: embedding method for similarity space (default 'clip')
+    - embed: embedding method for similarity space (default 'siglip2')
     - alpha: float force scale (default 0.25)
     - method: dimensionality reduction method for fallback base coords (default 'pca')
     """
@@ -2150,7 +2623,7 @@ def text_forces():
     texts = payload.get('texts') or []
     ids = payload.get('ids') or []
     base_coords = payload.get('base_coords')
-    embed_method = (payload.get('embed') or 'clip').lower()
+    embed_method = normalize_multimodal_method(payload.get('embed') or DEFAULT_SEMANTIC_EMBED_METHOD)
     red_method = (payload.get('method') or 'pca').lower()
     alpha = float(payload.get('alpha') or 0.25)
     if (not isinstance(texts, list)) or len(texts) == 0:
@@ -2183,10 +2656,8 @@ def text_forces():
         coords2d = engine.reduce_to_2d(embs_for_layout, method=red_method)
         base = coords2d[order, :].astype(np.float32)
 
-    # Similarities in CLIP space (or chosen embed method if desired)
-    embs_for_sim = engine._load_embeddings_only(entries, method='clip')
-    if embs_for_sim is None:
-        abort(400, description='CLIP embeddings not available. Precompute with --methods clip')
+    # Similarities in the selected semantic space, falling back to the default VLM.
+    _, embs_for_sim, sim_method = _load_semantic_embeddings(Path(dataset), preferred_method=embed_method)
     emb_engine = EmbeddingEngine(dataset)
     X = embs_for_sim.astype(np.float32)
     Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
@@ -2201,7 +2672,7 @@ def text_forces():
             # Skip invalid entries
             out_sims.append([0.0] * len(order))
             continue
-        tvec = emb_engine.text_embedding('clip', txt)
+        tvec = emb_engine.text_embedding(sim_method, txt)
         if tvec is None:
             sims = np.zeros((len(entries),), dtype=np.float32)
         else:

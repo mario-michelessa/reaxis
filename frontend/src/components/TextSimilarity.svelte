@@ -31,7 +31,7 @@
       const res = await fetch(`${apiBase}/text_force`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: queryText.trim(), rect: { x: 0, y: 0, w: 1, h: 1 }, embed: 'clip', method: 'pca', alpha: 0 })
+        body: JSON.stringify({ text: queryText.trim(), rect: { x: 0, y: 0, w: 1, h: 1 }, embed: 'siglip2', method: 'pca', alpha: 0 })
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -107,4 +107,3 @@
 
 <style>
 </style>
-

@@ -6,6 +6,7 @@
   import { createEventDispatcher, onMount, onDestroy } from 'svelte'
   import { axisBuildersStore } from '../lib/axisBuilderStore'
   import LassoSelector from './LassoSelector.svelte'
+  import MaterialIcon from './MaterialIcon.svelte'
   export let items = [] // [{ id, url, thumbUrl?, fullUrl?, x, y, gx, gy }]
   export let axes = [] // [{ id, name, coords: Record<string, number> }]
   export let apiBase = (() => {
@@ -25,6 +26,7 @@
   export let imageMax = 400
   export let imageSubsampleSeed = 1337
   export let focusImageRequest = null
+  export let restoreViewState = null
 
   const dispatch = createEventDispatcher()
   $: axisBuilderSessions = $axisBuildersStore
@@ -117,6 +119,13 @@
   let subsetSelectionIds = []
   let subsetFilter = null // { mode: 'isolate' | 'exclude', ids: string[] }
   let lassoRef
+  function normalizeSubsetFilter(raw) {
+    if (!raw || typeof raw !== 'object') return null
+    const mode = String(raw.mode || '').trim() === 'exclude' ? 'exclude' : 'isolate'
+    const ids = Array.isArray(raw.ids) ? raw.ids.map((id) => String(id || '').trim()).filter(Boolean) : []
+    if (ids.length === 0) return null
+    return { mode, ids }
+  }
   $: subsetSelectionSet = new Set((subsetSelectionIds || []).map((id) => String(id || '').trim()).filter(Boolean))
   $: subsetFilterSet = new Set(Array.isArray(subsetFilter?.ids) ? subsetFilter.ids.map((id) => String(id || '').trim()).filter(Boolean) : [])
   $: subsetFilterActive = subsetFilterSet.size > 0
@@ -216,12 +225,14 @@
   $: itemsById = new Map((items || []).map((item) => [String(item?.id || ''), item]).filter((row) => row[0]))
 
   function axisName(id) { return (axesById.get(id)?.name) || '—' }
-  const axisArrowMarkerId = `axis-arrow-head-${Math.random().toString(36).slice(2, 10)}`
-  // Keep the direction indicator anchored in screen space so it remains visible while panning/zooming.
-  $: axisArrowOriginX = 9
-  $: axisArrowOriginY = 88
-  $: axisArrowXEnd = 40
-  $: axisArrowYEnd = 56
+  $: axisFrameCenterXPx = (squareXOffsetNorm * width) + (squareSidePx * 0.5)
+  $: axisFrameCenterYPx = (squareYOffsetNorm * height) + (squareSidePx * 0.5)
+  $: axisFrameLeftPx = squareXOffsetNorm * width
+  $: axisFrameBottomPx = (squareYOffsetNorm * height) + squareSidePx
+  $: axisFrameTopPct = squareYOffsetNorm * 100
+  $: axisFrameLeftPct = squareXOffsetNorm * 100
+  $: axisFrameWidthPct = squareWNorm * 100
+  $: axisFrameHeightPct = squareHNorm * 100
   function getCoord(id, axisId) {
     const ax = axisId ? axesById.get(axisId) : null
     if (!ax || !ax.coords) return undefined
@@ -244,8 +255,7 @@
     if (s.includes('categor') || s.includes('nominal') || s.includes('class')) return 'categorical'
     return ''
   }
-  function isNonContinuousAxis(axisId) {
-    const ax = axisId ? axesById.get(axisId) : null
+  function inferNonContinuousAxis(ax) {
     if (!ax) return false
     const t = normalizeAxisType(ax.attribute_type || ax.type || ax.axis_type)
     if (t === 'continuous') return false
@@ -271,6 +281,16 @@
     }
     if (sampled > 0 && seen.size <= Math.max(6, Math.round(Math.sqrt(sampled)))) return true
     return false
+  }
+  let nonContinuousAxisById = new Map()
+  $: nonContinuousAxisById = (() => {
+    const next = new Map()
+    for (const ax of (axes || [])) next.set(ax.id, inferNonContinuousAxis(ax))
+    return next
+  })()
+  function isNonContinuousAxis(axisId) {
+    if (!axisId) return false
+    return !!nonContinuousAxisById.get(axisId)
   }
   function apiUrl(path) {
     const base = String(apiBase || '').trim().replace(/\/+$/, '')
@@ -789,6 +809,7 @@
   }
 
   function onMove(e) {
+    if (lassoEnabled || grabMode) return
     const rect = e.currentTarget.getBoundingClientRect()
     const vx = (e.clientX - rect.left) / rect.width
     const vy = (e.clientY - rect.top) / rect.height
@@ -806,11 +827,41 @@
     cx = 0.5
     cy = 0.5
     zoomZ = 1.0
+    vf = viewFrac
     griddingActive = false
     activeCenterId = null
     gridRect = null
     griddedImsRect = null
     syncHoverPreview()
+  }
+  function applyRestoredViewState(raw) {
+    const next = raw && typeof raw === 'object' ? raw : {}
+    cx = clamp(Number(next.cx ?? 0.5), 0, 1)
+    cy = clamp(Number(next.cy ?? 0.5), 0, 1)
+    zoomZ = clamp(Number(next.zoomZ ?? 1.0), 1.0, 6.0)
+    vf = clamp(Number(next.vf ?? viewFrac), 0.04, 0.9)
+    showDensity = !!next.showDensity
+    showUncertainty = !!next.showUncertainty
+    imageMax = Math.max(0, Math.floor(Number(next.imageMax ?? imageMax) || 0))
+    subsetFilter = normalizeSubsetFilter(next.subsetFilter)
+    clearLassoSelection()
+    griddingActive = false
+    activeCenterId = null
+    gridRect = null
+    griddedImsRect = null
+    zoomItemId = null
+    zoomSliderDrafts = {}
+    zoomError = ''
+    syncHoverPreview()
+  }
+  let appliedRestoreNonce = null
+  $: {
+    const state = restoreViewState
+    const nonce = state && typeof state === 'object' ? Number(state.nonce || 0) : 0
+    if (state && nonce && nonce !== appliedRestoreNonce) {
+      appliedRestoreNonce = nonce
+      applyRestoredViewState(state)
+    }
   }
   function onWheel(e) {
     if (e.shiftKey) {
@@ -1262,6 +1313,24 @@
   $: spacingScale = 1.04
   $: subsampleDotPx = 5
   $: normalizedImageMax = Math.max(0, Math.floor(Number(imageMax) || 0))
+  let lastViewStateSnapshot = ''
+  $: {
+    const snapshot = {
+      cx,
+      cy,
+      zoomZ,
+      vf,
+      showDensity,
+      showUncertainty,
+      imageMax: normalizedImageMax,
+      subsetFilter: subsetFilter ? { mode: subsetFilter.mode, ids: Array.isArray(subsetFilter.ids) ? subsetFilter.ids : [] } : null,
+    }
+    const nextJson = JSON.stringify(snapshot)
+    if (nextJson !== lastViewStateSnapshot) {
+      lastViewStateSnapshot = nextJson
+      dispatch('viewStateChange', snapshot)
+    }
+  }
   $: sampledIds = (() => {
     if (normalizedImageMax <= 0) return null
     const base = Array.isArray(itemsFiltered) ? itemsFiltered : []
@@ -1288,7 +1357,10 @@
 
   $: renderSourceItems = (() => {
     const base = Array.isArray(itemsFiltered) ? itemsFiltered : []
-    if (griddingActive || !subsampleActive) return base
+    if (!subsampleActive) return base
+    if (griddingActive && gridRect) {
+      return base.filter((it) => insideIds.has(it.id) || sampledIds.has(it.id))
+    }
     return base.filter((it) => sampledIds.has(it.id))
   })()
 
@@ -1602,8 +1674,6 @@
   }
 </script>
 
-<!-- Y axis selector will be positioned inside the minimap (left side) -->
-
 <div class="minimap-shell">
   <div
     role="img"
@@ -1630,14 +1700,14 @@
           aria-label="Clear subset"
           title="Clear subset"
           on:click|stopPropagation|preventDefault={clearSubsetFilter}
-        >×</button>
+        ><MaterialIcon name="close" size={14} /></button>
       </div>
     </div>
   {/if}
   {#if griddingActive && gridBackdrop}
     <div
       class="absolute pointer-events-none rounded"
-      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(229,231,235,0.9);z-index:5; transition: opacity 200ms ease; opacity:1;`}
+      style={`left:${gridBackdrop.x0 * 100}%;top:${gridBackdrop.y0 * 100}%;width:${gridBackdrop.w * 100}%;height:${gridBackdrop.h * 100}%;background:rgba(37,99,235,0.16);border:1px solid rgba(37,99,235,0.34);z-index:5; transition: opacity 200ms ease; opacity:1;`}
     />
     {/if}
   {#if pointRadius === 0}
@@ -1682,39 +1752,13 @@
     {/each}
   {/if}
 
-  {#if !lassoEnabled}
+  {#if !lassoEnabled && !grabMode}
     <div
       bind:this={focusRectEl}
       class="absolute border border-blue-500/70 pointer-events-none"
       style="left:0%;top:0%;width:0%;height:0%;"
     />
   {/if}
-
-  <svg class="axis-direction-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-      <defs>
-        <marker id={axisArrowMarkerId} viewBox="0 0 6 6" refX="4.9" refY="3" markerWidth="3.2" markerHeight="3.2" orient="auto-start-reverse">
-          <path d="M0,0 L6,3 L0,6 z" fill="#b7c0cc"></path>
-        </marker>
-      </defs>
-      <line
-        class="axis-direction-line"
-        x1={axisArrowOriginX}
-        y1={axisArrowOriginY}
-        x2={axisArrowXEnd}
-        y2={axisArrowOriginY}
-        marker-end={`url(#${axisArrowMarkerId})`}
-      />
-      <line
-        class="axis-direction-line"
-        x1={axisArrowOriginX}
-        y1={axisArrowOriginY}
-        x2={axisArrowOriginX}
-        y2={axisArrowYEnd}
-        marker-end={`url(#${axisArrowMarkerId})`}
-      />
-  </svg>
-
-  
 
   {#if zoomItemId}
     <div class="absolute inset-0 bg-black/40 flex items-center justify-center z-30" on:click|stopPropagation={closeZoom}>
@@ -1751,7 +1795,9 @@
             <div class="zoom-panel-error">{zoomError}</div>
           {/if}
           <div class="mt-2 flex gap-2 justify-center z-40 relative">
-            <button class="btn btn-sm btn-ui-secondary" style="z-index:41" on:click|stopPropagation|preventDefault={closeZoom}>Close</button>
+            <button class="btn btn-sm btn-ui-secondary" style="z-index:41" on:click|stopPropagation|preventDefault={closeZoom}>
+              <MaterialIcon name="close" />
+            </button>
           </div>
         </div>
       </div>
@@ -1766,7 +1812,7 @@
     on:pointerdown|stopPropagation|preventDefault={onResizeHandleDown}
   />
 
-  <div class="minimap-tools" on:click|stopPropagation on:mousedown|stopPropagation>
+  <div class="minimap-tools" on:pointerdown|stopPropagation>
     <button
       type="button"
       class={`btn btn-icon btn-minimap minimap-tool-btn ${(!grabMode && !lassoEnabled) ? 'is-active' : ''}`}
@@ -1775,9 +1821,7 @@
       title="Select mode (pan and inspect)"
       aria-label="Select mode"
     >
-      <svg class="minimap-tool-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M5 3L12 19L14.6 13.4L20.2 10.8Z" fill="currentColor" />
-      </svg>
+      <MaterialIcon name="arrow_selector_tool" />
     </button>
     <button
       type="button"
@@ -1787,9 +1831,7 @@
       title="Grab mode (move images)"
       aria-label="Grab mode"
     >
-      <svg class="minimap-tool-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M7 11V6a1 1 0 1 1 2 0v5h1V4a1 1 0 1 1 2 0v7h1V5a1 1 0 1 1 2 0v6h1V7a1 1 0 1 1 2 0v7c0 3-2 5-5 5h-3c-2.5 0-4.5-2-4.5-4.5V11a1 1 0 1 1 2 0z" fill="currentColor" />
-      </svg>
+      <MaterialIcon name="tune" />
     </button>
     <button
       type="button"
@@ -1799,10 +1841,7 @@
       title="Lasso subset tool"
       aria-label="Lasso subset tool"
     >
-      <svg class="minimap-tool-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M5.5 8.5c0-2.9 3-5 6.7-5 3.6 0 6.4 2 6.4 4.8 0 2.5-2.2 4.3-5.4 4.9-.8.1-1.2.2-1.8.5-.6.3-1 .8-1 1.5 0 .8.6 1.4 1.5 1.4h2.2c1.2 0 2.1.9 2.1 2s-.9 2-2.1 2h-1.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="11.2" cy="18.7" r="1.6" fill="currentColor" />
-      </svg>
+      <MaterialIcon name="lasso_select" />
     </button>
     <button
       type="button"
@@ -1811,7 +1850,11 @@
       aria-pressed={showDensity}
       title="Density"
       aria-label="Density"
-    >D</button>
+    >
+      <svg class="minimap-tool-svg density-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M2 18C5 18 5.5 7 12 7s7 11 10 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </button>
     <button
       type="button"
       class={`btn btn-icon btn-minimap minimap-tool-btn ${showUncertainty ? 'is-active' : ''}`}
@@ -1833,7 +1876,7 @@
         on:input={(e)=>{ imageMax = Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)) }}
       />
     </label>
-    <button type="button" class="btn btn-icon btn-minimap minimap-tool-btn" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view">⟲</button>
+    <button type="button" class="btn btn-icon btn-minimap minimap-tool-btn" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view"><MaterialIcon name="replay" /></button>
   </div>
 
   {#if lassoEnabled}
@@ -1879,7 +1922,7 @@
 
   {#if selectionToolsEnabled}
     <!-- Top-center filter dropdown and drop target -->
-    <div class="axis-rail-top text-sm" on:dragover={allowDropSelection} on:drop={onDropSelection} title="Drop a selection here or choose one to filter">
+    <div class="axis-rail-top text-sm" role="group" on:dragover={allowDropSelection} on:drop={onDropSelection} title="Drop a selection here or choose one to filter">
       <div class="inline-flex items-center gap-2">
         <span class="text-gray-700 text-sm">Filter</span>
         <select class="text-sm" on:change={(e)=> onDropdownSelect(e.currentTarget.value)}>
@@ -1899,9 +1942,15 @@
     </div>
   {/if}
 
-  <div class="axis-corner axis-corner-bottom-left text-sm" on:dragover={allowDrop} on:drop={onDropY} title="Drop an axis here">
-    <span class="text-gray-700 text-sm">Y axis</span>
-    <select class="text-sm" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+  <div
+    class="axis-edge axis-edge-y text-sm"
+    role="group"
+    style={`left:${Math.max(6, axisFrameLeftPx - 72)}px;top:${axisFrameCenterYPx}px;`}
+    on:dragover={allowDrop}
+    on:drop={onDropY}
+    title="Drop a Y axis here"
+  >
+    <select class="axis-inline-select axis-inline-select-y text-sm" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
       <option value="">(none)</option>
       {#each axes as ax}
         <option value={ax.id} selected={selectedY===ax.id}>{ax.name}</option>
@@ -1937,9 +1986,15 @@
       on:select={onLassoSelect}
     />
   {/if}
-    <div class="axis-corner axis-corner-bottom-right text-sm" on:dragover={allowDrop} on:drop={onDropX} title="Drop an axis here">
-      <span class="text-gray-700 text-sm">X axis</span>
-      <select class="text-sm" on:change={(e)=>{ selectedX = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+  <div
+    class="axis-edge axis-edge-x text-sm"
+    role="group"
+    style={`left:${axisFrameCenterXPx}px;top:${axisFrameBottomPx + 15}px;`}
+    on:dragover={allowDrop}
+    on:drop={onDropX}
+    title="Drop an X axis here"
+  >
+      <select class="axis-inline-select text-sm" on:change={(e)=>{ selectedX = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
         <option value="">(none)</option>
         {#each axes as ax}
           <option value={ax.id} selected={selectedX===ax.id}>{ax.name}</option>
@@ -1955,13 +2010,13 @@
     height: 100%;
     display: flex;
     align-items: center;
-    justify-content: center;
-    overflow: hidden;
+    justify-content: flex-start;
+    overflow: visible;
   }
 
   .zoom-panel {
     background: #ffffff;
-    border-radius: 14px;
+    border-radius: 8px;
     box-shadow: 0 20px 50px rgba(15, 23, 42, 0.24);
     padding: 14px;
     display: grid;
@@ -1979,7 +2034,7 @@
     max-height: 62vh;
     object-fit: contain;
     display: block;
-    border-radius: 10px;
+    border-radius: 6px;
     background: #f8fafc;
   }
 
@@ -2027,7 +2082,7 @@
 
   .minimap-chip-stack {
     position: absolute;
-    top: 8px;
+    top: 80px;
     left: 8px;
     z-index: 30;
     display: flex;
@@ -2071,31 +2126,54 @@
     justify-content: center;
   }
 
-  .axis-corner {
+  .axis-edge {
     position: absolute;
     z-index: 24;
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    background: rgba(255, 255, 255, 0.94);
-    border: 1px solid #dbe2ec;
-    border-radius: 8px;
-    padding: 4px 6px;
+    gap: 0;
+    color: #5b6472;
+    pointer-events: auto;
   }
 
-  .axis-corner :global(select) {
+  .axis-edge-y {
+    transform: translateY(-50%);
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .axis-edge-x {
+    transform: translate(-50%, -100%);
+    align-items: center;
+  }
+
+  .axis-inline-select {
     margin: 0;
-    max-width: 190px;
+    width: auto;
+    max-width: none;
+    border: 0;
+    border-bottom: 1px solid #d8dee8;
+    border-radius: 0;
+    background: transparent;
+    color: #334155;
+    padding: 2px 20px 2px 4px;
+    line-height: 1.15;
+    box-shadow: none;
   }
 
-  .axis-corner-bottom-left {
-    left: 8px;
-    bottom: 8px;
+  .axis-inline-select:focus {
+    outline: none;
+    border-bottom-color: #94a3b8;
   }
 
-  .axis-corner-bottom-right {
-    right: 8px;
-    bottom: 8px;
+  .axis-inline-select-y {
+    width: auto;
+    min-width: max-content;
+    transform: rotate(-90deg);
+    transform-origin: center center;
   }
 
   .minimap-resize-handle {
@@ -2123,7 +2201,7 @@
   .minimap-tools {
     position: absolute;
     top: 8px;
-    right: 8px;
+    left: 8px;
     z-index: 30;
     pointer-events: auto;
     display: inline-flex;
@@ -2132,12 +2210,13 @@
     white-space: nowrap;
     background: rgba(255, 255, 255, 0.95);
     border: 1px solid #dbe2ec;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 4px 6px;
   }
 
   .minimap-tools-secondary {
     top: 44px;
+    left: 8px;
     padding: 4px;
     gap: 4px;
   }
@@ -2152,8 +2231,14 @@
   }
 
   .minimap-tool-btn.is-active {
-    background: #e2e8f0;
-    border-color: #94a3b8;
+    background: rgba(37, 99, 235, 0.1);
+    border-color: #2563eb;
+    color: #2563eb !important;
+  }
+
+  .minimap-tool-btn.is-active :global(.material-symbols-rounded.material-symbol),
+  .minimap-tool-btn.is-active .minimap-tool-svg {
+    color: #2563eb !important;
   }
 
   .minimap-subset-btn {
@@ -2178,6 +2263,11 @@
     color: #0f172a;
   }
 
+  .density-icon {
+    width: 18px;
+    height: 18px;
+  }
+
   .minimap-tool-max {
     display: inline-flex;
     align-items: center;
@@ -2193,18 +2283,4 @@
     padding: 0 4px;
   }
 
-  .axis-direction-overlay {
-    position: absolute;
-    z-index: 0;
-    inset: 0;
-    pointer-events: none;
-    overflow: visible;
-  }
-
-  .axis-direction-line {
-    stroke: #b7c0cc;
-    stroke-width: 0.22;
-    stroke-linecap: round;
-    opacity: 0.8;
-  }
 </style>

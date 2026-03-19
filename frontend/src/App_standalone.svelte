@@ -20,7 +20,7 @@
   let axes = []
   let selectedAxisX = null
   let selectedAxisY = null
-  let embedMethod = 'color_rgb'
+  let embedMethod = 'siglip2'
 
   // Layout sizing
   let minimapContainerRef
@@ -46,13 +46,14 @@
     axes = []
     selectedAxisX = null
     selectedAxisY = null
+    embedMethod = 'siglip2'
     labelDB = {}
     warningMsg = ''
     galleryCache.clear()
   }
 
   function ensureDefaultAxesForCurrentProjection() {
-    const methodName = String(embedMethod || 'color_rgb')
+    const methodName = String(embedMethod || 'siglip2')
     const idX = `axis:${methodName}:x`
     const idY = `axis:${methodName}:y`
 
@@ -114,7 +115,7 @@
   let loadingGuard = 0
   async function loadStaticGallery() {
     const datasetKey = datasetName || '_default'
-    const targetMethod = String(embedMethod || 'color_rgb')
+    const targetMethod = String(embedMethod || 'siglip2')
     const cacheKey = `standalone|${datasetKey}|${targetMethod}|pca`
     const myGuard = ++loadingGuard
 
@@ -140,9 +141,11 @@
       if (res && res.ok) {
         const data = await res.json()
         const items = Array.isArray(data.items) ? data.items : []
+        const effectiveEmbedMethod = String(data.embed || targetMethod || 'siglip2')
 
         // Ignore stale responses from earlier dataset/method requests.
         if (myGuard !== loadingGuard || String(embedMethod || '') !== targetMethod) return
+        if (effectiveEmbedMethod) embedMethod = effectiveEmbedMethod
 
         allImages = items.map((item) => ({
           id: item.id,
@@ -306,7 +309,7 @@
   }
 
   function fallbackAxisId(slot, nextAxes) {
-    const preferred = `axis:${String(embedMethod || 'color_rgb')}:${slot}`
+    const preferred = `axis:${String(embedMethod || 'siglip2')}:${slot}`
     if (Array.isArray(nextAxes) && nextAxes.some((axis) => axis?.id === preferred)) return preferred
     return Array.isArray(nextAxes) && nextAxes.length > 0 ? nextAxes[0].id : null
   }

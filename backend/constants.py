@@ -8,7 +8,14 @@ BACKEND_PORT = 5002
 
 # LLM provider configuration.
 # - huggingface_local: local model loaded from HF_LOCAL_MODEL_PATH
-LLM_PROVIDER = 'huggingface_local'
+# - gemini_api: Google Gemini API using a locally stored API key file
+LLM_PROVIDER = 'gemini_api'
+
+# Gemini API configuration.
+# Keep the API key in an ignored local file, not in tracked source.
+GEMINI_MODEL_NAME = 'gemini-2.5-flash-lite'
+GEMINI_API_KEY_PATH = 'data/secrets/gemini_api_key.txt'
+GEMINI_API_TIMEOUT_SEC = 45
 
 # Local Hugging Face LLM configuration.
 # You can hardcode a path here, e.g.:
@@ -38,62 +45,70 @@ ZERO_SHOT_HISTOGRAM_BINS = 20
 # Scorer backend:
 # - 'bayes_linear': legacy axis engine path (gaussian / rank / graph modes stay unchanged)
 # - 'piecewise_linear': mixture-of-linear ranker trained mainly from ordering constraints
-AXIS_MODEL_TYPE = 'piecewise_linear'  # 'bayes_linear' | 'piecewise_linear'
+# - 'residual': global semantic text prior plus a small smooth GP residual
+AXIS_MODEL_TYPE = 'bayes_linear'  # 'bayes_linear' | 'piecewise_linear' | 'residual'
 
 # Update mode:
 # - 'gaussian': numeric target updates in projection units for a global linear axis
 # - 'rank': pairwise ranking updates for a global linear axis
 # - 'graph': Bayesian Gaussian random field over per-image latent scores on a kNN graph
-AXIS_BAYES_MODE = 'gaussian'  # 'gaussian' | 'rank' | 'graph'
+AXIS_BAYES_MODE = 'rank'  # 'gaussian' | 'rank' | 'graph'
 
-# Feature space used by Axis Bayes:
-# - 'clip': CLIP only
-# - 'clip_dino': concatenate CLIP and DINO blocks
+# Semantic VLM block used by Axis Bayes.
+# - 'siglip2': preferred semantic cache / text encoder
+# - 'clip': compatibility fallback
+AXIS_BAYES_SEMANTIC_METHOD = 'siglip2'  # 'siglip2' | 'clip'
+
+# Feature space used by Axis Bayes.
+# Legacy names are kept for compatibility:
+# - 'clip': semantic VLM block only
+# - 'clip_dino': semantic VLM block concatenated with DINO
 AXIS_BAYES_FEATURE_SPACE = 'clip_dino'  # 'clip' | 'clip_dino'
 
-# Relative contribution of CLIP and DINO blocks in fused features.
+# Relative contribution of semantic-VLM and DINO blocks in fused features.
 # Effective scaling uses normalized weights:
-#   x_fused = [sqrt(w_clip)*x_clip, sqrt(w_dino)*x_dino]
-# Increase DINO weight if you want more structure/texture sensitivity.
-AXIS_BAYES_CLIP_WEIGHT = 0.8495719029864992
-AXIS_BAYES_DINO_WEIGHT = 0.1504280970135008
+#   x_fused = [sqrt(w_clip)*x_semantic, sqrt(w_dino)*x_dino]
+# These defaults follow the current best rank-mode sweep winner (Trial 69).
+AXIS_BAYES_CLIP_WEIGHT = 0.8041519207887364
+AXIS_BAYES_DINO_WEIGHT = 0.19584807921126357
 
 # Piecewise-linear ranker controls.
 # The new scorer still uses the existing CLIP/DINO embeddings, but can combine
 # a small number of local linear experts instead of a single global direction.
-AXIS_PIECEWISE_NUM_EXPERTS = 2
-AXIS_PIECEWISE_USE_GATING = False
+AXIS_PIECEWISE_NUM_EXPERTS = 3
+AXIS_PIECEWISE_USE_GATING = True
 AXIS_PIECEWISE_AGGREGATOR = 'max'  # 'max' | 'mean' | 'softmax'
 
 # Additional per-block scaling for the piecewise scorer.
 # These are applied after recovering the normalized CLIP / DINO features from the
 # legacy fused cache, so 1.0 keeps the current feature magnitudes unchanged.
-AXIS_PIECEWISE_CLIP_SCALE = 1.0
-AXIS_PIECEWISE_DINO_SCALE = 1.0
+AXIS_PIECEWISE_CLIP_SCALE = 1.3508877482680062
+AXIS_PIECEWISE_DINO_SCALE = 0.22659722214371478
 
 # Minimum scalar-label gap required before two moved examples become an explicit
 # ranking pair. Smaller values create more constraints from close labels.
-AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN = 0.08
+AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN = 0.34936776596459196
 
 # Regularization toward the text prior direction for expert 1.
-AXIS_PIECEWISE_PRIOR_STRENGTH = 8.0
+AXIS_PIECEWISE_PRIOR_STRENGTH = 0.11917005611546902
 
 # Penalizes expert collapse by discouraging similar expert directions.
-AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH = 0.1
+AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH = 0.5197325862847438
 
 # Standard L2 penalty on all expert weights.
-AXIS_PIECEWISE_L2_REG = 0.02
+AXIS_PIECEWISE_L2_REG = 0.04912946914323385
 
 # Optimizer settings for each refinement after a user move.
-AXIS_PIECEWISE_LEARNING_RATE = 0.05
-AXIS_PIECEWISE_MAX_REFINE_STEPS = 120
+AXIS_PIECEWISE_LEARNING_RATE = 0.07989580454753624
+AXIS_PIECEWISE_MAX_REFINE_STEPS = 48
 # Prior precision for CLIP block (all CLIP dimensions).
 # Larger -> stronger pull toward CLIP text prior; smaller -> faster adaptation.
-AXIS_BAYES_ALPHA = 0.17
+# Current default follows the best rank-mode sweep winner (Trial 69).
+AXIS_BAYES_ALPHA = 0.34361647953904884
 
 # Prior precision for DINO block (all DINO dimensions) when using 'clip_dino'.
 # Larger than AXIS_BAYES_ALPHA keeps DINO conservative unless moves support it.
-AXIS_BAYES_DINO_ALPHA = 0.75
+AXIS_BAYES_DINO_ALPHA = 0.41751659396568375
 
 # Intercept (bias) prior precision.
 # Smaller -> easier global shift of scores; larger -> stays closer to prior centering.
@@ -128,16 +143,27 @@ AXIS_BAYES_MOVE_MAG_GAIN = 36.0
 
 # Rank-mode temperature eta in pairwise logistic likelihood.
 # Smaller -> sharper comparisons, larger -> softer comparisons.
-AXIS_BAYES_RANK_ETA = 0.25
+# Current default follows the best rank-mode sweep winner (Trial 69).
+AXIS_BAYES_RANK_ETA = 1.3185334419106902
 
 # Rank-mode anchor sampling around target percentile after a move.
 # K controls anchors per side; DELTA controls percentile window radius.
-AXIS_BAYES_RANK_ANCHOR_K = 6
-AXIS_BAYES_RANK_ANCHOR_DELTA = 0.12
+AXIS_BAYES_RANK_ANCHOR_K = 3
+AXIS_BAYES_RANK_ANCHOR_DELTA = 0.3181991587400454
 
 # Maximum stored pairwise constraints per axis in rank mode.
 # Higher can improve stability but increases compute.
-AXIS_BAYES_RANK_MAX_PAIRS = 100
+AXIS_BAYES_RANK_MAX_PAIRS = 224
+
+# Residual-mode controls: global CLIP text prior plus a small smooth GP residual.
+# All values are intentionally conservative so the residual only bends the prior
+# near labeled examples and falls back cleanly elsewhere.
+AXIS_RESIDUAL_ALPHA = 1.0
+AXIS_RESIDUAL_BETA = 0.0
+AXIS_RESIDUAL_LAMBDA = 0.12
+AXIS_RESIDUAL_SIGMA_Y = 0.06
+AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER = 1.0
+AXIS_RESIDUAL_JITTER = 1e-6
 
 # Optional hard cap on number of image moves per axis (0 = unlimited).
 AXIS_BAYES_MAX_MOVES = 0
@@ -477,4 +503,3 @@ OUTPUT:
 ZERO_SHOT_VALUE_PROMPT_TEMPLATE = 'a photo where the {attribute} is {value}.'
 
 ZERO_SHOT_VALUE_PROMPT_WITH_CONTEXT_TEMPLATE = 'a photo in the context of {context}, where the {attribute} is {value}.'
-

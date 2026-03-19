@@ -13,7 +13,7 @@ try:
         ZERO_SHOT_VALUE_PROMPT_TEMPLATE,
         ZERO_SHOT_VALUE_PROMPT_WITH_CONTEXT_TEMPLATE,
     )
-    from .embeddings import CLIPEmbeddingExtractor
+    from .embeddings import DEFAULT_SEMANTIC_EMBED_METHOD, build_multimodal_extractor
 except ImportError:
     from constants import (
         ZERO_SHOT_HISTOGRAM_BINS,
@@ -21,7 +21,7 @@ except ImportError:
         ZERO_SHOT_VALUE_PROMPT_TEMPLATE,
         ZERO_SHOT_VALUE_PROMPT_WITH_CONTEXT_TEMPLATE,
     )
-    from embeddings import CLIPEmbeddingExtractor
+    from embeddings import DEFAULT_SEMANTIC_EMBED_METHOD, build_multimodal_extractor
 
 
 def _normalize_rows(x: np.ndarray) -> np.ndarray:
@@ -83,20 +83,27 @@ class ZeroShotAttributeRegressor:
     """Maps image embeddings to a continuous [0,1] attribute score.
 
     Method:
-    - Build CLIP text embeddings for ordered attribute values (low -> high).
+    - Build VLM text embeddings for ordered attribute values (low -> high).
     - Compute image-to-value similarity.
     - Convert similarities to probabilities via softmax.
     - Score = expected position over ordered values.
     """
 
-    def __init__(self, temperature: float = ZERO_SHOT_SOFTMAX_TEMPERATURE):
+    def __init__(
+        self,
+        temperature: float = ZERO_SHOT_SOFTMAX_TEMPERATURE,
+        text_method: str = DEFAULT_SEMANTIC_EMBED_METHOD,
+    ):
         self.temperature = float(temperature)
-        self._clip_text_extractor: Optional[CLIPEmbeddingExtractor] = None
+        self.text_method = str(text_method or DEFAULT_SEMANTIC_EMBED_METHOD)
+        self._text_extractor: Optional[Any] = None
 
-    def _get_text_extractor(self) -> CLIPEmbeddingExtractor:
-        if self._clip_text_extractor is None:
-            self._clip_text_extractor = CLIPEmbeddingExtractor()
-        return self._clip_text_extractor
+    def _get_text_extractor(self):
+        if self._text_extractor is None:
+            self._text_extractor = build_multimodal_extractor(self.text_method)
+            if self._text_extractor is None:
+                raise RuntimeError(f'Unsupported text embedding method: {self.text_method}')
+        return self._text_extractor
 
     def _embed_text(self, text: str) -> np.ndarray:
         ext = self._get_text_extractor()

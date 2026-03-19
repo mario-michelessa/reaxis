@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
+from inspect import signature
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -11,6 +13,24 @@ from PIL import Image
 
 
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+DEFAULT_SEMANTIC_EMBED_METHOD = 'siglip2'
+DEFAULT_SIGLIP2_MODEL_NAME = 'google/siglip2-base-patch16-naflex'
+CLIP_METHOD_ALIASES = {'clip', 'clip-vit', 'clip32'}
+SIGLIP2_METHOD_ALIASES = {
+    'siglip2',
+    'siglip2-base',
+    'siglip2-base-patch16-224',
+    'siglip2-base-patch16-naflex',
+}
+
+
+def normalize_multimodal_method(method: str) -> str:
+    method_l = str(method or '').strip().lower()
+    if method_l in CLIP_METHOD_ALIASES:
+        return 'clip'
+    if method_l in SIGLIP2_METHOD_ALIASES:
+        return 'siglip2'
+    return method_l
 
 def split_emb(emb, n_parts=4):
     """Split embeddings into n_parts parts."""
@@ -33,7 +53,13 @@ class ImageEntry:
 class CLIPEmbeddingExtractor:
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32"):
         import torch
-        from transformers import CLIPModel, CLIPImageProcessor, CLIPTokenizer
+        try:
+            from transformers import CLIPModel, CLIPImageProcessor, CLIPTokenizer
+        except Exception:
+            # Some transformers builds do not re-export CLIPModel at the top level.
+            from transformers.models.clip.image_processing_clip import CLIPImageProcessor
+            from transformers.models.clip.modeling_clip import CLIPModel
+            from transformers.models.clip.tokenization_clip import CLIPTokenizer
         self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CLIPModel.from_pretrained(
@@ -43,6 +69,7 @@ class CLIPEmbeddingExtractor:
         ).to(self.device)
         self.processor = CLIPImageProcessor.from_pretrained(clip_model_name)
         self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+        self.batch_size = 32 if torch.cuda.is_available() else 8
         for p in self.model.parameters():
             p.requires_grad = False
         self.available = True
@@ -57,6 +84,16 @@ class CLIPEmbeddingExtractor:
         feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
+    def extract_image_embeddings(self, images: Sequence[Image.Image]) -> np.ndarray:
+        if not self.available:
+            raise RuntimeError("CLIPExtractor unavailable")
+        torch = self.torch
+        inputs = self.processor(images=list(images), return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            feats = self.model.get_image_features(**inputs)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        return feats.detach().cpu().numpy().astype("float32")
+
     def extract_text_embedding(self, text: str):
         if not self.available or self.tokenizer is None:
             raise RuntimeError("CLIPExtractor unavailable for text")
@@ -66,6 +103,84 @@ class CLIPEmbeddingExtractor:
             feats = self.model.get_text_features(**inputs)
         feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
+
+
+class SigLIP2EmbeddingExtractor:
+    def __init__(self, model_name: str = DEFAULT_SIGLIP2_MODEL_NAME):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+        self.torch = torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            use_safetensors=True,
+            local_files_only=False,
+        ).to(self.device)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.batch_size = 32 if torch.cuda.is_available() else 4
+        self._image_feature_args = self._feature_arg_names(self.model.get_image_features)
+        self._text_feature_args = self._feature_arg_names(self.model.get_text_features)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.available = True
+
+    @staticmethod
+    def _feature_arg_names(method) -> set[str]:
+        return {name for name in signature(method).parameters.keys() if name != 'self'}
+
+    def _move_payload(self, inputs, allowed_keys: set[str]) -> dict:
+        return {
+            key: value.to(self.device) if hasattr(value, 'to') else value
+            for key, value in inputs.items()
+            if key in allowed_keys
+        }
+
+    def extract_image_embedding(self, image: Image.Image):
+        if not self.available:
+            raise RuntimeError("SigLIP2 extractor unavailable")
+        torch = self.torch
+        inputs = self.processor(images=image, return_tensors="pt")
+        payload = self._move_payload(inputs, self._image_feature_args)
+        with torch.no_grad():
+            feats = self.model.get_image_features(**payload)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        return feats.squeeze(0).detach().cpu().numpy().astype("float32")
+
+    def extract_image_embeddings(self, images: Sequence[Image.Image]) -> np.ndarray:
+        if not self.available:
+            raise RuntimeError("SigLIP2 extractor unavailable")
+        torch = self.torch
+        inputs = self.processor(images=list(images), return_tensors="pt")
+        payload = self._move_payload(inputs, self._image_feature_args)
+        with torch.no_grad():
+            feats = self.model.get_image_features(**payload)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        return feats.detach().cpu().numpy().astype("float32")
+
+    def extract_text_embedding(self, text: str):
+        if not self.available:
+            raise RuntimeError("SigLIP2 extractor unavailable for text")
+        torch = self.torch
+        inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True)
+        payload = self._move_payload(inputs, self._text_feature_args)
+        with torch.no_grad():
+            feats = self.model.get_text_features(**payload)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        return feats.squeeze(0).detach().cpu().numpy().astype("float32")
+
+
+@lru_cache(maxsize=4)
+def _build_multimodal_extractor_cached(normalized: str):
+    if normalized == 'clip':
+        return CLIPEmbeddingExtractor()
+    if normalized == 'siglip2':
+        return SigLIP2EmbeddingExtractor()
+    return None
+
+
+def build_multimodal_extractor(method: str):
+    normalized = normalize_multimodal_method(method)
+    return _build_multimodal_extractor_cached(normalized)
 
 
 class DINOEmbeddingExtractor:
@@ -145,9 +260,9 @@ class EmbeddingEngine:
     def estimate_embeddings(self, images: Sequence[ImageEntry],
                             method: str = "color_rgb",
                             resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
-        method_l = method.lower()
-        if method_l in {"clip", "clip-vit", "clip32"}:
-            extractor = CLIPEmbeddingExtractor()
+        method_l = normalize_multimodal_method(method)
+        if method_l in {"clip", "siglip2"}:
+            extractor = build_multimodal_extractor(method_l)
             if getattr(extractor, 'available', False):
                 return self._extract_with_extractor(images, extractor, fallback_dim=512)
             method_l = "color_rgb"
@@ -290,6 +405,17 @@ class EmbeddingEngine:
 
 
     def _extract_with_extractor(self, images: Sequence[ImageEntry], extractor, fallback_dim: int) -> np.ndarray:
+        if hasattr(extractor, 'extract_image_embeddings'):
+            batch_size = max(1, int(getattr(extractor, 'batch_size', 8) or 8))
+            embs = []
+            for start in range(0, len(images), batch_size):
+                batch_entries = images[start:start + batch_size]
+                batch_images = []
+                for entry in batch_entries:
+                    with Image.open(entry.path) as img:
+                        batch_images.append(img.convert('RGB').copy())
+                embs.append(extractor.extract_image_embeddings(batch_images))
+            return np.vstack(embs)
         embs = []
         for e in images:
             with Image.open(e.path) as img:
@@ -304,7 +430,8 @@ class EmbeddingEngine:
         return d
 
     def load_embeddings_only(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache_method = normalize_multimodal_method(method)
+        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
         if not cache.exists():
             return None
         data = np.load(cache, allow_pickle=False)
@@ -327,18 +454,16 @@ class EmbeddingEngine:
     def compute_and_cache_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
         embs = self.estimate_embeddings(entries, method=method)
         import numpy as np
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache_method = normalize_multimodal_method(method)
+        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
         paths = np.array([e.path for e in entries])
         mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
         np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
         return embs
 
     def text_embedding(self, method: str, text: str) -> Optional[np.ndarray]:
-        m = (method or '').lower()
-        if m in { 'clip', 'clip-vit', 'clip32' }:
-            extractor = CLIPEmbeddingExtractor()
-            if getattr(extractor, 'available', False):
-                vec = extractor.extract_text_embedding(text)
-                return vec
+        extractor = build_multimodal_extractor(method)
+        if extractor is not None and getattr(extractor, 'available', False):
+            vec = extractor.extract_text_embedding(text)
+            return vec
         return None
-

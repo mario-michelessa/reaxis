@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,1,0');
+
 :root {
   --font-family-ui: 'Inter', sans-serif;
   font-family: var(--font-family-ui);
@@ -6,7 +8,7 @@
   color-scheme: light;
   color: rgba(0, 0, 0, 0.87);
   background-color: #ffffff;
-  --mdc-theme-primary: #7856a9;
+  --mdc-theme-primary: #2563eb;
   /* theming variables */
   --surface: #ffffff;
   --muted-surface: #f8fafc;
@@ -20,6 +22,9 @@
   --font-size-body: 0.95rem;
   --font-size-small: 0.82rem;
   --font-size-base: var(--font-size-body);
+  --radius-panel: 8px;
+  --radius-card: 6px;
+  --radius-control: 4px;
 }
 
 body {
@@ -55,7 +60,7 @@ body {
 }
 
 button {
-  border-radius: 8px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--border);
   padding: 0.5em 0.9em;
   font-size: var(--font-size-small);
@@ -75,7 +80,7 @@ button:focus-visible {
 select, textarea, input[type="range"], input[type="text"], input[type="search"], input[type="number"] {
   margin: 0.5em;
   padding: 0.4em 0.5em;
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--border);
   background-color: #fff;
   color: var(--text);
@@ -144,11 +149,11 @@ select, textarea, input[type="range"], input[type="text"], input[type="search"],
 }
 
 /* Standardized utility classes for components */
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
-.panel-header { background: linear-gradient(90deg, #e2e8f0, #e5e7eb, #e2e8f0); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px;  font-weight: 600; font-size: var(--font-size-body); display:flex; align-items:center; gap:8px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card); padding: 8px; }
+.panel-header { background: linear-gradient(90deg, #e2e8f0, #e5e7eb, #e2e8f0); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-card); padding: 5px 10px;  font-weight: 600; font-size: var(--font-size-body); display:flex; align-items:center; gap:8px; }
 .minimap { position: relative; background: var(--surface); border: none; user-select: none; }
-.toolbar { position: absolute; background: #ffffff; backdrop-filter: blur(0px); border-radius: 6px; padding: 2px 4px; display:flex; align-items:center; gap:4px; }
-.chip { background:#ffffff; border:1px solid var(--border); border-radius:8px; padding:4px 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+.toolbar { position: absolute; background: #ffffff; backdrop-filter: blur(0px); border-radius: var(--radius-card); padding: 2px 4px; display:flex; align-items:center; gap:4px; }
+.chip { background:#ffffff; border:1px solid var(--border); border-radius: var(--radius-card); padding:4px 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
 .chip input[type="checkbox"], .chip input[type="range"] { background:#ffffff; accent-color: #2563eb; }
 
 /* High-fidelity checkbox styling inside chips */
@@ -216,19 +221,58 @@ select, textarea, input[type="range"], input[type="text"], input[type="search"],
 .right-just { justify-content: flex-end; }
 .pos-bottom-right { bottom: 4px; right: -54px; }
 .pos-bottom-left { bottom: 4px; left: 4px; }
-.axis-rail-left, .axis-rail-right, .axis-rail-top, .axis-rail-bottom { position: absolute; background: rgba(255,255,255,0.9); border: 0px solid var(--border); border-radius: 6px; padding: 6px; display:flex; flex-direction:row; align-items:center; gap:8px; z-index: 10; }
+.axis-rail-left, .axis-rail-right, .axis-rail-top, .axis-rail-bottom { position: absolute; background: rgba(255,255,255,0.9); border: 0px solid var(--border); border-radius: var(--radius-card); padding: 6px; display:flex; flex-direction:row; align-items:center; gap:8px; z-index: 10; }
 .axis-rail-left { left: -45px; top:50%; transform: rotate(-90deg);}
 .axis-rail-right { right: 4px; top:50%; transform: rotate(-90deg);}
 .axis-rail-top { top: 4px; left:50%; transform: translateX(-50%); }
 .axis-rail-bottom { bottom: 0px; left:50%; transform: translateX(-50%); }
 
-.btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; padding: 3px 7px; cursor: pointer; font-size: var(--font-size-small); line-height: 1.2; }
+.btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: var(--radius-control); padding: 3px 7px; cursor: pointer; font-size: var(--font-size-small); line-height: 1.2; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
 .btn:hover { background: var(--muted-surface); }
 .btn-sm { font-size: var(--font-size-small); padding: 3px 6px; }
 .btn-xs { font-size: var(--font-size-small); padding: 2px 5px; }
 .btn-icon { width: 28px; height: 28px; display:grid; place-items:center; }
-.btn-primary { background: #fff; color: #2563eb; border-color: #2563eb; }
+.ui-icon {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: #111827 !important;
+}
+.ui-icon.sm {
+  width: 14px;
+  height: 14px;
+}
+:global(.material-symbols-rounded.material-symbol) {
+  font-family: 'Material Symbols Rounded';
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+  color: #111827 !important;
+  font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+:where(.btn, .axis-action, .saved-axes-close, .saved-axis-delete) .ui-icon {
+  color: #111827 !important;
+}
+:where(.btn, .axis-action, .saved-axes-close, .saved-axis-delete) :global(.material-symbols-rounded.material-symbol) {
+  color: #111827 !important;
+}
+.btn .minimap-tool-svg {
+  color: #111827 !important;
+}
+.btn-primary { background: #fff; color: var(--accent); border-color: var(--accent); }
 .btn-primary:hover { background: #eff6ff; }
+.btn-primary .ui-icon,
+.btn-primary :global(.material-symbols-rounded.material-symbol) {
+  color: var(--accent) !important;
+}
 .btn-danger { background: #fff; color: #dc2626; border-color: #dc2626; }
 .btn-danger:hover { background: #fee2e2; }
 .btn-success { background: #fff; color: var(--good); border-color: var(--good); }
@@ -248,14 +292,14 @@ select, textarea, input[type="range"], input[type="text"], input[type="search"],
 .btn-minimap:hover { background: #f8fafc; }
 
 .thumbs { display:flex; flex-wrap:wrap; gap:4px; }
-.thumb { width: 3rem; height: 3rem; border-radius: 6px; object-fit: cover; border:1px solid var(--border); }
+.thumb { width: 3rem; height: 3rem; border-radius: var(--radius-card); object-fit: cover; border:1px solid var(--border); }
 
 /* Tiles (for App and subcomponents) */
-.tile { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: visible; }
-.tile-header { padding: 4px 10px; border-bottom: 0; font-weight: 700; font-size: var(--font-size-title); display:flex; align-items:center; gap:8px; background: #fff; line-height: 1.15; }
+.tile { position: relative; background: #fff; border: 1px solid var(--border); border-radius: var(--radius-panel); box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: visible; }
+.tile-header { padding: 10px 10px; border-bottom: 0; font-weight: 700; font-size: var(--font-size-title); display:flex; align-items:center; gap:8px; background: #fff; line-height: 1.15; }
 .tile-content { padding: 6px; }
 .tile-content.flush { padding: 0; }
-.subtile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+.subtile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card); padding: 8px; }
 .tile-primary { box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
 .tile-header.primary { background: linear-gradient(90deg, #dbeafe, #e0e7ff, #dbeafe); color:#1f2937; }
 
@@ -272,7 +316,7 @@ select, textarea, input[type="range"], input[type="text"], input[type="search"],
   height: 16px;
   border: 1px solid var(--border);
   background: #ffffff;
-  border-radius: 5px;
+  border-radius: var(--radius-control);
   cursor: nwse-resize;
   box-shadow: 0 2px 4px rgba(0,0,0,0.12);
   z-index: 20;           /* above tile content */

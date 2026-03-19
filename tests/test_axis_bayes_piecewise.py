@@ -45,6 +45,24 @@ class StubAxisBayesEngine(AxisBayesEngine):
             {'source': 'test', 'provider': 'test'},
         )
 
+    def _embed_prompt_lists(self, pos_prompts, neg_prompts, *, source: str, provider: str):
+        pos_list = self._clean_prompt_list(pos_prompts)
+        neg_list = self._clean_prompt_list(neg_prompts)
+        axis_x = sum('x' in prompt.lower() or 'horizontal' in prompt.lower() for prompt in pos_list)
+        axis_y = sum('y' in prompt.lower() or 'vertical' in prompt.lower() for prompt in pos_list)
+        neg_x = sum('x' in prompt.lower() or 'horizontal' in prompt.lower() for prompt in neg_list)
+        neg_y = sum('y' in prompt.lower() or 'vertical' in prompt.lower() for prompt in neg_list)
+        vec = np.asarray([
+            float(axis_x - neg_x),
+            float(axis_y - neg_y),
+            0.0,
+        ], dtype=np.float32)
+        if float(np.linalg.norm(vec)) <= 1e-8:
+            vec = self._stub_prompt.copy()
+        else:
+            vec = _normalize_vec(vec)
+        return vec, pos_list, neg_list, {'source': source, 'provider': provider}
+
 
 class AxisBayesPiecewiseTests(unittest.TestCase):
     def _collection(self, embeddings: np.ndarray) -> CollectionCache:
@@ -242,6 +260,97 @@ class AxisBayesPiecewiseTests(unittest.TestCase):
         state = restored.deserialize_axis(blob)
         round_trip = restored._state_payload(state)
         self.assertIn(image_id, round_trip['undefined_ids'])
+
+    def test_piecewise_undefined_feedback_does_not_crash_anchor_pair_building(self):
+        coll, prompt, true_score = self._make_piecewise_problem()
+        engine = StubAxisBayesEngine(
+            coll,
+            prompt,
+            model_type='piecewise_linear',
+            mode='rank',
+            feature_space='clip',
+            clip_weight=1.0,
+            dino_weight=0.0,
+            piecewise_num_experts=2,
+            piecewise_max_refine_steps=12,
+        )
+        created = engine.create_axis('test-dataset', '/tmp/test-dataset', 'piecewise-undefined', model_type='piecewise_linear')
+        labels = self._label_indices(true_score, count=4)
+        ids = [coll.ids[idx] for idx in labels]
+        pct = _percentile_targets(true_score[labels])
+        refined = self._apply_labels(engine, created['axis_id'], ids, pct)
+        undefined_payload = engine.move_axis(refined['axis_id'], ids[0], 0.0, move_type='undefined')
+        self.assertIn(ids[0], undefined_payload['undefined_ids'])
+        self.assertEqual(undefined_payload['model_type'], 'piecewise_linear')
+        self.assertEqual(undefined_payload['move_count'], len(ids) - 1)
+
+    def test_prompt_update_rebuilds_linear_prior_and_preserves_moves(self):
+        coll, prompt, true_score = self._make_linear_problem()
+        engine = StubAxisBayesEngine(
+            coll,
+            prompt,
+            model_type='bayes_linear',
+            mode='gaussian',
+            feature_space='clip',
+            clip_weight=1.0,
+            dino_weight=0.0,
+        )
+        created = engine.create_axis('test-dataset', '/tmp/test-dataset', 'direction')
+        moved = engine.move_axis(created['axis_id'], coll.ids[0], 100.0)
+        updated = engine.update_axis_prompts(
+            created['axis_id'],
+            pos_prompts=['strong vertical'],
+            neg_prompts=['strong horizontal'],
+        )
+        self.assertEqual(updated['move_count'], 1)
+        self.assertEqual(updated['w0_summary']['pos_prompts'], ['strong vertical'])
+        self.assertEqual(updated['w0_summary']['neg_prompts'], ['strong horizontal'])
+        self.assertEqual(updated['w0_summary']['prompt_source'], 'manual_edit')
+        self.assertNotEqual(
+            np.argmax(np.abs(np.asarray(moved['projection_values'], dtype=np.float32))),
+            -1,
+        )
+        diff = np.max(
+            np.abs(
+                np.asarray(updated['projection_values'], dtype=np.float32)
+                - np.asarray(moved['projection_values'], dtype=np.float32)
+            )
+        )
+        self.assertGreater(float(diff), 1e-4)
+
+    def test_prompt_update_rebuilds_piecewise_prior_and_preserves_feedback(self):
+        coll, prompt, true_score = self._make_piecewise_problem()
+        engine = StubAxisBayesEngine(
+            coll,
+            prompt,
+            model_type='piecewise_linear',
+            mode='rank',
+            feature_space='clip',
+            clip_weight=1.0,
+            dino_weight=0.0,
+            piecewise_num_experts=2,
+            piecewise_max_refine_steps=12,
+        )
+        created = engine.create_axis('test-dataset', '/tmp/test-dataset', 'direction', model_type='piecewise_linear')
+        labels = self._label_indices(true_score, count=4)
+        ids = [coll.ids[idx] for idx in labels]
+        pct = _percentile_targets(true_score[labels])
+        refined = self._apply_labels(engine, created['axis_id'], ids, pct)
+        updated = engine.update_axis_prompts(
+            created['axis_id'],
+            pos_prompts=['strong vertical'],
+            neg_prompts=['strong horizontal'],
+        )
+        self.assertEqual(updated['move_count'], len(ids))
+        self.assertEqual(updated['model_type'], 'piecewise_linear')
+        self.assertEqual(updated['w0_summary']['pos_prompts'], ['strong vertical'])
+        diff = np.max(
+            np.abs(
+                np.asarray(updated['projection_values'], dtype=np.float32)
+                - np.asarray(refined['projection_values'], dtype=np.float32)
+            )
+        )
+        self.assertGreater(float(diff), 1e-4)
 
     def test_serialization_round_trip_for_legacy_and_piecewise(self):
         coll, prompt, true_score = self._make_linear_problem()

@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import json
+from pathlib import Path
 import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     from .constants import (
@@ -22,6 +25,9 @@ try:
         ATTRIBUTE_CONTINUOUS_ANCHORS_USER_PROMPT_TEMPLATE,
         DEFAULT_MAX_ATTRIBUTES,
         DEFAULT_VALUE_COUNT,
+        GEMINI_API_KEY_PATH,
+        GEMINI_API_TIMEOUT_SEC,
+        GEMINI_MODEL_NAME,
         HF_4BIT_COMPUTE_DTYPE,
         HF_4BIT_DEVICE_MAP,
         HF_4BIT_QUANT_TYPE,
@@ -51,6 +57,9 @@ except ImportError:
         ATTRIBUTE_CONTINUOUS_ANCHORS_USER_PROMPT_TEMPLATE,
         DEFAULT_MAX_ATTRIBUTES,
         DEFAULT_VALUE_COUNT,
+        GEMINI_API_KEY_PATH,
+        GEMINI_API_TIMEOUT_SEC,
+        GEMINI_MODEL_NAME,
         HF_4BIT_COMPUTE_DTYPE,
         HF_4BIT_DEVICE_MAP,
         HF_4BIT_QUANT_TYPE,
@@ -302,7 +311,14 @@ def _align_phrase_to_prompt(prompt: str, phrase: str, used_ranges: Optional[List
 
 class LightweightLLMEngine:
     def __init__(self):
+        repo_root = Path(__file__).resolve().parent.parent
         self.provider = LLM_PROVIDER
+        self.gemini_model_name = str(GEMINI_MODEL_NAME or 'gemini-2.5-flash-lite').strip()
+        gemini_key_path = Path(str(GEMINI_API_KEY_PATH or 'data/secrets/gemini_api_key.txt')).expanduser()
+        if not gemini_key_path.is_absolute():
+            gemini_key_path = repo_root / gemini_key_path
+        self.gemini_api_key_path = gemini_key_path.resolve()
+        self.gemini_api_timeout_sec = max(1, int(GEMINI_API_TIMEOUT_SEC or 45))
         self.hf_local_model_path = HF_LOCAL_MODEL_PATH
         self.hf_local_files_only = bool(HF_LOCAL_FILES_ONLY)
         self.hf_trust_remote_code = bool(HF_TRUST_REMOTE_CODE)
@@ -317,9 +333,13 @@ class LightweightLLMEngine:
         self._hf_tokenizer = None
         self._hf_model = None
         self._hf_load_error: Optional[str] = None
+        self._gemini_api_key: Optional[str] = None
+        self._gemini_api_key_error: Optional[str] = None
         self._log(
-            'init provider=%s model_path=%s use_4bit=%s quant_type=%s compute_dtype=%s device_map=%s',
+            'init provider=%s gemini_model=%s gemini_key_path=%s model_path=%s use_4bit=%s quant_type=%s compute_dtype=%s device_map=%s',
             self.provider,
+            self.gemini_model_name,
+            self.gemini_api_key_path,
             self.hf_local_model_path,
             self.hf_use_4bit,
             self.hf_4bit_quant_type,
@@ -337,6 +357,29 @@ class LightweightLLMEngine:
 
     def _can_use_hf_local(self) -> bool:
         return self.provider in {'huggingface_local', 'huggingface', 'hf_local'} and bool(self.hf_local_model_path)
+
+    def _can_use_gemini_api(self) -> bool:
+        return self.provider in {'gemini_api', 'gemini'}
+
+    def _load_gemini_api_key(self) -> Optional[str]:
+        if not self._can_use_gemini_api():
+            return None
+        if self._gemini_api_key:
+            return self._gemini_api_key
+        if self._gemini_api_key_error:
+            self._log('skip gemini key load: previous error=%s', self._gemini_api_key_error)
+            return None
+        try:
+            raw = self.gemini_api_key_path.read_text(encoding='utf-8').strip()
+            if not raw:
+                raise RuntimeError(f'Empty Gemini API key file: {self.gemini_api_key_path}')
+            self._gemini_api_key = raw
+            self._log('gemini api key loaded from %s', self.gemini_api_key_path)
+            return self._gemini_api_key
+        except Exception as e:
+            self._gemini_api_key_error = str(e)
+            self._log('gemini api key load failed: %s', self._gemini_api_key_error)
+            return None
 
     def _load_hf_local(self) -> bool:
         if not self._can_use_hf_local():
@@ -474,7 +517,92 @@ class LightweightLLMEngine:
             self._log('chat failed: %s', e)
             return None
 
+    def _post_gemini_chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> Optional[str]:
+        api_key = self._load_gemini_api_key()
+        if not api_key:
+            self._log('gemini chat aborted: api key unavailable')
+            return None
+        try:
+            t0 = time.time()
+            system_parts = [str(m.get('content') or '').strip() for m in messages if str(m.get('role') or '').strip().lower() == 'system']
+            non_system = [m for m in messages if str(m.get('role') or '').strip().lower() != 'system']
+            contents = []
+            for m in non_system:
+                role = str(m.get('role') or 'user').strip().lower()
+                text = str(m.get('content') or '').strip()
+                if not text:
+                    continue
+                mapped_role = 'model' if role == 'assistant' else 'user'
+                contents.append({
+                    'role': mapped_role,
+                    'parts': [{'text': text}],
+                })
+            if len(contents) == 0:
+                self._log('gemini chat aborted: no message contents')
+                return None
+            payload: Dict[str, Any] = {
+                'contents': contents,
+                'generationConfig': {
+                    'temperature': max(0.0, float(temperature)),
+                    'responseMimeType': 'application/json',
+                },
+            }
+            if system_parts:
+                payload['systemInstruction'] = {
+                    'parts': [{'text': '\n\n'.join(system_parts)}],
+                }
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model_name}:generateContent'
+            body = json.dumps(payload).encode('utf-8')
+            req = urllib_request.Request(
+                url,
+                data=body,
+                method='POST',
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-goog-api-key': api_key,
+                },
+            )
+            self._log('gemini chat start messages=%d temperature=%.3f model=%s', len(messages), float(temperature), self.gemini_model_name)
+            with urllib_request.urlopen(req, timeout=self.gemini_api_timeout_sec) as resp:
+                raw = resp.read().decode('utf-8', errors='replace')
+            obj = json.loads(raw)
+            candidates = obj.get('candidates') if isinstance(obj, dict) else None
+            if not isinstance(candidates, list) or len(candidates) == 0:
+                self._log('gemini chat failed: missing candidates raw="%s"', _short(raw))
+                return None
+            parts = (((candidates[0] or {}).get('content') or {}).get('parts') or [])
+            text_chunks = []
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict):
+                        text = str(part.get('text') or '').strip()
+                        if text:
+                            text_chunks.append(text)
+            text = '\n'.join(text_chunks).strip()
+            self._log('gemini chat complete output_chars=%d elapsed=%.2fs', len(text), time.time() - t0)
+            return text or None
+        except urllib_error.HTTPError as e:
+            try:
+                details = e.read().decode('utf-8', errors='replace')
+            except Exception:
+                details = str(e)
+            self._log('gemini chat http error: %s body="%s"', e, _short(details))
+            return None
+        except Exception as e:
+            self._log('gemini chat failed: %s', e)
+            return None
+
     def _run_structured_json(self, messages: List[Dict[str, str]], temperature: float = 0.2):
+        if self._can_use_gemini_api():
+            content = self._post_gemini_chat(messages, temperature=temperature if temperature is not None else self.hf_temperature)
+            if content:
+                obj = _extract_json_payload(content)
+                if obj is not None:
+                    self._log('json parse success keys=%s', list(obj.keys()))
+                    return obj, 'gemini_api'
+                self._log('json parse failed preview="%s"', _short(content))
+            else:
+                self._log('no content returned from gemini')
         if self._can_use_hf_local():
             content = self._post_hf_chat(messages, temperature=temperature if temperature is not None else self.hf_temperature)
             if content:
@@ -488,8 +616,12 @@ class LightweightLLMEngine:
         return None, None
 
     def _last_error(self) -> str:
+        if self._can_use_gemini_api() and self._gemini_api_key_error:
+            return f'Gemini API key load failed: {self._gemini_api_key_error}'
         if self._hf_load_error:
             return f'HF model load failed: {self._hf_load_error}'
+        if self._can_use_gemini_api():
+            return 'Gemini API returned empty or non-JSON output'
         return 'HF model returned empty or non-JSON output'
 
     def extract_attribute_support(self, prompt: str, attributes: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -666,7 +798,7 @@ class LightweightLLMEngine:
         return {
             'attributes': [],
             'attribute_names': [],
-            'provider': provider or 'huggingface_local',
+            'provider': provider or self.provider or 'unknown',
             'error': self._last_error(),
         }
 
@@ -730,7 +862,7 @@ class LightweightLLMEngine:
         return {
             'pos_prompts': [],
             'neg_prompts': [],
-            'provider': provider or 'huggingface_local',
+            'provider': provider or self.provider or 'unknown',
             'error': self._last_error(),
         }
 
@@ -793,7 +925,7 @@ class LightweightLLMEngine:
         self._log('suggest_categories failed: %s', self._last_error())
         return {
             'categories': [],
-            'provider': provider or 'huggingface_local',
+            'provider': provider or self.provider or 'unknown',
             'error': self._last_error(),
         }
 
@@ -866,7 +998,7 @@ class LightweightLLMEngine:
         return {
             'low': '',
             'high': '',
-            'provider': provider or 'huggingface_local',
+            'provider': provider or self.provider or 'unknown',
             'error': self._last_error(),
         }
 

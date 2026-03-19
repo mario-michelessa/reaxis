@@ -21,19 +21,33 @@ except Exception:
 
 try:
     from .constants import (
+        AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE,
         AXIS_BUILDER_LLM_PROMPT_COUNT,
         AXIS_BUILDER_USE_LLM_PROMPT_ENSEMBLE,
+        AXIS_RESIDUAL_ALPHA,
+        AXIS_RESIDUAL_BETA,
+        AXIS_RESIDUAL_LAMBDA,
+        AXIS_RESIDUAL_SIGMA_Y,
+        AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+        AXIS_RESIDUAL_JITTER,
     )
-    from .embeddings import CLIPEmbeddingExtractor
+    from .embeddings import build_multimodal_extractor, normalize_multimodal_method
     from .gallery_backend import ImageGalleryEngine
 except ImportError:
     from constants import (
+        AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE,
         AXIS_BUILDER_LLM_PROMPT_COUNT,
         AXIS_BUILDER_USE_LLM_PROMPT_ENSEMBLE,
+        AXIS_RESIDUAL_ALPHA,
+        AXIS_RESIDUAL_BETA,
+        AXIS_RESIDUAL_LAMBDA,
+        AXIS_RESIDUAL_SIGMA_Y,
+        AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+        AXIS_RESIDUAL_JITTER,
     )
-    from embeddings import CLIPEmbeddingExtractor
+    from embeddings import build_multimodal_extractor, normalize_multimodal_method
     from gallery_backend import ImageGalleryEngine
 
 
@@ -54,6 +68,13 @@ def _normalize_vec(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=np.float32).reshape(-1)
     denom = float(np.linalg.norm(arr)) + 1e-8
     return (arr / denom).astype(np.float32)
+
+
+def _normalize_semantic_method(method: str) -> str:
+    normalized = normalize_multimodal_method(method)
+    if normalized in {'clip', 'siglip2'}:
+        return normalized
+    return 'clip'
 
 
 def _rank_percentile_01(values: np.ndarray) -> np.ndarray:
@@ -117,6 +138,8 @@ def _normalize_model_type(model_type: Any) -> str:
     s = str(model_type or '').strip().lower()
     if s in {'piecewise', 'piecewise_linear', 'mixture', 'mixture_of_linear'}:
         return 'piecewise_linear'
+    if s in {'residual', 'residual_gp', 'smooth_residual', 'gp_residual'}:
+        return 'residual'
     return 'bayes_linear'
 
 
@@ -137,6 +160,7 @@ class CollectionCache:
     embeddings: np.ndarray
     id_to_index: Dict[str, int]
     feature_space: str
+    semantic_method: str
     clip_dim: int
     dino_dim: int
     clip_scale: float
@@ -169,6 +193,7 @@ class AxisBayesState:
     prompt_provider: str
     mode: str
     feature_space: str
+    semantic_method: str
     clip_dim: int
     dino_dim: int
     clip_scale: float
@@ -239,6 +264,20 @@ class AxisBayesState:
     piecewise_pair_j: List[int] = field(default_factory=list)
     piecewise_pair_w: List[float] = field(default_factory=list)
     piecewise_last_fit_signature: str = ''
+    residual_alpha: float = 1.0
+    residual_beta: float = 0.0
+    residual_lambda: float = 0.12
+    residual_sigma_y: float = 0.06
+    residual_lengthscale_multiplier: float = 1.0
+    residual_lengthscale: float = 1.0
+    residual_jitter: float = 1e-6
+    residual_features: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
+    residual_external_features: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
+    residual_external_targets: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    residual_external_weights: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    residual_posterior_mean: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    residual_posterior_std: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    residual_last_fit_signature: str = ''
 
 
 class BaseAxisScorer:
@@ -572,12 +611,105 @@ class PiecewiseLinearAxisScorer(BaseAxisScorer):
         return scores, expert_scores.astype(np.float32), uncertainty
 
 
+class ResidualAxisScorer(BaseAxisScorer):
+    """Global CLIP prior plus a small smooth GP residual over fused image features."""
+
+    model_type = 'residual'
+
+    def initialize_state(self, engine: 'AxisBayesEngine', state: AxisBayesState) -> None:
+        state.residual_features = engine._build_residual_feature_matrix(state)
+        if state.residual_lengthscale <= 1e-6:
+            state.residual_lengthscale = engine._estimate_residual_lengthscale(state.residual_features, state)
+        engine._refresh_residual_prior(state)
+        if state.residual_posterior_mean.size != len(state.ids):
+            state.residual_posterior_mean = np.asarray(state.z0_all, dtype=np.float32).copy()
+        if state.residual_posterior_std.size != len(state.ids):
+            base_std = float(max(1e-6, state.residual_lambda))
+            state.residual_posterior_std = np.full((len(state.ids),), base_std, dtype=np.float32)
+
+    def fit_from_feedback(self, engine: 'AxisBayesEngine', state: AxisBayesState) -> None:
+        self.initialize_state(engine, state)
+        signature = engine._residual_fit_signature(state)
+        if signature == state.residual_last_fit_signature and state.residual_posterior_mean.size == len(state.ids):
+            return
+
+        base = np.asarray(state.z0_all, dtype=np.float32)
+        support_features, residual_targets, support_weights = engine._build_residual_support_data(state)
+        n = int(len(state.ids))
+        lambda_sq = float(max(1e-8, state.residual_lambda * state.residual_lambda))
+        if support_features.size == 0 or residual_targets.size == 0:
+            state.residual_posterior_mean = base.astype(np.float32)
+            state.residual_posterior_std = np.full((n,), float(np.sqrt(lambda_sq)), dtype=np.float32)
+            state.residual_last_fit_signature = signature
+            return
+        if support_features.ndim != 2 or support_features.shape[1] != state.residual_features.shape[1]:
+            raise ValueError(
+                f'Residual support feature dim mismatch: support={support_features.shape} target={state.residual_features.shape}'
+            )
+
+        noise_var = (
+            (float(max(1e-6, state.residual_sigma_y)) ** 2)
+            / np.maximum(np.asarray(support_weights, dtype=np.float64), 1e-3)
+        )
+        K_mm = engine._residual_kernel(
+            np.asarray(support_features, dtype=np.float32),
+            np.asarray(support_features, dtype=np.float32),
+            state.residual_lengthscale,
+            state.residual_lambda,
+        ).astype(np.float64)
+        K_obs = K_mm + np.diag(noise_var + float(max(1e-10, state.residual_jitter)))
+        K_nm = engine._residual_kernel(
+            np.asarray(state.residual_features, dtype=np.float32),
+            np.asarray(support_features, dtype=np.float32),
+            state.residual_lengthscale,
+            state.residual_lambda,
+        ).astype(np.float64)
+        targets = np.asarray(residual_targets, dtype=np.float64).reshape(-1)
+
+        try:
+            chol = np.linalg.cholesky(K_obs)
+            alpha = np.linalg.solve(chol.T, np.linalg.solve(chol, targets))
+            v = np.linalg.solve(chol, K_nm.T)
+            quad = np.sum(v * v, axis=0)
+        except Exception:
+            inv = np.linalg.pinv(K_obs)
+            alpha = inv @ targets
+            quad = np.sum((K_nm @ inv) * K_nm, axis=1)
+
+        mean = base.astype(np.float64) + (K_nm @ alpha)
+        var = lambda_sq - quad
+        state.residual_posterior_mean = np.asarray(mean, dtype=np.float32)
+        state.residual_posterior_std = np.sqrt(np.maximum(var, float(max(1e-10, state.residual_jitter)))).astype(np.float32)
+        state.residual_last_fit_signature = signature
+
+    def score_embeddings(self, engine: 'AxisBayesEngine', state: AxisBayesState) -> np.ndarray:
+        self.fit_from_feedback(engine, state)
+        return np.asarray(state.residual_posterior_mean, dtype=np.float32)
+
+    def get_uncertainty(self, engine: 'AxisBayesEngine', state: AxisBayesState) -> np.ndarray:
+        self.fit_from_feedback(engine, state)
+        return np.asarray(state.residual_posterior_std, dtype=np.float32)
+
+    def export_state(self, state: AxisBayesState) -> Dict[str, Any]:
+        return {
+            'residual_external_features': np.asarray(state.residual_external_features, dtype=np.float32).tolist(),
+            'residual_external_targets': np.asarray(state.residual_external_targets, dtype=np.float32).tolist(),
+            'residual_external_weights': np.asarray(state.residual_external_weights, dtype=np.float32).tolist(),
+        }
+
+    def import_state(self, state: AxisBayesState, payload: Dict[str, Any]) -> None:
+        state.residual_external_features = np.asarray(payload.get('residual_external_features') or [], dtype=np.float32)
+        state.residual_external_targets = np.asarray(payload.get('residual_external_targets') or [], dtype=np.float32)
+        state.residual_external_weights = np.asarray(payload.get('residual_external_weights') or [], dtype=np.float32)
+
+
 class AxisBayesEngine:
     def __init__(
         self,
         model_type: str = 'bayes_linear',
         mode: str = 'gaussian',
         feature_space: str = 'clip',
+        semantic_method: str = AXIS_BAYES_SEMANTIC_METHOD,
         clip_weight: float = 0.7,
         dino_weight: float = 0.3,
         piecewise_num_experts: int = 2,
@@ -605,6 +737,12 @@ class AxisBayesEngine:
         rank_anchor_k: int = 6,
         rank_anchor_delta: float = 0.12,
         rank_max_pairs: int = 1600,
+        residual_alpha: float = AXIS_RESIDUAL_ALPHA,
+        residual_beta: float = AXIS_RESIDUAL_BETA,
+        residual_lambda: float = AXIS_RESIDUAL_LAMBDA,
+        residual_sigma_y: float = AXIS_RESIDUAL_SIGMA_Y,
+        residual_lengthscale_multiplier: float = AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
+        residual_jitter: float = AXIS_RESIDUAL_JITTER,
         hotspot_boundary: float = 50.0,
         hotspot_tau: float = 18.0,
         hotspot_k: int = 10,
@@ -619,6 +757,7 @@ class AxisBayesEngine:
         self.mode = _normalize_mode(mode)
         fs = str(feature_space or '').strip().lower()
         self.feature_space = 'clip_dino' if fs in {'clip_dino', 'clip+dino', 'dino_clip'} else 'clip'
+        self.semantic_method = _normalize_semantic_method(semantic_method)
         c_w = float(max(1e-6, clip_weight))
         d_w = float(max(1e-6, dino_weight))
         w_sum = c_w + d_w
@@ -640,6 +779,12 @@ class AxisBayesEngine:
         self.rank_anchor_k = max(1, int(rank_anchor_k))
         self.rank_anchor_delta = float(max(0.01, min(0.45, float(rank_anchor_delta))))
         self.rank_max_pairs = max(16, int(rank_max_pairs))
+        self.residual_alpha = float(residual_alpha)
+        self.residual_beta = float(residual_beta)
+        self.residual_lambda = float(max(1e-6, float(residual_lambda)))
+        self.residual_sigma_y = float(max(1e-6, float(residual_sigma_y)))
+        self.residual_lengthscale_multiplier = float(max(1e-3, float(residual_lengthscale_multiplier)))
+        self.residual_jitter = float(max(1e-10, float(residual_jitter)))
         self.piecewise_num_experts = max(1, int(piecewise_num_experts))
         self.piecewise_use_gating = bool(piecewise_use_gating)
         self.piecewise_aggregator = _normalize_piecewise_aggregator(piecewise_aggregator)
@@ -663,10 +808,11 @@ class AxisBayesEngine:
         self.llm_prompt_count = max(2, int(llm_prompt_count))
         self._collections: Dict[str, CollectionCache] = {}
         self._axes: Dict[str, AxisBayesState] = {}
-        self._text_extractor: Optional[CLIPEmbeddingExtractor] = None
+        self._text_extractors: Dict[str, Any] = {}
         self._scorers: Dict[str, BaseAxisScorer] = {
             'bayes_linear': BayesianLinearAxisScorer(),
             'piecewise_linear': PiecewiseLinearAxisScorer(),
+            'residual': ResidualAxisScorer(),
         }
 
     def _log(self, msg: str, *args):
@@ -677,11 +823,16 @@ class AxisBayesEngine:
                 msg = f'{msg} {args}'
         print(f'[axis-bayes] {msg}')
 
-    def _get_text_extractor(self) -> CLIPEmbeddingExtractor:
-        if self._text_extractor is None:
-            self._log('loading CLIP text extractor')
-            self._text_extractor = CLIPEmbeddingExtractor()
-        return self._text_extractor
+    def _get_text_extractor(self, semantic_method: Optional[str] = None):
+        method = _normalize_semantic_method(semantic_method or self.semantic_method)
+        extractor = self._text_extractors.get(method)
+        if extractor is None:
+            self._log('loading semantic text extractor method=%s', method)
+            extractor = build_multimodal_extractor(method)
+            if extractor is None:
+                raise RuntimeError(f'No text extractor available for semantic method {method}')
+            self._text_extractors[method] = extractor
+        return extractor
 
     def _build_fixed_prompt_ensemble(self, q: str) -> tuple[List[str], List[str]]:
         query = re.sub(r'\s+', ' ', str(q or '').strip())
@@ -714,6 +865,43 @@ class AxisBayesEngine:
             neg_seen.add(key)
             neg_out.append(prompt)
         return pos_out, neg_out
+
+    def _clean_prompt_list(self, values: Any) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        if not isinstance(values, (list, tuple)):
+            return out
+        for raw in values:
+            text = re.sub(r'\s+', ' ', str(raw or '').strip())
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+        return out
+
+    def _embed_prompt_lists(
+        self,
+        pos_prompts: Any,
+        neg_prompts: Any,
+        *,
+        semantic_method: str,
+        source: str,
+        provider: str,
+    ) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
+        pos_list = self._clean_prompt_list(pos_prompts)
+        neg_list = self._clean_prompt_list(neg_prompts)
+        if len(pos_list) == 0 or len(neg_list) == 0:
+            raise ValueError('Both positive and negative prompt lists must contain at least one prompt')
+        ext = self._get_text_extractor(semantic_method)
+        pos_vecs = [_normalize_vec(ext.extract_text_embedding(prompt)) for prompt in pos_list]
+        neg_vecs = [_normalize_vec(ext.extract_text_embedding(prompt)) for prompt in neg_list]
+        pos_avg = np.mean(np.vstack(pos_vecs), axis=0, dtype=np.float32)
+        neg_avg = np.mean(np.vstack(neg_vecs), axis=0, dtype=np.float32)
+        w0 = _normalize_vec(pos_avg - neg_avg)
+        return w0, pos_list, neg_list, {'source': str(source or 'unknown'), 'provider': str(provider or 'unknown')}
 
     def build_prompt_ensemble(self, q: str) -> tuple[List[str], List[str], Dict[str, str]]:
         query = re.sub(r'\s+', ' ', str(q or '').strip())
@@ -765,23 +953,15 @@ class AxisBayesEngine:
         )
         return pos_prompts, neg_prompts, {'source': 'llm', 'provider': provider}
 
-    def _embed_prompt_ensemble(self, q: str) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
+    def _embed_prompt_ensemble(self, q: str, semantic_method: str) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
         pos_prompts, neg_prompts, prompt_meta = self.build_prompt_ensemble(q)
-        if len(pos_prompts) == 0 or len(neg_prompts) == 0:
-            raise ValueError('Empty query for prompt ensemble')
-        ext = self._get_text_extractor()
-        pos_vecs = []
-        neg_vecs = []
-        for prompt in pos_prompts:
-            vec = ext.extract_text_embedding(prompt)
-            pos_vecs.append(_normalize_vec(vec))
-        for prompt in neg_prompts:
-            vec = ext.extract_text_embedding(prompt)
-            neg_vecs.append(_normalize_vec(vec))
-        pos_avg = np.mean(np.vstack(pos_vecs), axis=0, dtype=np.float32)
-        neg_avg = np.mean(np.vstack(neg_vecs), axis=0, dtype=np.float32)
-        w0 = _normalize_vec(pos_avg - neg_avg)
-        return w0, pos_prompts, neg_prompts, prompt_meta
+        return self._embed_prompt_lists(
+            pos_prompts,
+            neg_prompts,
+            semantic_method=semantic_method,
+            source=prompt_meta.get('source') or 'unknown',
+            provider=prompt_meta.get('provider') or 'unknown',
+        )
 
     def _quantile_from_sorted(self, z_sorted: np.ndarray, p01: float) -> float:
         arr = np.asarray(z_sorted, dtype=np.float32).reshape(-1)
@@ -811,10 +991,21 @@ class AxisBayesEngine:
         entries = engine.list_images()
         if len(entries) == 0:
             raise ValueError('No images found in collection')
-        clip_embs = engine._load_embeddings_only(entries, method='clip')
-        if clip_embs is None:
-            raise ValueError('CLIP embeddings not available for collection')
-        X_clip = _normalize_rows(np.asarray(clip_embs, dtype=np.float32))
+        semantic_method = None
+        semantic_embs = None
+        for candidate in (_normalize_semantic_method(self.semantic_method), 'clip'):
+            semantic_embs = engine._load_embeddings_only(entries, method=candidate)
+            if semantic_embs is not None:
+                semantic_method = candidate
+                break
+        if semantic_embs is None or semantic_method is None:
+            raise ValueError(
+                f'Semantic embeddings not available for collection. Tried '
+                f'{[_normalize_semantic_method(self.semantic_method), "clip"]}'
+            )
+        if semantic_method != _normalize_semantic_method(self.semantic_method):
+            self._log('semantic cache fallback preferred=%s actual=%s', self.semantic_method, semantic_method)
+        X_clip = _normalize_rows(np.asarray(semantic_embs, dtype=np.float32))
         clip_dim = int(X_clip.shape[1])
         dino_dim = 0
         X = X_clip
@@ -848,6 +1039,7 @@ class AxisBayesEngine:
             embeddings=X,
             id_to_index=id_to_index,
             feature_space=self.feature_space,
+            semantic_method=semantic_method,
             clip_dim=clip_dim,
             dino_dim=dino_dim,
             clip_scale=self.clip_scale,
@@ -898,6 +1090,8 @@ class AxisBayesEngine:
         state.move_weights.pop(image_key, None)
         if state.model_type == 'piecewise_linear':
             state.piecewise_last_fit_signature = ''
+        if state.model_type == 'residual':
+            state.residual_last_fit_signature = ''
         if state.model_type == 'bayes_linear' and _normalize_mode(state.mode) == 'rank' and len(state.pair_i) > 0:
             image_idx = state.id_to_index.get(image_key)
             if image_idx is not None:
@@ -951,6 +1145,132 @@ class AxisBayesEngine:
                 axis=0,
             ).astype(np.float32)
         return (float(state.piecewise_clip_scale) * np.asarray(state.w0[: state.clip_dim], dtype=np.float32)).astype(np.float32)
+
+    def _build_residual_feature_matrix(self, state: AxisBayesState) -> np.ndarray:
+        X = np.asarray(state.image_embeddings, dtype=np.float32)
+        if X.size == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        if state.feature_space == 'clip_dino':
+            clip_raw = X[:, : state.clip_dim] / max(1e-8, float(state.clip_scale))
+        else:
+            clip_raw = X[:, : state.clip_dim]
+        if state.feature_space == 'clip_dino' and int(state.dino_dim) > 0:
+            dino_raw = X[:, state.clip_dim :] / max(1e-8, float(state.dino_scale))
+            fused = np.concatenate([clip_raw, dino_raw], axis=1).astype(np.float32)
+            return _normalize_rows(fused)
+        return _normalize_rows(clip_raw.astype(np.float32))
+
+    def _build_residual_prior_scores(self, state: AxisBayesState) -> np.ndarray:
+        X = np.asarray(state.image_embeddings, dtype=np.float32)
+        if X.size == 0 or int(state.clip_dim) <= 0:
+            return np.zeros((len(state.ids),), dtype=np.float32)
+        if state.feature_space == 'clip_dino':
+            clip_raw = X[:, : state.clip_dim] / max(1e-8, float(state.clip_scale))
+        else:
+            clip_raw = X[:, : state.clip_dim]
+        raw_prior = clip_raw @ np.asarray(state.w0[: state.clip_dim], dtype=np.float32)
+        stable_prior = _rank_percentile_01(np.asarray(raw_prior, dtype=np.float32))
+        return (
+            (float(state.residual_alpha) * stable_prior) + float(state.residual_beta)
+        ).astype(np.float32)
+
+    def _refresh_residual_prior(self, state: AxisBayesState) -> None:
+        state.z0_all = self._build_residual_prior_scores(state)
+        state.z0_sorted = np.sort(np.asarray(state.z0_all, dtype=np.float32)).astype(np.float32)
+
+    def _estimate_residual_lengthscale(self, features: np.ndarray, state: AxisBayesState) -> float:
+        arr = np.asarray(features, dtype=np.float32)
+        n = int(arr.shape[0]) if arr.ndim == 2 else 0
+        if n <= 1:
+            return max(0.25, float(state.residual_lengthscale_multiplier))
+        if n > 96:
+            picks = np.linspace(0, n - 1, 96, dtype=np.int64)
+            arr = arr[picks]
+        diff = arr[:, None, :] - arr[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2, dtype=np.float32)
+        tri = dist2[np.triu_indices(dist2.shape[0], k=1)]
+        valid = tri[np.isfinite(tri) & (tri > 1e-8)]
+        base = float(np.sqrt(np.median(valid))) if valid.size > 0 else 1.0
+        return float(max(1e-3, float(state.residual_lengthscale_multiplier) * base))
+
+    def _residual_kernel(
+        self,
+        X_a: np.ndarray,
+        X_b: np.ndarray,
+        lengthscale: float,
+        amplitude: float,
+    ) -> np.ndarray:
+        a = np.asarray(X_a, dtype=np.float32)
+        b = np.asarray(X_b, dtype=np.float32)
+        if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
+            return np.zeros((a.shape[0] if a.ndim == 2 else 0, b.shape[0] if b.ndim == 2 else 0), dtype=np.float32)
+        ls = float(max(1e-6, lengthscale))
+        amp_sq = float(max(1e-8, amplitude * amplitude))
+        a_sq = np.sum(a * a, axis=1, keepdims=True)
+        b_sq = np.sum(b * b, axis=1, keepdims=True).T
+        dist2 = np.maximum(a_sq + b_sq - (2.0 * (a @ b.T)), 0.0)
+        return (amp_sq * np.exp(-0.5 * dist2 / (ls * ls))).astype(np.float32)
+
+    def _build_residual_support_data(self, state: AxisBayesState) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if state.residual_features.size == 0:
+            state.residual_features = self._build_residual_feature_matrix(state)
+        if state.z0_all.size != len(state.ids):
+            self._refresh_residual_prior(state)
+        features_parts: List[np.ndarray] = []
+        target_parts: List[np.ndarray] = []
+        weight_parts: List[np.ndarray] = []
+        if state.residual_external_features.size > 0 and state.residual_external_targets.size > 0:
+            features_parts.append(np.asarray(state.residual_external_features, dtype=np.float32))
+            target_parts.append(np.asarray(state.residual_external_targets, dtype=np.float32).reshape(-1))
+            ext_weights = np.asarray(state.residual_external_weights, dtype=np.float32).reshape(-1)
+            if ext_weights.size != state.residual_external_targets.size:
+                ext_weights = np.ones((state.residual_external_targets.size,), dtype=np.float32)
+            weight_parts.append(np.maximum(ext_weights, 1e-3))
+
+        undefined_ids = self._undefined_id_set(state)
+        local_ids = [
+            image_id for image_id in state.move_order
+            if image_id in state.id_to_index and image_id not in undefined_ids
+        ]
+        if local_ids:
+            local_idx = np.asarray([int(state.id_to_index[image_id]) for image_id in local_ids], dtype=np.int64)
+            local_features = np.asarray(state.residual_features[local_idx], dtype=np.float32)
+            local_targets = np.asarray(
+                [float(state.move_targets[image_id]) for image_id in local_ids],
+                dtype=np.float32,
+            ) - np.asarray(state.z0_all[local_idx], dtype=np.float32)
+            local_weights = np.asarray(
+                [float(max(1e-3, state.move_weights.get(image_id, 1.0))) for image_id in local_ids],
+                dtype=np.float32,
+            )
+            features_parts.append(local_features)
+            target_parts.append(local_targets)
+            weight_parts.append(local_weights)
+
+        if not features_parts:
+            return (
+                np.zeros((0, state.residual_features.shape[1] if state.residual_features.ndim == 2 else 0), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
+        return (
+            np.concatenate(features_parts, axis=0).astype(np.float32),
+            np.concatenate(target_parts, axis=0).astype(np.float32),
+            np.concatenate(weight_parts, axis=0).astype(np.float32),
+        )
+
+    def _residual_fit_signature(self, state: AxisBayesState) -> str:
+        payload = {
+            'move_order': [str(v) for v in state.move_order],
+            'move_targets': {str(k): round(float(v), 6) for k, v in sorted(state.move_targets.items())},
+            'move_weights': {str(k): round(float(v), 6) for k, v in sorted(state.move_weights.items())},
+            'undefined_order': [str(v) for v in state.undefined_order],
+            'external_count': int(state.residual_external_targets.size),
+            'lengthscale': round(float(state.residual_lengthscale), 6),
+            'lambda': round(float(state.residual_lambda), 6),
+            'sigma_y': round(float(state.residual_sigma_y), 6),
+        }
+        return json.dumps(payload, sort_keys=True)
 
     def _collection_piecewise_basis(self, state: AxisBayesState, features: np.ndarray) -> np.ndarray:
         coll = self._collections.get(
@@ -1025,13 +1345,23 @@ class AxisBayesEngine:
 
         prior_scores = _rank_percentile_01(state.z0_all)
         all_indices = np.asarray(self._defined_indices(state), dtype=np.int64)
+        defined_prior_scores = prior_scores[all_indices] if all_indices.size > 0 else np.zeros((0,), dtype=np.float32)
         for image_idx, target, move_weight in label_rows:
-            lower = all_indices[(prior_scores < target) & (prior_scores >= max(0.0, target - state.rank_anchor_delta)) & (all_indices != image_idx)]
-            upper = all_indices[(prior_scores > target) & (prior_scores <= min(1.0, target + state.rank_anchor_delta)) & (all_indices != image_idx)]
+            candidate_mask = all_indices != int(image_idx)
+            candidate_indices = all_indices[candidate_mask]
+            candidate_scores = defined_prior_scores[candidate_mask]
+            lower = candidate_indices[
+                (candidate_scores < target)
+                & (candidate_scores >= max(0.0, target - state.rank_anchor_delta))
+            ]
+            upper = candidate_indices[
+                (candidate_scores > target)
+                & (candidate_scores <= min(1.0, target + state.rank_anchor_delta))
+            ]
             if lower.size == 0:
-                lower = all_indices[(prior_scores < target) & (all_indices != image_idx)]
+                lower = candidate_indices[candidate_scores < target]
             if upper.size == 0:
-                upper = all_indices[(prior_scores > target) & (all_indices != image_idx)]
+                upper = candidate_indices[candidate_scores > target]
             if lower.size > 0:
                 lower = lower[np.argsort(np.abs(prior_scores[lower] - target), kind='mergesort')[: state.rank_anchor_k]]
                 for loser in lower.tolist():
@@ -1678,6 +2008,8 @@ class AxisBayesEngine:
         mode_name = _normalize_mode(state.mode)
         if state.model_type == 'piecewise_linear':
             scoring_method = 'piecewise_linear_ranker'
+        elif state.model_type == 'residual':
+            scoring_method = 'bayesian_smooth_residual'
         elif mode_name == 'graph':
             scoring_method = 'bayesian_graph_field'
         elif mode_name == 'rank':
@@ -1709,6 +2041,7 @@ class AxisBayesEngine:
                 'posterior_projection_min': float(np.min(z)) if z.size > 0 else 0.0,
                 'posterior_projection_max': float(np.max(z)) if z.size > 0 else 0.0,
                 'feature_space': str(state.feature_space),
+                'semantic_method': str(state.semantic_method),
                 'clip_dim': int(state.clip_dim),
                 'dino_dim': int(state.dino_dim),
                 'clip_scale': float(state.clip_scale),
@@ -1718,6 +2051,11 @@ class AxisBayesEngine:
                 'piecewise_num_experts': int(state.piecewise_num_experts),
                 'piecewise_use_gating': bool(state.piecewise_use_gating),
                 'piecewise_aggregator': str(state.piecewise_aggregator),
+                'residual_alpha': float(state.residual_alpha),
+                'residual_beta': float(state.residual_beta),
+                'residual_lambda': float(state.residual_lambda),
+                'residual_sigma_y': float(state.residual_sigma_y),
+                'residual_lengthscale': float(state.residual_lengthscale),
                 'graph_knn_k': int(state.graph_knn_k),
                 'graph_lambda_smooth': float(state.graph_lambda_smooth),
                 'graph_lambda_prior': float(state.graph_lambda_prior),
@@ -1727,6 +2065,13 @@ class AxisBayesEngine:
             'dino_alpha': float(state.dino_alpha),
             'bias_alpha': float(state.bias_alpha),
             'sigma2': float(state.sigma2),
+            'residual_alpha': float(state.residual_alpha),
+            'residual_beta': float(state.residual_beta),
+            'residual_lambda': float(state.residual_lambda),
+            'residual_sigma_y': float(state.residual_sigma_y),
+            'residual_lengthscale_multiplier': float(state.residual_lengthscale_multiplier),
+            'residual_lengthscale': float(state.residual_lengthscale),
+            'residual_jitter': float(state.residual_jitter),
             'piecewise_num_experts': int(state.piecewise_num_experts),
             'piecewise_use_gating': bool(state.piecewise_use_gating),
             'piecewise_aggregator': str(state.piecewise_aggregator),
@@ -1758,6 +2103,7 @@ class AxisBayesEngine:
                 'scoring_method': scoring_method,
                 'model_type': str(state.model_type),
                 'feature_space': str(state.feature_space),
+                'semantic_method': str(state.semantic_method),
                 'labels': [
                     _format_axis_value(z_min),
                     _format_axis_value(z_min + (0.5 * z_span)),
@@ -1785,9 +2131,12 @@ class AxisBayesEngine:
             mode_name = 'rank'
         if mode_name == 'graph':
             coll = self._ensure_graph_prior(coll)
-        w0_clip, pos_prompts, neg_prompts, prompt_meta = self._embed_prompt_ensemble(query)
+        w0_clip, pos_prompts, neg_prompts, prompt_meta = self._embed_prompt_ensemble(
+            query,
+            semantic_method=coll.semantic_method,
+        )
         if int(w0_clip.shape[0]) != int(coll.clip_dim):
-            raise ValueError(f'CLIP text/image dim mismatch: text={w0_clip.shape[0]} image_clip={coll.clip_dim}')
+            raise ValueError(f'Semantic text/image dim mismatch: text={w0_clip.shape[0]} image_semantic={coll.clip_dim}')
         if coll.dino_dim > 0:
             w0 = np.concatenate(
                 [
@@ -1798,7 +2147,17 @@ class AxisBayesEngine:
             ).astype(np.float32)
         else:
             w0 = w0_clip.astype(np.float32)
-        z0_all = (coll.embeddings @ w0).astype(np.float32)
+        if model_name == 'residual':
+            if coll.feature_space == 'clip_dino':
+                clip_raw = coll.embeddings[:, : coll.clip_dim] / max(1e-8, float(coll.clip_scale))
+            else:
+                clip_raw = coll.embeddings[:, : coll.clip_dim]
+            z0_all = (
+                (float(self.residual_alpha) * _rank_percentile_01(clip_raw @ w0[: coll.clip_dim]))
+                + float(self.residual_beta)
+            ).astype(np.float32)
+        else:
+            z0_all = (coll.embeddings @ w0).astype(np.float32)
         z0_sorted = np.sort(z0_all).astype(np.float32)
         alpha_vec = np.concatenate(
             [
@@ -1828,6 +2187,7 @@ class AxisBayesEngine:
             prompt_provider=str(prompt_meta.get('provider') or 'unknown'),
             mode=mode_name,
             feature_space=coll.feature_space,
+            semantic_method=coll.semantic_method,
             clip_dim=int(coll.clip_dim),
             dino_dim=int(coll.dino_dim),
             clip_scale=float(coll.clip_scale),
@@ -1864,6 +2224,13 @@ class AxisBayesEngine:
             piecewise_l2_reg=float(self.piecewise_l2_reg),
             piecewise_learning_rate=float(self.piecewise_learning_rate),
             piecewise_max_refine_steps=int(self.piecewise_max_refine_steps),
+            residual_alpha=float(self.residual_alpha),
+            residual_beta=float(self.residual_beta),
+            residual_lambda=float(self.residual_lambda),
+            residual_sigma_y=float(self.residual_sigma_y),
+            residual_lengthscale_multiplier=float(self.residual_lengthscale_multiplier),
+            residual_lengthscale=0.0,
+            residual_jitter=float(self.residual_jitter),
         )
         self._scorer_for_state(state).initialize_state(self, state)
         self._axes[axis_id] = state
@@ -1874,6 +2241,126 @@ class AxisBayesEngine:
             query,
             mode_name,
             model_name,
+        )
+        return self._state_payload(state)
+
+    def _rebuild_rank_pairs_from_feedback(self, state: AxisBayesState) -> None:
+        state.pair_i = []
+        state.pair_j = []
+        state.pair_y = []
+        state.pair_w = []
+        state.pair_D = np.zeros((0, state.image_embeddings.shape[1]), dtype=np.float32)
+        state.pair_W_diag = np.zeros((0,), dtype=np.float32)
+        state.pair_M_inv = np.zeros((0, 0), dtype=np.float32)
+        for image_id in list(state.move_order):
+            if image_id not in state.id_to_index:
+                continue
+            if image_id in self._undefined_id_set(state):
+                continue
+            self._append_rank_pairs_from_move(
+                state=state,
+                image_idx=int(state.id_to_index[image_id]),
+                target_p01=float(state.move_targets.get(image_id, 0.5)),
+            )
+
+    def _reset_state_for_new_prior(self, state: AxisBayesState) -> None:
+        n = int(len(state.ids))
+        d = int(state.image_embeddings.shape[1]) if state.image_embeddings.ndim == 2 else 0
+        state.b0 = 0.0
+        if state.model_type == 'residual':
+            self._refresh_residual_prior(state)
+        else:
+            state.z0_all = np.asarray(state.image_embeddings @ state.w0, dtype=np.float32)
+        state.z0_sorted = np.sort(state.z0_all).astype(np.float32)
+        state.X = np.zeros((0, d), dtype=np.float32)
+        state.y = np.zeros((0,), dtype=np.float32)
+        state.A_inv = np.zeros((0, 0), dtype=np.float32)
+        state.mu = np.asarray(state.w0, dtype=np.float32).copy()
+        state.b = 0.0
+        state.pair_D = np.zeros((0, d), dtype=np.float32)
+        state.pair_W_diag = np.zeros((0,), dtype=np.float32)
+        state.pair_M_inv = np.zeros((0, 0), dtype=np.float32)
+        state.graph_posterior_mean = np.asarray(state.z0_all, dtype=np.float32).copy()
+        if state.graph_prior_cov_diag.size == n:
+            state.graph_posterior_cov_diag = np.asarray(state.graph_prior_cov_diag, dtype=np.float32).copy()
+        else:
+            state.graph_posterior_cov_diag = np.zeros((n,), dtype=np.float32)
+        state.graph_obs_indices = []
+        state.graph_obs_var = np.zeros((0,), dtype=np.float32)
+        state.graph_obs_S_inv = np.zeros((0, 0), dtype=np.float32)
+        if state.model_type == 'residual':
+            state.residual_features = self._build_residual_feature_matrix(state)
+            state.residual_external_features = np.zeros((0, 0), dtype=np.float32)
+            state.residual_external_targets = np.zeros((0,), dtype=np.float32)
+            state.residual_external_weights = np.zeros((0,), dtype=np.float32)
+            state.residual_posterior_mean = np.asarray(state.z0_all, dtype=np.float32).copy()
+            state.residual_posterior_std = np.full((n,), float(max(1e-6, state.residual_lambda)), dtype=np.float32)
+            state.residual_last_fit_signature = ''
+            return
+        if state.model_type == 'piecewise_linear':
+            state.piecewise_features = self._build_piecewise_feature_matrix(state)
+            state.piecewise_prior_vector = self._build_piecewise_prior_vector(state)
+            state.piecewise_expert_weights = np.zeros((0, 0), dtype=np.float32)
+            state.piecewise_gate_weights = np.zeros((0, 0), dtype=np.float32)
+            state.piecewise_gate_bias = np.zeros((0,), dtype=np.float32)
+            state.piecewise_scores_all = np.zeros((n,), dtype=np.float32)
+            state.piecewise_expert_scores_all = np.zeros((n, 0), dtype=np.float32)
+            state.piecewise_uncertainty_all = np.zeros((n,), dtype=np.float32)
+            state.piecewise_pair_i = []
+            state.piecewise_pair_j = []
+            state.piecewise_pair_w = []
+            state.piecewise_last_fit_signature = ''
+            return
+        if _normalize_mode(state.mode) == 'rank':
+            self._rebuild_rank_pairs_from_feedback(state)
+        else:
+            state.pair_i = []
+            state.pair_j = []
+            state.pair_y = []
+            state.pair_w = []
+
+    def update_axis_prompts(
+        self,
+        axis_id: str,
+        pos_prompts: Any,
+        neg_prompts: Any,
+    ) -> Dict[str, Any]:
+        state = self._axes.get(str(axis_id or '').strip())
+        if state is None:
+            raise KeyError(f'Unknown axis_id: {axis_id}')
+        w0_clip, pos_list, neg_list, prompt_meta = self._embed_prompt_lists(
+            pos_prompts,
+            neg_prompts,
+            semantic_method=state.semantic_method,
+            source='manual_edit',
+            provider='user_edit',
+        )
+        if int(w0_clip.shape[0]) != int(state.clip_dim):
+            raise ValueError(f'Semantic text/image dim mismatch: text={w0_clip.shape[0]} image_semantic={state.clip_dim}')
+        if int(state.dino_dim) > 0:
+            w0 = np.concatenate(
+                [
+                    np.asarray(w0_clip, dtype=np.float32),
+                    np.zeros((state.dino_dim,), dtype=np.float32),
+                ],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            w0 = np.asarray(w0_clip, dtype=np.float32)
+        state.w0 = np.asarray(w0, dtype=np.float32)
+        state.pos_prompt_ensemble = list(pos_list)
+        state.neg_prompt_ensemble = list(neg_list)
+        state.prompt_ensemble = list(pos_list) + list(neg_list)
+        state.prompt_source = str(prompt_meta.get('source') or 'manual_edit')
+        state.prompt_provider = str(prompt_meta.get('provider') or 'user_edit')
+        self._reset_state_for_new_prior(state)
+        self._log(
+            'axis prompt update axis_id=%s pos_count=%d neg_count=%d model_type=%s mode=%s',
+            state.axis_id,
+            len(state.pos_prompt_ensemble),
+            len(state.neg_prompt_ensemble),
+            state.model_type,
+            state.mode,
         )
         return self._state_payload(state)
 
@@ -1961,6 +2448,7 @@ class AxisBayesEngine:
             'prompt_source': str(state.prompt_source),
             'prompt_provider': str(state.prompt_provider),
             'feature_space': str(state.feature_space),
+            'semantic_method': str(state.semantic_method),
             'clip_dim': int(state.clip_dim),
             'dino_dim': int(state.dino_dim),
             'clip_scale': float(state.clip_scale),
@@ -1999,6 +2487,13 @@ class AxisBayesEngine:
             'piecewise_l2_reg': float(state.piecewise_l2_reg),
             'piecewise_learning_rate': float(state.piecewise_learning_rate),
             'piecewise_max_refine_steps': int(state.piecewise_max_refine_steps),
+            'residual_alpha': float(state.residual_alpha),
+            'residual_beta': float(state.residual_beta),
+            'residual_lambda': float(state.residual_lambda),
+            'residual_sigma_y': float(state.residual_sigma_y),
+            'residual_lengthscale_multiplier': float(state.residual_lengthscale_multiplier),
+            'residual_lengthscale': float(state.residual_lengthscale),
+            'residual_jitter': float(state.residual_jitter),
             'scorer_state': scorer.export_state(state),
         }
 
@@ -2064,6 +2559,13 @@ class AxisBayesEngine:
             'piecewise_l2_reg': float(state.piecewise_l2_reg),
             'piecewise_learning_rate': float(state.piecewise_learning_rate),
             'piecewise_max_refine_steps': int(state.piecewise_max_refine_steps),
+            'residual_alpha': float(state.residual_alpha),
+            'residual_beta': float(state.residual_beta),
+            'residual_lambda': float(state.residual_lambda),
+            'residual_sigma_y': float(state.residual_sigma_y),
+            'residual_lengthscale_multiplier': float(state.residual_lengthscale_multiplier),
+            'residual_lengthscale': float(state.residual_lengthscale),
+            'residual_jitter': float(state.residual_jitter),
         }
 
         if state.model_type == 'piecewise_linear':
@@ -2071,6 +2573,13 @@ class AxisBayesEngine:
                 'piecewise_expert_weights': np.asarray(state.piecewise_expert_weights, dtype=np.float32).tolist(),
                 'piecewise_gate_weights': np.asarray(state.piecewise_gate_weights, dtype=np.float32).tolist(),
                 'piecewise_gate_bias': np.asarray(state.piecewise_gate_bias, dtype=np.float32).tolist(),
+            }
+        elif state.model_type == 'residual':
+            support_features, support_targets, support_weights = self._build_residual_support_data(state)
+            base['scorer_state'] = {
+                'residual_external_features': np.asarray(support_features, dtype=np.float32).tolist(),
+                'residual_external_targets': np.asarray(support_targets, dtype=np.float32).tolist(),
+                'residual_external_weights': np.asarray(support_weights, dtype=np.float32).tolist(),
             }
         else:
             base['scorer_state'] = {
@@ -2113,6 +2622,7 @@ class AxisBayesEngine:
             prompt_provider=str(payload.get('prompt_provider') or 'unknown'),
             mode=_normalize_mode(payload.get('mode') or self.mode),
             feature_space=str(payload.get('feature_space') or self.feature_space),
+            semantic_method=_normalize_semantic_method(payload.get('semantic_method') or self.semantic_method),
             clip_dim=int(payload.get('clip_dim') or 0),
             dino_dim=int(payload.get('dino_dim') or 0),
             clip_scale=float(payload.get('clip_scale') or self.clip_scale),
@@ -2151,6 +2661,15 @@ class AxisBayesEngine:
             piecewise_l2_reg=float(payload.get('piecewise_l2_reg') or self.piecewise_l2_reg),
             piecewise_learning_rate=float(payload.get('piecewise_learning_rate') or self.piecewise_learning_rate),
             piecewise_max_refine_steps=int(payload.get('piecewise_max_refine_steps') or self.piecewise_max_refine_steps),
+            residual_alpha=float(payload.get('residual_alpha') or self.residual_alpha),
+            residual_beta=float(payload.get('residual_beta') or self.residual_beta),
+            residual_lambda=float(payload.get('residual_lambda') or self.residual_lambda),
+            residual_sigma_y=float(payload.get('residual_sigma_y') or self.residual_sigma_y),
+            residual_lengthscale_multiplier=float(
+                payload.get('residual_lengthscale_multiplier') or self.residual_lengthscale_multiplier
+            ),
+            residual_lengthscale=float(payload.get('residual_lengthscale') or 0.0),
+            residual_jitter=float(payload.get('residual_jitter') or self.residual_jitter),
         )
         scorer = self._scorer_for_state(state)
         scorer.import_state(state, payload.get('scorer_state') or {})
@@ -2241,6 +2760,7 @@ class AxisBayesEngine:
             prompt_provider=str(payload.get('prompt_provider') or 'unknown'),
             mode=mode_name,
             feature_space=str(payload.get('feature_space') or coll.feature_space),
+            semantic_method=_normalize_semantic_method(payload.get('semantic_method') or coll.semantic_method),
             clip_dim=int(payload.get('clip_dim') or coll.clip_dim),
             dino_dim=int(payload.get('dino_dim') or coll.dino_dim),
             clip_scale=float(payload.get('clip_scale') or coll.clip_scale),
@@ -2284,6 +2804,15 @@ class AxisBayesEngine:
             piecewise_l2_reg=float(payload.get('piecewise_l2_reg') or self.piecewise_l2_reg),
             piecewise_learning_rate=float(payload.get('piecewise_learning_rate') or self.piecewise_learning_rate),
             piecewise_max_refine_steps=int(payload.get('piecewise_max_refine_steps') or self.piecewise_max_refine_steps),
+            residual_alpha=float(payload.get('residual_alpha') or self.residual_alpha),
+            residual_beta=float(payload.get('residual_beta') or self.residual_beta),
+            residual_lambda=float(payload.get('residual_lambda') or self.residual_lambda),
+            residual_sigma_y=float(payload.get('residual_sigma_y') or self.residual_sigma_y),
+            residual_lengthscale_multiplier=float(
+                payload.get('residual_lengthscale_multiplier') or self.residual_lengthscale_multiplier
+            ),
+            residual_lengthscale=float(payload.get('residual_lengthscale') or 0.0),
+            residual_jitter=float(payload.get('residual_jitter') or self.residual_jitter),
         )
 
         if model_type == 'piecewise_linear':
@@ -2311,6 +2840,11 @@ class AxisBayesEngine:
             state.piecewise_last_fit_signature = ''
             state.z0_all = np.asarray(state.piecewise_scores_all, dtype=np.float32).copy()
             state.z0_sorted = np.sort(state.z0_all).astype(np.float32)
+        elif model_type == 'residual':
+            residual_scorer = self._scorers['residual']
+            residual_scorer.import_state(state, scorer_state)
+            residual_scorer.initialize_state(self, state)
+            state.residual_last_fit_signature = ''
         else:
             mu = np.asarray(scorer_state.get('mu') or [], dtype=np.float32)
             if mu.size == 0:

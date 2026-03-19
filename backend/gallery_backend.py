@@ -24,10 +24,22 @@ import numpy as np
 from PIL import Image
 
 try:
-    from .embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
+    from .embeddings import (
+        DEFAULT_SEMANTIC_EMBED_METHOD,
+        SUPPORTED_FORMATS,
+        ImageEntry,
+        EmbeddingEngine,
+        normalize_multimodal_method,
+    )
     from . import layout as layout_utils
 except ImportError:
-    from embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
+    from embeddings import (
+        DEFAULT_SEMANTIC_EMBED_METHOD,
+        SUPPORTED_FORMATS,
+        ImageEntry,
+        EmbeddingEngine,
+        normalize_multimodal_method,
+    )
     import layout as layout_utils
 
 class ImageGalleryEngine:
@@ -43,7 +55,7 @@ class ImageGalleryEngine:
     def list_images(self) -> List[ImageEntry]:
         return self.emb.list_images()
 
-    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = "color_rgb", resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
+    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = DEFAULT_SEMANTIC_EMBED_METHOD, resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
         return self.emb.estimate_embeddings(images, method=method, resize=resize)
 
     # Embedding extraction implementations moved to embeddings. No local copies here.
@@ -58,7 +70,7 @@ class ImageGalleryEngine:
         return layout_utils.pack_to_grid(coords01, n_layer=n_layer, n_tile=n_tile, filter_fn=filter_fn)
 
     def build_gallery(self, n_layer: int = 64, n_tile: int = 8,
-                      method: str = "pca", embed_method: str = "color_rgb") -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
+                      method: str = "pca", embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD) -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
         """End-to-end pipeline returning entries, reduced coords, and packed coords.
 
         Embeddings and PCA coordinates are cached per dataset and model.
@@ -73,8 +85,9 @@ class ImageGalleryEngine:
         return self.emb._cache_dir()
 
     def _load_or_compute_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
+        cache_method = normalize_multimodal_method(method)
         # Try fast-path: plain embeddings npz without path metadata (e.g., dift_sd_partXY)
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
         if cache.exists():
             try:
                 data = np.load(cache, allow_pickle=False)
@@ -91,7 +104,7 @@ class ImageGalleryEngine:
                 # Fall through to normal path
                 print(f"[emb] failed to load minimal cache: {cache.name}")
         # Normal cached format with path+mtime checks
-        print(f"[emb] probing cache (full) embeddings_{method.lower()}.npz with paths/mtimes")
+        print(f"[emb] probing cache (full) embeddings_{cache_method}.npz with paths/mtimes")
         embs = self.emb.load_embeddings_only(entries, method=method)
         if embs is not None:
             print(f"[emb] loaded full cache shape={tuple(embs.shape)}")
@@ -105,7 +118,8 @@ class ImageGalleryEngine:
         Minimal: npz with only an embeddings array (any key, prefers 'embeddings').
         Full: npz with paths/mtimes + embeddings; validates against current dataset.
         """
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache_method = normalize_multimodal_method(method)
+        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
         if not cache.exists():
             print(f"[emb] cache file not found: {cache}")
             return None
@@ -167,7 +181,8 @@ class ImageGalleryEngine:
         cached_coords = self._load_cached_coords(entries, method=method)
         if red_method.lower() == 'pca' and cached_coords is not None:
             return cached_coords
-        cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
+        cache_method = normalize_multimodal_method(method)
+        cache = self._cache_dir() / f'coords_pca2d_{cache_method}.npz'
         print(f"[coords] computing coords method={red_method} for embs shape={tuple(embs.shape)}")
         coords2d = self.reduce_to_2d(embs, method=red_method)
         if red_method.lower() == 'pca':
@@ -183,7 +198,8 @@ class ImageGalleryEngine:
 
     def _load_cached_coords(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
         # Always cache PCA coordinates as primary.
-        cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
+        cache_method = normalize_multimodal_method(method)
+        cache = self._cache_dir() / f'coords_pca2d_{cache_method}.npz'
         current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
         current_names = np.array([Path(e.path).name for e in entries])
         if not cache.exists():
@@ -215,7 +231,7 @@ class ImageGalleryEngine:
 
     def export_gallery_json(self, out_path: str, base_url: Optional[str] = None,
                              n_layer: int = 64, n_tile: int = 8,
-                             method: str = "umap", embed_method: str = "color_rgb") -> str:
+                             method: str = "umap", embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD) -> str:
         """Generate a JSON file with image metadata and coordinates.
 
         - base_url: optional URL prefix to serve images (e.g., '/images')
@@ -247,7 +263,7 @@ class ImageGalleryEngine:
         return out_path
 
     def build_gallery_from_precomputed(self, n_layer: int = 64, n_tile: int = 8,
-                                       method: str = "pca", embed_method: str = "color_rgb"):
+                                       method: str = "pca", embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD):
         """Build gallery using ONLY precomputed embeddings.
 
         Loads cached embeddings; if unavailable returns (None, None, None, 0).
@@ -353,11 +369,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_tile", type=int, default=8)
     parser.add_argument("--method", type=str, default="pca", help="'umap' or 'pca'")
     parser.add_argument("--base_url", type=str, default=None, help="Optional URL prefix for images")
-    parser.add_argument("--embed", type=str, default="color_rgb", help="Embedding method: 'color_rgb', 'clip', 'dino', 'sd'")
+    parser.add_argument("--embed", type=str, default=DEFAULT_SEMANTIC_EMBED_METHOD, help="Embedding method: 'siglip2', 'color_rgb', 'clip', 'dino', 'sd'")
     # Standalone export-all
     parser.add_argument("--export_all_dir", type=str, default=None, help="Output folder for standalone dataset (copies images and writes gallery_*.json)")
-    parser.add_argument("--methods", type=str, default="color_rgb,clip,dino,dift_sd", help="Comma-separated embedding methods to export")
-    parser.add_argument("--default_method", type=str, default="color_rgb", help="Default method for gallery.json link")
+    parser.add_argument("--methods", type=str, default=f"color_rgb,{DEFAULT_SEMANTIC_EMBED_METHOD},clip,dino,dift_sd", help="Comma-separated embedding methods to export")
+    parser.add_argument("--default_method", type=str, default=DEFAULT_SEMANTIC_EMBED_METHOD, help="Default method for gallery.json link")
     args = parser.parse_args()
 
     if args.export_all_dir:

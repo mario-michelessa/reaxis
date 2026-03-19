@@ -1,69 +1,95 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-from typing import List
+
+import argparse
 from pathlib import Path
-from embeddings import EmbeddingEngine
+from typing import List
+
+try:
+    from .import_curated_dataset import DEFAULT_REDUCTION, parse_methods, precompute_dataset
+    from .embeddings import normalize_multimodal_method
+except ImportError:
+    from import_curated_dataset import DEFAULT_REDUCTION, parse_methods, precompute_dataset
+    from embeddings import normalize_multimodal_method
 
 
-# DEFAULT_METHODS = ["color_rgb","color_hsv", "color_lch"]
-# DEFAULT_METHODS = ["dift_sd", ]
-DEFAULT_METHODS = ["color_rgb","color_hsv", "color_lch", "clip", "dino", "dift_sd", ]
-# DEFAULT_METHODS = ["dino"]
-DATASETS_DIR = Path(__file__).parent.parent / "data" / "datasets"
-
-def precompute(dataset: str, methods: List[str]) -> None:
-    engine = EmbeddingEngine(dataset)
-    entries = engine.list_images()
-    if not entries:
-        print(f"No images found under: {dataset}")
-        return
-    print(f"Found {len(entries)} images. Precomputing embeddings for: {methods}")
-    ok = []
-    fail = []
-    for m in methods:
-        print(f"-> {m} ...", end="", flush=True)
-        embs = engine.estimate_embeddings(entries, method=m)
-        # Persist via the same cache path the server expects
-        import numpy as np
-        paths = np.array([e.path for e in entries])
-        mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
-        
-        if m == 'dift_sd':
-            n_parts = embs.shape[2]
-            for i in range(n_parts):
-                for j in range(n_parts):
-                    cache = engine._cache_dir() / f"embeddings_{m.lower()}_part{i}{j}.npz"
-                    np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs[:,:,i,j])
-        else:
-            cache = engine._cache_dir() / f"embeddings_{m.lower()}.npz"
-            np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
-        print(" done")
-        ok.append(m)
-
-    print()
-    print(f"Completed. OK={ok}")
-    if fail:
-        print("Failures:")
-        for m, err in fail:
-            print(f"  - {m}: {err}")
+DEFAULT_METHODS = ["siglip2"]
+DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
 
 
-def main():
-    # for dataset in DATASETS_DIR.iterdir():
-    for dataset in ['../data/datasets/ISIC2020']:
-        dataset = Path(dataset)
-        # if dataset.name in ['VIS30K', 'ImageNet_R', 'ImageNet']:
-        #     print(f"Skipping dataset: {dataset}")
-        #     continue
+def resolve_datasets(raw_datasets: List[str]) -> List[Path]:
+    if raw_datasets:
+        return [Path(dataset).resolve() for dataset in raw_datasets]
+    return sorted(path.resolve() for path in DATASETS_DIR.iterdir() if path.is_dir())
+
+
+def missing_methods(dataset: Path, methods: List[str]) -> List[str]:
+    cache_dir = dataset / ".cache"
+    missing: List[str] = []
+    for method in methods:
+        cache_method = normalize_multimodal_method(method)
+        emb_cache = cache_dir / f"embeddings_{cache_method}.npz"
+        coords_cache = cache_dir / f"coords_pca2d_{cache_method}.npz"
+        if not emb_cache.exists() or not coords_cache.exists():
+            missing.append(cache_method)
+    return missing
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Precompute embedding and PCA caches for existing prepared datasets."
+    )
+    parser.add_argument(
+        "datasets",
+        nargs="*",
+        help="Prepared dataset directories. Defaults to every directory under data/datasets.",
+    )
+    parser.add_argument(
+        "--methods",
+        default=",".join(DEFAULT_METHODS),
+        help="Comma-separated embedding methods to precompute.",
+    )
+    parser.add_argument(
+        "--reduction",
+        default=DEFAULT_REDUCTION,
+        help="2D reduction method for cached coordinates (default: pca).",
+    )
+    parser.add_argument(
+        "--include-complete",
+        action="store_true",
+        help="Process datasets even when all requested caches already exist.",
+    )
+    args = parser.parse_args()
+
+    methods = parse_methods(args.methods)
+    datasets = resolve_datasets(list(args.datasets))
+    if not datasets:
+        raise RuntimeError(f"No datasets found under {DATASETS_DIR}")
+
+    queued: List[Path] = []
+    for dataset in datasets:
         if not dataset.is_dir():
+            raise FileNotFoundError(f"Dataset path not found: {dataset}")
+        missing = missing_methods(dataset, methods)
+        if missing or args.include_complete:
+            if missing:
+                print(f"Queue: {dataset} missing={missing}")
+            else:
+                print(f"Queue: {dataset} already complete for {methods}")
+            queued.append(dataset)
             continue
-        print(f"Dataset: {dataset.name}")
-        try :
-            precompute(dataset, DEFAULT_METHODS)
-        except Exception as e:
-            print(f"Error processing dataset {dataset.name}: {e}")
+        print(f"Skip: {dataset} already has {methods}")
+
+    if not queued:
+        print("Nothing to do.")
+        return
+
+    for dataset in queued:
+        print(f"Dataset: {dataset}")
+        precompute_dataset(dataset_root=dataset, methods=methods, reduction=args.reduction)
     print("All done.")
+
 
 if __name__ == "__main__":
     main()
