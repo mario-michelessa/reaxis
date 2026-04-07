@@ -2,16 +2,21 @@
   import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte'
   import AxisBuilder from './AxisBuilder.svelte'
   import MaterialIcon from './MaterialIcon.svelte'
+  import { buildApiUrl, resolveApiBase } from '../lib/apiBase'
   import { axisBuildersStore } from '../lib/axisBuilderStore'
-  import { selectRepresentativeImageIds } from '../lib/representativeImages'
+  import { axisPayloadFromSession, axisSessionFromResponse } from '../lib/axisSessions'
 
   export let axes = []
   export let items = []
   export let selectedX = null
   export let selectedY = null
-  export let apiBase = 'http://127.0.0.1:5002'
+  export let apiBase = resolveApiBase()
   export let dataset = ''
   export let externalSlices = []
+  export let subsetIds = []
+  export let subsetActive = false
+  export let axisDebugEmbeddingOption = 'siglip2_raw'
+  export let axisDebugPriorMode = 'rank'
 
   const dispatch = createEventDispatcher()
 
@@ -43,7 +48,6 @@
 
   $: axisById = new Map((axes || []).map((axis) => [axis.id, axis]))
   $: itemById = new Map((items || []).map((item) => [String(item?.id || ''), item]).filter((row) => row[0]))
-  $: datasetRepresentativeImageIds = selectRepresentativeImageIds(items, 10)
   $: selectedChips = Array.isArray(attributeChips) ? attributeChips.filter((chip) => chip?.selected) : []
   $: selectedChipCount = selectedChips.length
   $: hoveredExplainChip = Array.isArray(attributeChips)
@@ -72,6 +76,14 @@
         group: axis.group || '',
       }))
     : []
+
+  function axisDebugRequest() {
+    const raw = String(axisDebugEmbeddingOption || 'siglip2_raw').trim().toLowerCase()
+    if (raw === 'clip') return { semanticMethod: 'clip', norm: true }
+    if (raw === 'clip_raw') return { semanticMethod: 'clip', norm: false }
+    if (raw === 'siglip2') return { semanticMethod: 'siglip2', norm: true }
+    return { semanticMethod: 'siglip2', norm: false }
+  }
   function normalizedSliceArray(raw) {
     if (!Array.isArray(raw)) return []
     const out = []
@@ -153,6 +165,15 @@
     const id = String(axisId || '').trim()
     if (!id) return
     dispatch('removeAxis', { id })
+  }
+
+  function emitLog(action, detail = 'none') {
+    const actionText = String(action || '').trim()
+    if (!actionText) return
+    dispatch('logAction', {
+      action: actionText,
+      detail: String(detail || '').trim() || 'none',
+    })
   }
 
   function applyAxisX(proposal) {
@@ -368,14 +389,17 @@
   }
 
   function apiUrl(path) {
-    const base = String(apiBase || '').trim().replace(/\/+$/, '')
-    return `${base}${path}`
+    return buildApiUrl(apiBase, path)
   }
 
   function capitalizeLeading(value) {
     const text = String(value || '').trim()
     if (!text) return ''
     return `${text.charAt(0).toUpperCase()}${text.slice(1)}`
+  }
+
+  function normalizeAxisQuery(value) {
+    return capitalizeLeading(value)
   }
 
   function toggleAttributeChip(chipId) {
@@ -388,61 +412,6 @@
         customName: capitalizeLeading(String(chip.customName || chip.name || '').trim()),
       }
     })
-  }
-
-  function renameAttributeChip(chipId, value) {
-    const nextValue = String(value || '')
-    attributeChips = (attributeChips || []).map((chip) => {
-      if (chip?.id !== chipId) return chip
-      return { ...chip, customName: nextValue }
-    })
-  }
-
-  function startAttributeChipEdit(chipId) {
-    attributeChips = (attributeChips || []).map((chip) => {
-      if (chip?.id !== chipId) return { ...chip, editing: false }
-      return {
-        ...chip,
-        editing: true,
-        customName: String(chip.customName || chip.name || '').trim(),
-        editBackup: String(chip.customName || chip.name || '').trim(),
-      }
-    })
-  }
-
-  function finishAttributeChipEdit(chipId) {
-    attributeChips = (attributeChips || []).map((chip) => {
-      if (chip?.id !== chipId) return chip
-      const nextName = capitalizeLeading(String(chip.customName || chip.name || '').trim() || String(chip.name || '').trim())
-      return {
-        ...chip,
-        editing: false,
-        customName: nextName,
-        editBackup: '',
-      }
-    })
-  }
-
-  function cancelAttributeChipEdit(chipId) {
-    attributeChips = (attributeChips || []).map((chip) => {
-      if (chip?.id !== chipId) return chip
-      return {
-        ...chip,
-        editing: false,
-        customName: capitalizeLeading(String(chip.editBackup || chip.customName || chip.name || '').trim() || String(chip.name || '').trim()),
-        editBackup: '',
-      }
-    })
-  }
-
-  function onAttributeChipKeydown(chipId, e) {
-    if (e.key === 'Enter') {
-      try { e.preventDefault() } catch (_) {}
-      finishAttributeChipEdit(chipId)
-    } else if (e.key === 'Escape') {
-      try { e.preventDefault() } catch (_) {}
-      cancelAttributeChipEdit(chipId)
-    }
   }
 
   function clearPromptWorkflow() {
@@ -755,34 +724,12 @@
     return res.json()
   }
 
-  function sessionFromAxisResponse(chip, data) {
-    const axis = data?.axis
-    if (!axis?.id || !axis?.coords) return null
-    return {
-      axisId: axis.id,
-      q: String(chip?.customName || chip?.name || data?.q || axis?.name || '').trim(),
-      axis: {
-        ...axis,
-        name: String(chip?.customName || chip?.name || axis?.name || '').trim() || axis.name,
-      },
-      ids: Array.isArray(data?.ids) ? data.ids.map((v) => String(v || '').trim()) : [],
-      projectionValues: Array.isArray(data?.projection_values) ? data.projection_values.map((v) => Number(v) || 0) : [],
-      projectionMin: Number(data?.projection_min || 0),
-      projectionMax: Number(data?.projection_max || 0),
-      scores: Array.isArray(data?.scores) ? data.scores.map((v) => Number(v) || 0) : [],
-      std: Array.isArray(data?.std) ? data.std.map((v) => Number(v) || 0) : [],
-      decileExemplars: Array.isArray(data?.decile_exemplars) ? data.decile_exemplars : [],
-      hotspots: Array.isArray(data?.hotspots) ? data.hotspots : [],
-      moveCount: Number(data?.move_count || 0),
-      maxMoves: Number(data?.max_moves || 0),
-      moves: Array.isArray(data?.moves) ? data.moves : [],
-      undefinedIds: Array.isArray(data?.undefined_ids) ? data.undefined_ids.map((v) => String(v || '').trim()).filter(Boolean) : [],
-      w0Summary: data?.w0_summary || {},
-      moveHistory: Array.isArray(chip?.moveHistory) ? chip.moveHistory : [],
-    }
-  }
-
   function currentSubsetIds() {
+    if (subsetActive) {
+      return Array.isArray(subsetIds)
+        ? subsetIds.map((id) => String(id || '').trim()).filter(Boolean)
+        : []
+    }
     const normalized = normalizedSliceArray(activeSlices)
       .map((slice) => ({
         ...slice,
@@ -810,8 +757,13 @@
     errorMsg = ''
     recommendationInfo = ''
     recommendations = []
+    const effectiveSubsetIds = currentSubsetIds()
     if (!Array.isArray(candidateAxes) || candidateAxes.length < 2) {
       errorMsg = 'Need at least two axes before requesting recommendations.'
+      return
+    }
+    if (subsetActive && effectiveSubsetIds.length === 0) {
+      errorMsg = 'Current subset is empty.'
       return
     }
     recommendingScatterplots = true
@@ -819,7 +771,7 @@
       const data = await postJson('/analysis/recommend_scatterplots', {
         dataset: dataset || undefined,
         axes: candidateAxes,
-        subset_ids: currentSubsetIds(),
+        subset_ids: effectiveSubsetIds,
         top_k: 10,
         min_overlap: 24,
         k_neighbors: 12,
@@ -866,8 +818,6 @@
         type,
         selected: false,
         customName: name,
-        editing: false,
-        editBackup: '',
         supportPhrases: Array.isArray(entry?.support_phrases) ? entry.support_phrases.map((v) => String(v || '').trim()).filter(Boolean) : [],
         supportSpans: normalizeSupportSpans(entry?.support_spans),
       })
@@ -944,6 +894,7 @@
 
     extracting = true
     try {
+      emitLog('suggest axes', prompt)
       const extraction = await postJson('/llm/extract_attributes', {
         prompt,
         dataset: dataset || undefined,
@@ -956,7 +907,7 @@
       attributeChips = chips
       extractedPromptText = prompt
       proposals = []
-      extractionInfo = `LLM proposed ${chips.length} dimensions. Select chips, rename if needed, then create axes.`
+      extractionInfo = `LLM proposed ${chips.length} dimensions. Select chips or type one directly, then add them.`
     } catch (e) {
       extractedPromptText = ''
       attributeChips = []
@@ -968,91 +919,84 @@
     }
   }
 
-  async function createAxesFromSelectedChips() {
-    const prompt = String(promptText || '').trim()
-    errorMsg = ''
-    clearSlice()
-    if (!prompt) {
-      errorMsg = 'Enter a visualization prompt first.'
-      return
+  function collectAxisCreationTargets() {
+    const seen = new Set()
+    const targets = []
+    const manualQuery = normalizeAxisQuery(manualAxisText)
+    if (manualQuery) {
+      seen.add(manualQuery.toLowerCase())
+      targets.push({
+        source: 'manual',
+        query: manualQuery,
+        chipLike: { name: manualQuery, customName: manualQuery },
+      })
     }
-    if (!Array.isArray(selectedChips) || selectedChips.length === 0) {
-      errorMsg = 'Select at least one dimension chip.'
-      return
+    for (const chip of Array.isArray(selectedChips) ? selectedChips : []) {
+      const query = normalizeAxisQuery(String(chip?.customName || chip?.name || '').trim())
+      const key = query.toLowerCase()
+      if (!query || seen.has(key)) continue
+      seen.add(key)
+      targets.push({
+        source: 'chip',
+        chipId: String(chip?.id || '').trim(),
+        query,
+        chipLike: { ...chip, customName: query },
+      })
     }
-    if (!Array.isArray(items) || items.length === 0) {
-      errorMsg = 'Load images before creating axes.'
-      return
-    }
-
-    creatingAxes = true
-    try {
-      const results = await Promise.all(
-        selectedChips.map(async (chip) => {
-          const renamed = String(chip?.customName || '').trim()
-          const query = renamed || String(chip?.name || '').trim()
-          const data = await postJson('/axis/create', {
-            collection_id: dataset || undefined,
-            dataset: dataset || undefined,
-            q: query,
-          })
-          return { chip: { ...chip, customName: query }, data }
-        })
-      )
-
-      const nextBuilders = results
-        .map(({ chip, data }) => sessionFromAxisResponse(chip, data))
-        .filter(Boolean)
-
-      if (nextBuilders.length === 0) {
-        throw new Error('No valid axis builders were produced for selected chips.')
-      }
-      axisBuildersStore.replace(nextBuilders)
-      proposals = []
-      for (const builder of nextBuilders) {
-        if (builder?.axis?.id) emitAxis(builder.axis)
-      }
-      extractionInfo = ''
-    } catch (e) {
-      axisBuildersStore.reset()
-      proposals = []
-      clearSlice()
-      errorMsg = `Axis creation failed: ${String(e)}`
-    } finally {
-      creatingAxes = false
-    }
+    return targets
   }
 
-  async function addManualAxis() {
-    const rawQuery = String(manualAxisText || '').trim()
-    const query = rawQuery ? `${rawQuery.charAt(0).toUpperCase()}${rawQuery.slice(1)}` : ''
+  async function addRequestedAxes() {
     errorMsg = ''
-    clearSlice()
-    if (!query) {
-      errorMsg = 'Enter an axis name first.'
+    const targets = collectAxisCreationTargets()
+    if (targets.length === 0) {
+      errorMsg = 'Select suggested axes or enter an axis name first.'
       return
     }
     if (!Array.isArray(items) || items.length === 0) {
       errorMsg = 'Load images before creating axes.'
       return
     }
+    const effectiveSubsetIds = currentSubsetIds()
+    if (subsetActive && effectiveSubsetIds.length === 0) {
+      errorMsg = 'Current subset is empty.'
+      return
+    }
 
     creatingAxes = true
+    let addedCount = 0
     try {
-      const data = await postJson('/axis/create', {
-        collection_id: dataset || undefined,
-        dataset: dataset || undefined,
-        q: query,
-      })
-      const builder = sessionFromAxisResponse({ name: query, customName: query }, data)
-      if (!builder) {
-        throw new Error('No valid axis builder was produced.')
+      const axisDebug = axisDebugRequest()
+      for (const target of targets) {
+        const data = await postJson('/axis/create', {
+          collection_id: dataset || undefined,
+          dataset: dataset || undefined,
+          q: target.query,
+          mode: String(axisDebugPriorMode || 'rank').trim() || 'rank',
+          semantic_method: axisDebug.semanticMethod,
+          norm: axisDebug.norm,
+          subset_ids: effectiveSubsetIds,
+        })
+        const builder = axisSessionFromResponse(target.chipLike, data, {
+          preferredName: String(target?.chipLike?.customName || target?.chipLike?.name || target?.query || '').trim(),
+        })
+        if (!builder) {
+          throw new Error(`No valid axis builder was produced for "${target.query}".`)
+        }
+        axisBuildersStore.upsert(builder)
+        if (builder?.axis?.id) emitAxis(axisPayloadFromSession(builder))
+        emitLog('create ax', builder?.axis?.name || builder?.q || target.query)
+        addedCount += 1
       }
-      axisBuildersStore.upsert(builder)
-      if (builder?.axis?.id) emitAxis(builder.axis)
       manualAxisText = ''
+      if (targets.some((target) => target.source === 'chip')) {
+        attributeChips = (attributeChips || []).map((chip) => ({ ...chip, selected: false }))
+      }
     } catch (e) {
-      errorMsg = `Axis creation failed: ${String(e)}`
+      const prefix = addedCount > 0
+        ? `Axis creation failed after ${addedCount} addition${addedCount === 1 ? '' : 's'}: `
+        : 'Axis creation failed: '
+      errorMsg = `${prefix}${String(e)}`
     } finally {
       creatingAxes = false
     }
@@ -1067,7 +1011,6 @@
     if (!axisId || !imageId) return
 
     errorMsg = ''
-    clearSlice()
 
     const current = (axisBuilders || []).find((entry) => entry?.axisId === axisId)
     try {
@@ -1077,17 +1020,35 @@
         new_score_0_100: newScore0To100,
         move_type: moveType,
       })
-      const updated = sessionFromAxisResponse(current || {}, data)
-      if (!updated) throw new Error('Invalid axis move response')
-      const nextHistory = Array.isArray(current?.moveHistory) ? [...current.moveHistory] : []
-      nextHistory.unshift({
-        imageId,
-        fromScore0To100,
-        toScore0To100: newScore0To100,
+      const updated = axisSessionFromResponse(current || {}, data, {
+        preferredName: String(current?.axis?.name || current?.q || '').trim(),
       })
+      if (!updated) throw new Error('Invalid axis move response')
+      const nextHistory = (Array.isArray(current?.moveHistory) ? [...current.moveHistory] : [])
+        .filter((entry) => String(entry?.imageId || '').trim() !== imageId)
+      if (moveType !== 'delete') {
+        nextHistory.unshift({
+          imageId,
+          fromScore0To100,
+          toScore0To100: newScore0To100,
+        })
+      }
       updated.moveHistory = nextHistory.slice(0, 6)
       axisBuildersStore.upsert(updated)
-      if (updated?.axis?.id) emitAxis(updated.axis)
+      if (updated?.axis?.id) emitAxis(axisPayloadFromSession(updated))
+      const axisName = String(current?.axis?.name || current?.q || updated?.axis?.name || axisId).trim() || axisId
+      const sourceRow = String(e?.detail?.sourceRow || 'unknown').trim() || 'unknown'
+      if (moveType === 'delete') {
+        emitLog('delete feedback', `${sourceRow} | initial:${fromScore0To100.toFixed(1)} | ${axisName}`)
+      } else if (sourceRow === 'feedback') {
+        emitLog('reorder', `${sourceRow} | initial:${fromScore0To100.toFixed(1)} | target:${newScore0To100.toFixed(1)} | ${axisName}`)
+      } else {
+        const sourceRank = String(e?.detail?.sourceRank ?? 'undefined').trim() || 'undefined'
+        const targetRank = moveType === 'undefined'
+          ? 'undefined'
+          : (String(e?.detail?.targetRank ?? 'undefined').trim() || 'undefined')
+        emitLog('reorder', `${sourceRow} | initial:${sourceRank} | target:${targetRank} | ${axisName}`)
+      }
     } catch (err) {
       errorMsg = `Axis move failed: ${String(err)}`
     }
@@ -1110,11 +1071,17 @@
         pos_prompts: posPrompts,
         neg_prompts: negPrompts,
       })
-      const updated = sessionFromAxisResponse(current || {}, data)
+      const updated = axisSessionFromResponse(current || {}, data, {
+        preferredName: String(current?.axis?.name || current?.q || '').trim(),
+      })
       if (!updated) throw new Error('Invalid axis prompt update response')
       updated.moveHistory = Array.isArray(current?.moveHistory) ? current.moveHistory : []
       axisBuildersStore.upsert(updated)
-      if (updated?.axis?.id) emitAxis(updated.axis)
+      if (updated?.axis?.id) emitAxis(axisPayloadFromSession(updated))
+      const editedSide = String(e?.detail?.editedSide || 'unknown').trim() || 'unknown'
+      const editedPrompts = Array.isArray(e?.detail?.editedPrompts) ? e.detail.editedPrompts : []
+      const promptDetail = editedPrompts.length > 0 ? editedPrompts.join(' | ') : 'none'
+      emitLog('change anchor', `${editedSide} | ${promptDetail}`)
       if (onSuccess) onSuccess(updated)
     } catch (err) {
       errorMsg = `Axis prompt update failed: ${String(err)}`
@@ -1130,6 +1097,7 @@
     axisBuildersStore.remove(axisId)
     removeSliceForAxis(axisId)
     emitAxisRemoval(axisId)
+    emitLog('delete ax', String(e?.detail?.axisName || axisId).trim() || axisId)
   }
 
   function onAxisBuilderSave(e) {
@@ -1167,13 +1135,6 @@
         <MaterialIcon name="send" />
       </button>
     </div>
-    <div class="mt-2 flex items-center gap-2">
-      {#if activeSlices.length > 0}
-        <button class="btn btn-ui-secondary btn-xs" on:click={clearSlice}>
-          Unslice
-        </button>
-      {/if}
-    </div>
     {#if errorMsg}
       <div class="mt-2 text-sm text-red-600">{errorMsg}</div>
     {/if}
@@ -1205,36 +1166,15 @@
                 on:focusout={() => { if (hoveredExplainChipId === chip.id) hoveredExplainChipId = '' }}
               >
                 <div class="dim-chip-row">
-                  {#if chip.editing}
-                    <input
-                      class="dim-chip-rename"
-                      type="text"
-                      value={chip.customName}
-                      on:input={(e) => renameAttributeChip(chip.id, e.currentTarget.value)}
-                      on:blur={() => finishAttributeChipEdit(chip.id)}
-                      on:keydown={(e) => onAttributeChipKeydown(chip.id, e)}
-                      placeholder="Rename axis"
-                    />
-                  {:else}
-                    <button
-                      type="button"
-                      class="dim-chip-toggle"
-                      on:click={() => toggleAttributeChip(chip.id)}
-                      title={chip.selected ? 'Deselect dimension' : 'Select dimension'}
-                    >
-                      <span class="dim-chip-label">{String(chip.customName || chip.name || '').trim() || chip.name}</span>
-                    </button>
-                  {/if}
+                  <button
+                    type="button"
+                    class="dim-chip-toggle"
+                    on:click={() => toggleAttributeChip(chip.id)}
+                    title={chip.selected ? 'Deselect dimension' : 'Select dimension'}
+                  >
+                    <span class="dim-chip-label">{String(chip.customName || chip.name || '').trim() || chip.name}</span>
+                  </button>
                   <div class="dim-chip-tools">
-                    <button
-                      type="button"
-                      class="dim-chip-edit"
-                      aria-label="Rename suggested attribute"
-                      title={chip.supportPhrases?.length ? `Rename suggested attribute. Support: ${chip.supportPhrases.join(' | ')}` : 'Rename suggested attribute'}
-                      on:click|stopPropagation={() => startAttributeChipEdit(chip.id)}
-                    >
-                      <MaterialIcon name="edit" />
-                    </button>
                     <span
                       class={`axis-type-icon ${attributeTypeIconClass(chip.type)}`}
                       role="img"
@@ -1267,47 +1207,34 @@
       </div>
     {/if}
 
-    {#if attributeChips.length > 0}
-      <div class="mt-2 flex items-center justify-end gap-3">
-        <button
-          class="btn btn-primary btn-xs btn-icon"
-          disabled={creatingAxes || extracting || selectedChipCount === 0}
-          on:click={createAxesFromSelectedChips}
-          aria-label={creatingAxes ? 'Creating axes' : 'Create axes'}
-          title={creatingAxes ? 'Creating axes' : 'Create axes'}
-        >
-          <MaterialIcon name={creatingAxes ? 'hourglass_top' : 'add_circle'} />
-        </button>
-      </div>
-    {/if}
-  </div>
-
-  <div class="subtile">
-    <div class="flex items-center justify-between gap-2">
-      <div class="sidebar-section-title">Axes</div>
-    </div>
     <div class="axis-entry-row mt-2">
       <input
         class="manual-axis-input"
         type="text"
         bind:value={manualAxisText}
-        placeholder="Add an axis directly"
+        placeholder="Add axis directly"
         on:keydown={(e) => {
           if (e.key === 'Enter') {
             try { e.preventDefault() } catch (_) {}
-            addManualAxis()
+            addRequestedAxes()
           }
         }}
       />
       <button
         class="btn btn-primary btn-xs btn-icon"
-        disabled={creatingAxes || extracting || !String(manualAxisText || '').trim()}
-        on:click={addManualAxis}
-        aria-label="Add"
-        title="Add"
+        disabled={creatingAxes || extracting || (!String(manualAxisText || '').trim() && selectedChipCount === 0)}
+        on:click={addRequestedAxes}
+        aria-label={creatingAxes ? 'Adding axes' : 'Add axes'}
+        title={creatingAxes ? 'Adding axes' : 'Add axes'}
       >
-        <MaterialIcon name="add_circle" />
+        <MaterialIcon name={creatingAxes ? 'hourglass_top' : 'add_circle'} />
       </button>
+    </div>
+  </div>
+
+  <div class="subtile">
+    <div class="flex items-center justify-between gap-2">
+      <div class="sidebar-section-title">Axis refinement</div>
     </div>
 
     {#if axisBuilders.length === 0}
@@ -1318,7 +1245,8 @@
           <AxisBuilder
             session={builder}
             itemsById={itemById}
-            representativeImageIds={datasetRepresentativeImageIds}
+            subsetIds={currentSubsetIds()}
+            {subsetActive}
             {selectedX}
             {selectedY}
             activeSlice={sliceForAxis(builder.axisId)}
@@ -1328,7 +1256,10 @@
             on:updatePrompts={onAxisBuilderUpdatePrompts}
             on:sliceChange={(e) => {
               const nextSlice = e.detail?.slice || null
-              if (nextSlice) updateActiveSlice(nextSlice)
+              if (nextSlice) {
+                updateActiveSlice(nextSlice)
+                if (e.detail?.final) emitLog('ax slicing', builder?.axis?.name || builder?.q || builder?.axisId || 'none')
+              }
               else removeSliceForAxis(builder.axisId)
             }}
             on:useX={(e) => {
@@ -1569,38 +1500,10 @@
     flex: none;
   }
 
-  .dim-chip-edit {
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: #111827;
-    padding: 0;
-  }
-
-  .dim-chip.selected .dim-chip-edit {
-    color: #ffffff;
-  }
-
   .axis-type-icon {
     flex: none;
     font-size: 0.92rem;
     color: #64748b;
-  }
-
-  .dim-chip-rename {
-    margin: 0;
-    width: 100%;
-    min-width: 110px;
-    padding: 2px 6px;
-    font-size: var(--font-size-body);
-    border-radius: 999px;
-    border: 1px solid #cbd5e1;
-    color: #0f172a;
-    background: #ffffff;
   }
 
   .axis-entry-row {

@@ -18,7 +18,7 @@ function createAxisBuildersStore() {
         const next = (Array.isArray(list) ? list : []).map((entry) => {
           if (entry?.axisId !== session.axisId) return entry
           found = true
-          return { ...entry, ...session }
+          return session
         })
         return found ? next : [session, ...next]
       })

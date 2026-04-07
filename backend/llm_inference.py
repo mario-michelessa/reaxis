@@ -15,6 +15,7 @@ try:
         AXIS_BUILDER_LLM_PROMPT_COUNT,
         AXIS_BUILDER_PROMPT_ENSEMBLE_SYSTEM_PROMPT,
         AXIS_BUILDER_PROMPT_ENSEMBLE_USER_PROMPT_TEMPLATE,
+        DATASET_LLM_CONTEXT,
         ATTRIBUTE_EXTRACTION_SYSTEM_PROMPT,
         ATTRIBUTE_SUPPORT_SYSTEM_PROMPT,
         ATTRIBUTE_SUPPORT_USER_PROMPT_TEMPLATE,
@@ -47,6 +48,7 @@ except ImportError:
         AXIS_BUILDER_LLM_PROMPT_COUNT,
         AXIS_BUILDER_PROMPT_ENSEMBLE_SYSTEM_PROMPT,
         AXIS_BUILDER_PROMPT_ENSEMBLE_USER_PROMPT_TEMPLATE,
+        DATASET_LLM_CONTEXT,
         ATTRIBUTE_EXTRACTION_SYSTEM_PROMPT,
         ATTRIBUTE_SUPPORT_SYSTEM_PROMPT,
         ATTRIBUTE_SUPPORT_USER_PROMPT_TEMPLATE,
@@ -165,23 +167,32 @@ def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
     raw = str(text or '').strip()
     if not raw:
         return None
-    # First try strict parse.
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    # Then find the first JSON object substring.
-    m = re.search(r'\{.*\}', raw, flags=re.S)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        return None
+
+    decoder = json.JSONDecoder()
+    candidates: List[str] = [raw]
+
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.I | re.S)
+    for block in fenced:
+        text_block = str(block or '').strip()
+        if text_block:
+            candidates.append(text_block)
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        for match in re.finditer(r'\{', candidate):
+            start = match.start()
+            try:
+                obj, end = decoder.raw_decode(candidate[start:])
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                return obj
     return None
 
 
@@ -201,6 +212,16 @@ def _short(text: str, n: int = 140) -> str:
     if len(s) <= n:
         return s
     return s[: max(0, n - 3)] + '...'
+
+
+def _dataset_prompt_context(dataset_name: Any) -> Dict[str, str]:
+    raw_name = str(dataset_name or '').strip()
+    canonical_name = Path(raw_name).name if raw_name else ''
+    context = re.sub(r'\s+', ' ', str(DATASET_LLM_CONTEXT.get(canonical_name) or '').strip()).strip()
+    return {
+        'dataset_name': canonical_name or 'unspecified dataset',
+        'dataset_context': context or 'No dataset-specific context provided.',
+    }
 
 
 def _normalize_name_key(value: Any) -> str:
@@ -335,6 +356,8 @@ class LightweightLLMEngine:
         self._hf_load_error: Optional[str] = None
         self._gemini_api_key: Optional[str] = None
         self._gemini_api_key_error: Optional[str] = None
+        self._last_runtime_error: Optional[str] = None
+        self._axis_prompt_ensemble_cache: Dict[tuple[str, str, int], Dict[str, Any]] = {}
         self._log(
             'init provider=%s gemini_model=%s gemini_key_path=%s model_path=%s use_4bit=%s quant_type=%s compute_dtype=%s device_map=%s',
             self.provider,
@@ -354,6 +377,10 @@ class LightweightLLMEngine:
             except Exception:
                 msg = f'{msg} {args}'
         print(f'[llm] {msg}')
+
+    def _set_last_runtime_error(self, message: Optional[str]) -> None:
+        text = str(message or '').strip()
+        self._last_runtime_error = text or None
 
     def _can_use_hf_local(self) -> bool:
         return self.provider in {'huggingface_local', 'huggingface', 'hf_local'} and bool(self.hf_local_model_path)
@@ -471,6 +498,7 @@ class LightweightLLMEngine:
     def _post_hf_chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> Optional[str]:
         if not self._load_hf_local():
             self._log('chat aborted: model not loaded')
+            self._set_last_runtime_error('HF local model is not loaded')
             return None
         try:
             t0 = time.time()
@@ -480,6 +508,7 @@ class LightweightLLMEngine:
             model = self._hf_model
             if tok is None or model is None:
                 self._log('chat aborted: tokenizer/model missing')
+                self._set_last_runtime_error('HF tokenizer/model missing')
                 return None
 
             self._log('chat start messages=%d temperature=%.3f', len(messages), float(temperature))
@@ -515,12 +544,14 @@ class LightweightLLMEngine:
             return str(text or '').strip()
         except Exception as e:
             self._log('chat failed: %s', e)
+            self._set_last_runtime_error(f'HF chat failed: {e}')
             return None
 
     def _post_gemini_chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> Optional[str]:
         api_key = self._load_gemini_api_key()
         if not api_key:
             self._log('gemini chat aborted: api key unavailable')
+            self._set_last_runtime_error('Gemini API key unavailable')
             return None
         try:
             t0 = time.time()
@@ -539,6 +570,7 @@ class LightweightLLMEngine:
                 })
             if len(contents) == 0:
                 self._log('gemini chat aborted: no message contents')
+                self._set_last_runtime_error('Gemini chat aborted: no message contents')
                 return None
             payload: Dict[str, Any] = {
                 'contents': contents,
@@ -569,6 +601,7 @@ class LightweightLLMEngine:
             candidates = obj.get('candidates') if isinstance(obj, dict) else None
             if not isinstance(candidates, list) or len(candidates) == 0:
                 self._log('gemini chat failed: missing candidates raw="%s"', _short(raw))
+                self._set_last_runtime_error(f'Gemini API returned no candidates: {_short(raw)}')
                 return None
             parts = (((candidates[0] or {}).get('content') or {}).get('parts') or [])
             text_chunks = []
@@ -580,6 +613,8 @@ class LightweightLLMEngine:
                             text_chunks.append(text)
             text = '\n'.join(text_chunks).strip()
             self._log('gemini chat complete output_chars=%d elapsed=%.2fs', len(text), time.time() - t0)
+            if not text:
+                self._set_last_runtime_error('Gemini API returned empty content')
             return text or None
         except urllib_error.HTTPError as e:
             try:
@@ -587,12 +622,26 @@ class LightweightLLMEngine:
             except Exception:
                 details = str(e)
             self._log('gemini chat http error: %s body="%s"', e, _short(details))
+            summary = None
+            try:
+                payload = json.loads(details)
+                error_obj = payload.get('error') if isinstance(payload, dict) else None
+                if isinstance(error_obj, dict):
+                    code = error_obj.get('code') or getattr(e, 'code', 'unknown')
+                    message = str(error_obj.get('message') or '').strip()
+                    if message:
+                        summary = f'Gemini API HTTP {code}: {message}'
+            except Exception:
+                summary = None
+            self._set_last_runtime_error(summary or f'Gemini API HTTP {getattr(e, "code", "unknown")}: {_short(details)}')
             return None
         except Exception as e:
             self._log('gemini chat failed: %s', e)
+            self._set_last_runtime_error(f'Gemini chat failed: {e}')
             return None
 
     def _run_structured_json(self, messages: List[Dict[str, str]], temperature: float = 0.2):
+        self._set_last_runtime_error(None)
         if self._can_use_gemini_api():
             content = self._post_gemini_chat(messages, temperature=temperature if temperature is not None else self.hf_temperature)
             if content:
@@ -601,6 +650,7 @@ class LightweightLLMEngine:
                     self._log('json parse success keys=%s', list(obj.keys()))
                     return obj, 'gemini_api'
                 self._log('json parse failed preview="%s"', _short(content))
+                self._set_last_runtime_error(f'Gemini API returned non-JSON content: {_short(content)}')
             else:
                 self._log('no content returned from gemini')
         if self._can_use_hf_local():
@@ -611,6 +661,7 @@ class LightweightLLMEngine:
                     self._log('json parse success keys=%s', list(obj.keys()))
                     return obj, 'huggingface_local'
                 self._log('json parse failed preview="%s"', _short(content))
+                self._set_last_runtime_error(f'HF model returned non-JSON content: {_short(content)}')
             else:
                 self._log('no content returned from chat')
         return None, None
@@ -620,6 +671,8 @@ class LightweightLLMEngine:
             return f'Gemini API key load failed: {self._gemini_api_key_error}'
         if self._hf_load_error:
             return f'HF model load failed: {self._hf_load_error}'
+        if self._last_runtime_error:
+            return self._last_runtime_error
         if self._can_use_gemini_api():
             return 'Gemini API returned empty or non-JSON output'
         return 'HF model returned empty or non-JSON output'
@@ -727,11 +780,18 @@ class LightweightLLMEngine:
             'provider': provider or 'unknown',
         }
 
-    def extract_attributes(self, prompt: str, max_attributes: int = DEFAULT_MAX_ATTRIBUTES) -> Dict[str, Any]:
+    def extract_attributes(
+        self,
+        prompt: str,
+        max_attributes: int = DEFAULT_MAX_ATTRIBUTES,
+        dataset_name: str = '',
+    ) -> Dict[str, Any]:
         p = str(prompt or '').strip()
         max_attributes = _clamp(max_attributes, 1, 20)
+        dataset_prompt_ctx = _dataset_prompt_context(dataset_name)
         self._log(
-            'extract_attributes start prompt_len=%d max_attributes=%d preview="%s"',
+            'extract_attributes start dataset=%s prompt_len=%d max_attributes=%d preview="%s"',
+            dataset_prompt_ctx['dataset_name'],
             len(p),
             max_attributes,
             _short(p),
@@ -739,7 +799,11 @@ class LightweightLLMEngine:
         if not p:
             return {'attributes': [], 'provider': 'none'}
 
-        user_prompt = ATTRIBUTE_EXTRACTION_USER_PROMPT_TEMPLATE.format(prompt=p)
+        user_prompt = ATTRIBUTE_EXTRACTION_USER_PROMPT_TEMPLATE.format(
+            prompt=p,
+            dataset_name=dataset_prompt_ctx['dataset_name'],
+            dataset_context=dataset_prompt_ctx['dataset_context'],
+        )
         obj, provider = self._run_structured_json([
             {'role': 'system', 'content': ATTRIBUTE_EXTRACTION_SYSTEM_PROMPT},
             {'role': 'user', 'content': user_prompt},
@@ -806,20 +870,40 @@ class LightweightLLMEngine:
         self,
         attribute: str,
         n_prompts: int = AXIS_BUILDER_LLM_PROMPT_COUNT,
+        dataset_name: str = '',
     ) -> Dict[str, Any]:
         attr = str(attribute or '').strip()
-        n_prompts = _clamp(n_prompts, 4, 16)
+        n_prompts = _clamp(n_prompts, 2, 16)
+        dataset_prompt_ctx = _dataset_prompt_context(dataset_name)
+        cache_key = (dataset_prompt_ctx['dataset_name'].lower(), attr.lower(), int(n_prompts))
         self._log(
-            'generate_axis_prompt_ensemble start attribute="%s" n_prompts=%d',
+            'generate_axis_prompt_ensemble start dataset=%s attribute="%s" n_prompts=%d',
+            dataset_prompt_ctx['dataset_name'],
             attr,
             n_prompts,
         )
         if not attr:
             return {'pos_prompts': [], 'neg_prompts': [], 'provider': 'none'}
+        cached = self._axis_prompt_ensemble_cache.get(cache_key)
+        if isinstance(cached, dict):
+            self._log(
+                'generate_axis_prompt_ensemble cache hit dataset=%s attribute="%s" n_prompts=%d provider=%s',
+                dataset_prompt_ctx['dataset_name'],
+                attr,
+                n_prompts,
+                str(cached.get('provider') or 'unknown'),
+            )
+            return {
+                'pos_prompts': list(cached.get('pos_prompts') or []),
+                'neg_prompts': list(cached.get('neg_prompts') or []),
+                'provider': str(cached.get('provider') or 'unknown'),
+            }
 
         user_prompt = AXIS_BUILDER_PROMPT_ENSEMBLE_USER_PROMPT_TEMPLATE.format(
             attribute=attr,
             n_prompts=n_prompts,
+            dataset_name=dataset_prompt_ctx['dataset_name'],
+            dataset_context=dataset_prompt_ctx['dataset_context'],
         )
         obj, provider = self._run_structured_json([
             {'role': 'system', 'content': AXIS_BUILDER_PROMPT_ENSEMBLE_SYSTEM_PROMPT},
@@ -852,6 +936,11 @@ class LightweightLLMEngine:
                     pos_prompts,
                     neg_prompts,
                 )
+                self._axis_prompt_ensemble_cache[cache_key] = {
+                    'pos_prompts': list(pos_prompts),
+                    'neg_prompts': list(neg_prompts),
+                    'provider': provider or 'unknown',
+                }
                 return {
                     'pos_prompts': pos_prompts,
                     'neg_prompts': neg_prompts,

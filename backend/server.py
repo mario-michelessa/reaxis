@@ -5,7 +5,7 @@ non-overlapping packed coordinates for a minimap and image grid.
 
 Endpoints
 - GET /health
-- GET /gallery.json?method=umap|pca&n_layer=64&n_tile=8
+- GET /gallery.json?method=pca|umap|tsne&n_layer=64&n_tile=8
   Returns items with fields: id, url, className, x, y, gx, gy
 - GET /images/<path:relpath>
   Serves images relative to the configured dataset root
@@ -35,10 +35,25 @@ import csv
 import hashlib
 try:
     from .gallery_backend import ImageGalleryEngine
-    from .embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, normalize_multimodal_method
+    from .embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, embedding_cache_filename, normalize_multimodal_method
+    from .reduction_cache import normalize_reduction_method
+    from .session_store import (
+        DEFAULT_SESSION_NAME,
+        LEGACY_SESSION_NAME,
+        append_session_log,
+        iter_session_names,
+        normalize_session_name,
+        session_activity_log_path,
+        session_axes_path,
+        session_dir,
+        session_subsets_path,
+        session_summary,
+        session_visualizations_path,
+    )
     from .constants import (
         BACKEND_HOST,
         BACKEND_PORT,
+        INITIAL_GALLERY_PROJECTION_METHOD,
         DEFAULT_MAX_ATTRIBUTES,
         DEFAULT_VALUE_COUNT,
         AXIS_MODEL_TYPE,
@@ -48,6 +63,7 @@ try:
         AXIS_BAYES_MODE,
         AXIS_BAYES_FEATURE_SPACE,
         AXIS_BAYES_SEMANTIC_METHOD,
+        AXIS_BAYES_NORM,
         AXIS_BAYES_CLIP_WEIGHT,
         AXIS_BAYES_DINO_WEIGHT,
         AXIS_PIECEWISE_NUM_EXPERTS,
@@ -90,10 +106,25 @@ try:
     from .zero_shot_regressor import ZeroShotAttributeRegressor, slugify
 except ImportError:
     from gallery_backend import ImageGalleryEngine
-    from embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, normalize_multimodal_method
+    from embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, embedding_cache_filename, normalize_multimodal_method
+    from reduction_cache import normalize_reduction_method
+    from session_store import (
+        DEFAULT_SESSION_NAME,
+        LEGACY_SESSION_NAME,
+        append_session_log,
+        iter_session_names,
+        normalize_session_name,
+        session_activity_log_path,
+        session_axes_path,
+        session_dir,
+        session_subsets_path,
+        session_summary,
+        session_visualizations_path,
+    )
     from constants import (
         BACKEND_HOST,
         BACKEND_PORT,
+        INITIAL_GALLERY_PROJECTION_METHOD,
         DEFAULT_MAX_ATTRIBUTES,
         DEFAULT_VALUE_COUNT,
         AXIS_MODEL_TYPE,
@@ -103,6 +134,7 @@ except ImportError:
         AXIS_BAYES_MODE,
         AXIS_BAYES_FEATURE_SPACE,
         AXIS_BAYES_SEMANTIC_METHOD,
+        AXIS_BAYES_NORM,
         AXIS_BAYES_CLIP_WEIGHT,
         AXIS_BAYES_DINO_WEIGHT,
         AXIS_PIECEWISE_NUM_EXPERTS,
@@ -157,8 +189,6 @@ DATASETS_ROOT = (Path(__file__).parent.parent / 'data' / 'datasets').resolve()
 DATASET_PATH = (DATASETS_ROOT / 'ISIC2017').resolve()
 SESSIONS_ROOT = (Path(__file__).parent.parent / 'data' / 'sessions').resolve()
 LEGACY_AXIS_LIBRARY_PATH = (Path(__file__).parent.parent / 'data' / 'axis_library.json').resolve()
-DEFAULT_SESSION_NAME = 'P0'
-SESSION_NAMES = tuple(f'P{i}' for i in range(16))
 
 # Keep the currently active dataset root for serving images
 app.config['DATASET_ROOT'] = str(DATASET_PATH) if DATASET_PATH.exists() else None
@@ -168,51 +198,102 @@ print(f'[server] default DATASET_PATH={DATASET_PATH} exists={DATASET_PATH.exists
 # Lightweight LLM + zero-shot inference modules.
 LLM_ENGINE = LightweightLLMEngine()
 ZERO_SHOT_REGRESSOR = ZeroShotAttributeRegressor()
-AXIS_BAYES_ENGINE = AxisBayesEngine(
-    llm_engine=LLM_ENGINE,
-    model_type=AXIS_MODEL_TYPE,
-    mode=AXIS_BAYES_MODE,
-    feature_space=AXIS_BAYES_FEATURE_SPACE,
-    semantic_method=AXIS_BAYES_SEMANTIC_METHOD,
-    clip_weight=AXIS_BAYES_CLIP_WEIGHT,
-    dino_weight=AXIS_BAYES_DINO_WEIGHT,
-    piecewise_num_experts=AXIS_PIECEWISE_NUM_EXPERTS,
-    piecewise_use_gating=AXIS_PIECEWISE_USE_GATING,
-    piecewise_aggregator=AXIS_PIECEWISE_AGGREGATOR,
-    piecewise_clip_scale=AXIS_PIECEWISE_CLIP_SCALE,
-    piecewise_dino_scale=AXIS_PIECEWISE_DINO_SCALE,
-    pairwise_from_scalar_margin=AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN,
-    piecewise_prior_strength=AXIS_PIECEWISE_PRIOR_STRENGTH,
-    piecewise_expert_diversity_strength=AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH,
-    piecewise_l2_reg=AXIS_PIECEWISE_L2_REG,
-    piecewise_learning_rate=AXIS_PIECEWISE_LEARNING_RATE,
-    piecewise_max_refine_steps=AXIS_PIECEWISE_MAX_REFINE_STEPS,
-    alpha=AXIS_BAYES_ALPHA,
-    dino_alpha=AXIS_BAYES_DINO_ALPHA,
-    bias_alpha=AXIS_BAYES_BIAS_ALPHA,
-    sigma2=AXIS_BAYES_SIGMA2,
-    graph_knn_k=AXIS_BAYES_GRAPH_KNN_K,
-    graph_lambda_smooth=AXIS_BAYES_GRAPH_LAMBDA_SMOOTH,
-    graph_lambda_prior=AXIS_BAYES_GRAPH_LAMBDA_PRIOR,
-    graph_jitter=AXIS_BAYES_GRAPH_JITTER,
-    move_trust=AXIS_BAYES_MOVE_TRUST,
-    move_mag_gain=AXIS_BAYES_MOVE_MAG_GAIN,
-    rank_eta=AXIS_BAYES_RANK_ETA,
-    rank_anchor_k=AXIS_BAYES_RANK_ANCHOR_K,
-    rank_anchor_delta=AXIS_BAYES_RANK_ANCHOR_DELTA,
-    rank_max_pairs=AXIS_BAYES_RANK_MAX_PAIRS,
-    residual_alpha=AXIS_RESIDUAL_ALPHA,
-    residual_beta=AXIS_RESIDUAL_BETA,
-    residual_lambda=AXIS_RESIDUAL_LAMBDA,
-    residual_sigma_y=AXIS_RESIDUAL_SIGMA_Y,
-    residual_lengthscale_multiplier=AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
-    residual_jitter=AXIS_RESIDUAL_JITTER,
-    max_moves=AXIS_BAYES_MAX_MOVES,
-    hotspot_boundary=AXIS_BAYES_HOTSPOT_BOUNDARY,
-    hotspot_tau=AXIS_BAYES_HOTSPOT_TAU,
-    hotspot_k=AXIS_BAYES_HOTSPOT_K,
-    exemplar_k=AXIS_BAYES_EXEMPLAR_K,
-)
+
+
+def _make_axis_engine(
+    *,
+    model_type: Optional[str] = None,
+    mode: Optional[str] = None,
+    feature_space: Optional[str] = None,
+    semantic_method: Optional[str] = None,
+    norm: Optional[bool] = None,
+    clip_weight: Optional[float] = None,
+    dino_weight: Optional[float] = None,
+    piecewise_num_experts: Optional[int] = None,
+    piecewise_use_gating: Optional[bool] = None,
+    piecewise_aggregator: Optional[str] = None,
+    piecewise_clip_scale: Optional[float] = None,
+    piecewise_dino_scale: Optional[float] = None,
+    pairwise_from_scalar_margin: Optional[float] = None,
+    piecewise_prior_strength: Optional[float] = None,
+    piecewise_expert_diversity_strength: Optional[float] = None,
+    piecewise_l2_reg: Optional[float] = None,
+    piecewise_learning_rate: Optional[float] = None,
+    piecewise_max_refine_steps: Optional[int] = None,
+    alpha: Optional[float] = None,
+    dino_alpha: Optional[float] = None,
+    bias_alpha: Optional[float] = None,
+    sigma2: Optional[float] = None,
+    graph_knn_k: Optional[int] = None,
+    graph_lambda_smooth: Optional[float] = None,
+    graph_lambda_prior: Optional[float] = None,
+    graph_jitter: Optional[float] = None,
+    rank_eta: Optional[float] = None,
+    rank_anchor_k: Optional[int] = None,
+    rank_anchor_delta: Optional[float] = None,
+    rank_max_pairs: Optional[int] = None,
+    residual_alpha: Optional[float] = None,
+    residual_beta: Optional[float] = None,
+    residual_lambda: Optional[float] = None,
+    residual_sigma_y: Optional[float] = None,
+    residual_lengthscale_multiplier: Optional[float] = None,
+    residual_jitter: Optional[float] = None,
+) -> AxisBayesEngine:
+    return AxisBayesEngine(
+        llm_engine=LLM_ENGINE,
+        model_type=str(model_type or AXIS_MODEL_TYPE),
+        mode=str(mode or AXIS_BAYES_MODE),
+        feature_space=str(feature_space or AXIS_BAYES_FEATURE_SPACE),
+        semantic_method=str(semantic_method or AXIS_BAYES_SEMANTIC_METHOD),
+        norm=AXIS_BAYES_NORM if norm is None else bool(norm),
+        clip_weight=float(clip_weight if clip_weight is not None else AXIS_BAYES_CLIP_WEIGHT),
+        dino_weight=float(dino_weight if dino_weight is not None else AXIS_BAYES_DINO_WEIGHT),
+        piecewise_num_experts=int(piecewise_num_experts or AXIS_PIECEWISE_NUM_EXPERTS),
+        piecewise_use_gating=AXIS_PIECEWISE_USE_GATING if piecewise_use_gating is None else bool(piecewise_use_gating),
+        piecewise_aggregator=str(piecewise_aggregator or AXIS_PIECEWISE_AGGREGATOR),
+        piecewise_clip_scale=float(piecewise_clip_scale if piecewise_clip_scale is not None else AXIS_PIECEWISE_CLIP_SCALE),
+        piecewise_dino_scale=float(piecewise_dino_scale if piecewise_dino_scale is not None else AXIS_PIECEWISE_DINO_SCALE),
+        pairwise_from_scalar_margin=float(
+            pairwise_from_scalar_margin if pairwise_from_scalar_margin is not None else AXIS_PIECEWISE_PAIRWISE_FROM_SCALAR_MARGIN
+        ),
+        piecewise_prior_strength=float(piecewise_prior_strength if piecewise_prior_strength is not None else AXIS_PIECEWISE_PRIOR_STRENGTH),
+        piecewise_expert_diversity_strength=float(
+            piecewise_expert_diversity_strength if piecewise_expert_diversity_strength is not None else AXIS_PIECEWISE_EXPERT_DIVERSITY_STRENGTH
+        ),
+        piecewise_l2_reg=float(piecewise_l2_reg if piecewise_l2_reg is not None else AXIS_PIECEWISE_L2_REG),
+        piecewise_learning_rate=float(piecewise_learning_rate if piecewise_learning_rate is not None else AXIS_PIECEWISE_LEARNING_RATE),
+        piecewise_max_refine_steps=int(piecewise_max_refine_steps or AXIS_PIECEWISE_MAX_REFINE_STEPS),
+        alpha=float(alpha if alpha is not None else AXIS_BAYES_ALPHA),
+        dino_alpha=float(dino_alpha if dino_alpha is not None else AXIS_BAYES_DINO_ALPHA),
+        bias_alpha=float(bias_alpha if bias_alpha is not None else AXIS_BAYES_BIAS_ALPHA),
+        sigma2=float(sigma2 if sigma2 is not None else AXIS_BAYES_SIGMA2),
+        graph_knn_k=int(graph_knn_k or AXIS_BAYES_GRAPH_KNN_K),
+        graph_lambda_smooth=float(graph_lambda_smooth if graph_lambda_smooth is not None else AXIS_BAYES_GRAPH_LAMBDA_SMOOTH),
+        graph_lambda_prior=float(graph_lambda_prior if graph_lambda_prior is not None else AXIS_BAYES_GRAPH_LAMBDA_PRIOR),
+        graph_jitter=float(graph_jitter if graph_jitter is not None else AXIS_BAYES_GRAPH_JITTER),
+        move_trust=AXIS_BAYES_MOVE_TRUST,
+        move_mag_gain=AXIS_BAYES_MOVE_MAG_GAIN,
+        rank_eta=float(rank_eta if rank_eta is not None else AXIS_BAYES_RANK_ETA),
+        rank_anchor_k=int(rank_anchor_k or AXIS_BAYES_RANK_ANCHOR_K),
+        rank_anchor_delta=float(rank_anchor_delta if rank_anchor_delta is not None else AXIS_BAYES_RANK_ANCHOR_DELTA),
+        rank_max_pairs=int(rank_max_pairs or AXIS_BAYES_RANK_MAX_PAIRS),
+        residual_alpha=float(residual_alpha if residual_alpha is not None else AXIS_RESIDUAL_ALPHA),
+        residual_beta=float(residual_beta if residual_beta is not None else AXIS_RESIDUAL_BETA),
+        residual_lambda=float(residual_lambda if residual_lambda is not None else AXIS_RESIDUAL_LAMBDA),
+        residual_sigma_y=float(residual_sigma_y if residual_sigma_y is not None else AXIS_RESIDUAL_SIGMA_Y),
+        residual_lengthscale_multiplier=float(
+            residual_lengthscale_multiplier if residual_lengthscale_multiplier is not None else AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER
+        ),
+        residual_jitter=float(residual_jitter if residual_jitter is not None else AXIS_RESIDUAL_JITTER),
+        max_moves=AXIS_BAYES_MAX_MOVES,
+        hotspot_boundary=AXIS_BAYES_HOTSPOT_BOUNDARY,
+        hotspot_tau=AXIS_BAYES_HOTSPOT_TAU,
+        hotspot_k=AXIS_BAYES_HOTSPOT_K,
+        exemplar_k=AXIS_BAYES_EXEMPLAR_K,
+    )
+
+
+AXIS_BAYES_ENGINE = _make_axis_engine()
 
 
 def _llm_api_log(req_id: str, message: str):
@@ -262,10 +343,7 @@ def resolve_dataset_root(name_or_none: str | None) -> Path:
 
 
 def _normalize_session_name(value: Any) -> str:
-    session = str(value or '').strip()
-    if session in SESSION_NAMES:
-        return session
-    return DEFAULT_SESSION_NAME
+    return normalize_session_name(value, default=DEFAULT_SESSION_NAME)
 
 
 def _resolve_session_from_payload(payload: Dict[str, Any] | None) -> str:
@@ -278,18 +356,27 @@ def _resolve_session_from_payload(payload: Dict[str, Any] | None) -> str:
 
 
 def _session_dir(session_name: str) -> Path:
-    session = _normalize_session_name(session_name)
-    path = (SESSIONS_ROOT / session).resolve()
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return session_dir(SESSIONS_ROOT, _normalize_session_name(session_name), create=True)
 
 
 def _session_axes_path(session_name: str) -> Path:
-    return _session_dir(session_name) / 'axes.json'
+    return session_axes_path(SESSIONS_ROOT, _normalize_session_name(session_name))
 
 
 def _session_visualizations_path(session_name: str) -> Path:
-    return _session_dir(session_name) / 'visualizations.json'
+    return session_visualizations_path(SESSIONS_ROOT, _normalize_session_name(session_name))
+
+
+def _session_subsets_path(session_name: str) -> Path:
+    return session_subsets_path(SESSIONS_ROOT, _normalize_session_name(session_name))
+
+
+def _session_activity_path(session_name: str) -> Path:
+    return session_activity_log_path(SESSIONS_ROOT, _normalize_session_name(session_name))
+
+
+def _append_session_log(session_name: str, action: Any, detail: Any) -> Path:
+    return append_session_log(SESSIONS_ROOT, _normalize_session_name(session_name), action, detail)
 
 
 def _axis_library_key(raw: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -369,7 +456,7 @@ def _migrate_legacy_axes_to_default_session() -> None:
     legacy_path = LEGACY_AXIS_LIBRARY_PATH
     if not legacy_path.exists():
         return
-    target_path = _session_axes_path(DEFAULT_SESSION_NAME)
+    target_path = _session_axes_path(LEGACY_SESSION_NAME)
     existing = _read_library_file(target_path, _axis_library_item, include_artifact=True)
     existing_keys = {_axis_library_key(item) for item in existing}
     legacy_items = _read_library_file(legacy_path, _axis_library_item, include_artifact=True)
@@ -410,7 +497,10 @@ def _visualization_library_item(raw: Any, include_artifact: bool = False) -> Opt
     if not item_id or not name or not dataset:
         return None
     custom_axes = raw.get('custom_axes') if isinstance(raw.get('custom_axes'), list) else []
+    subset_chips = raw.get('subset_chips') if isinstance(raw.get('subset_chips'), list) else []
+    subset_filters = raw.get('subset_filters') if isinstance(raw.get('subset_filters'), list) else []
     subset_filter = raw.get('subset_filter') if isinstance(raw.get('subset_filter'), dict) else None
+    histogram_slices = raw.get('histogram_slices') if isinstance(raw.get('histogram_slices'), list) else []
     item = {
         'id': item_id,
         'name': name,
@@ -422,10 +512,17 @@ def _visualization_library_item(raw: Any, include_artifact: bool = False) -> Opt
         'created_at': created_at,
         'updated_at': updated_at,
         'custom_axis_count': len(custom_axes),
-        'subset_active': bool(isinstance(subset_filter, dict) and subset_filter.get('ids')),
+        'subset_active': bool(
+            len(subset_chips) > 0
+            or len(subset_filters) > 0
+            or len(histogram_slices) > 0
+            or (isinstance(subset_filter, dict) and subset_filter.get('ids'))
+        ),
     }
     if include_artifact:
-        item['histogram_slices'] = raw.get('histogram_slices') if isinstance(raw.get('histogram_slices'), list) else []
+        item['histogram_slices'] = histogram_slices
+        item['subset_chips'] = subset_chips
+        item['subset_filters'] = subset_filters
         item['subset_filter'] = subset_filter or None
         item['view_state'] = raw.get('view_state') if isinstance(raw.get('view_state'), dict) else {}
         item['minimap_size_offset'] = float(raw.get('minimap_size_offset') or 0.0)
@@ -447,6 +544,48 @@ def _visualization_library_read(
 
 def _visualization_library_write(session_name: str, items: List[Dict[str, Any]]) -> None:
     _write_library_file(_session_visualizations_path(session_name), items, _visualization_library_item)
+
+
+def _subset_library_item(raw: Any, include_artifact: bool = False) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    item_id = str(raw.get('id') or '').strip()
+    name = str(raw.get('name') or '').strip()
+    dataset = str(raw.get('dataset') or '').strip()
+    created_at = str(raw.get('created_at') or '').strip()
+    updated_at = str(raw.get('updated_at') or '').strip()
+    subset_chips = raw.get('subset_chips') if isinstance(raw.get('subset_chips'), list) else []
+    image_count = int(raw.get('image_count') or 0)
+    if not item_id or not name or not dataset:
+        return None
+    item = {
+        'id': item_id,
+        'name': name,
+        'dataset': dataset,
+        'created_at': created_at,
+        'updated_at': updated_at,
+        'chip_count': int(len(subset_chips)),
+        'image_count': image_count,
+        'subset_active': bool(len(subset_chips) > 0),
+    }
+    if include_artifact:
+        item['subset_chips'] = subset_chips
+    return item
+
+
+def _subset_library_read(
+    session_name: str = DEFAULT_SESSION_NAME,
+    include_artifact: bool = False,
+) -> List[Dict[str, Any]]:
+    return _read_library_file(
+        _session_subsets_path(session_name),
+        _subset_library_item,
+        include_artifact=include_artifact,
+    )
+
+
+def _subset_library_write(session_name: str, items: List[Dict[str, Any]]) -> None:
+    _write_library_file(_session_subsets_path(session_name), items, _subset_library_item)
 
 
 def _project_saved_axis_payload(
@@ -475,6 +614,7 @@ def _project_saved_axis_payload(
         mode=str(serialized_axis.get('mode') or mode or AXIS_BAYES_MODE),
         feature_space=str(serialized_axis.get('feature_space') or AXIS_BAYES_FEATURE_SPACE),
         semantic_method=str(serialized_axis.get('semantic_method') or AXIS_BAYES_SEMANTIC_METHOD),
+        norm=bool(serialized_axis.get('norm') if 'norm' in serialized_axis else AXIS_BAYES_NORM),
         clip_weight=max(1e-6, clip_scale * clip_scale),
         dino_weight=max(1e-6, dino_scale * dino_scale) if dino_scale > 0 else 1e-6,
         piecewise_num_experts=int(serialized_axis.get('piecewise_num_experts') or AXIS_PIECEWISE_NUM_EXPERTS),
@@ -580,6 +720,32 @@ def _semantic_method_or_default(method: str) -> str:
     if normalized in {'clip', 'siglip2'}:
         return normalized
     return DEFAULT_SEMANTIC_EMBED_METHOD
+
+
+def _parse_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raw = str(value).strip().lower()
+    if raw in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if raw in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    return None
+
+
+def _requested_axis_semantic_method(payload: Dict[str, Any]) -> Optional[str]:
+    normalized = normalize_multimodal_method(
+        payload.get('semantic_method') or payload.get('semanticMethod') or payload.get('axis_embed') or payload.get('axisEmbed') or ''
+    )
+    if normalized in {'clip', 'siglip2'}:
+        return normalized
+    return None
+
+
+def _requested_axis_norm(payload: Dict[str, Any]) -> Optional[bool]:
+    return _parse_optional_bool(payload.get('norm') if 'norm' in payload else payload.get('axis_norm', payload.get('axisNorm')))
 
 
 def _load_semantic_embeddings(dataset_root: Path, preferred_method: str = DEFAULT_SEMANTIC_EMBED_METHOD):
@@ -1217,7 +1383,10 @@ def gallery() -> Any:
     dataset_name = request.args.get('dataset')
     dataset_path = resolve_dataset_root(dataset_name)
     dataset = str(dataset_path)
-    method = request.args.get('method', 'pca').lower()
+    try:
+        method = normalize_reduction_method(request.args.get('method', INITIAL_GALLERY_PROJECTION_METHOD))
+    except ValueError as exc:
+        abort(400, description=str(exc))
     embed_method = normalize_multimodal_method(request.args.get('embed', DEFAULT_SEMANTIC_EMBED_METHOD))
     # 'text' is a frontend-only view; map to a real embedding for gallery fallbacks
     if embed_method == 'text':
@@ -1297,6 +1466,7 @@ def gallery() -> Any:
                     'n_tile': n_tile,
                     'method': method,
                     'embed': embed_method,
+                    'embedding_file': embedding_cache_filename(embed_method, normalize=True),
                     'metadata_axes': metadata_axes,
                     'warning': warning})
 
@@ -1668,18 +1838,32 @@ def axis_create():
     q = str(payload.get('q') or payload.get('attribute') or '').strip()
     mode = str(payload.get('mode') or '').strip() or None
     model_type = str(payload.get('model_type') or payload.get('modelType') or '').strip() or None
+    requested_semantic_method = _requested_axis_semantic_method(payload)
+    requested_norm = _requested_axis_norm(payload)
     collection_id = str(payload.get('collection_id') or payload.get('dataset') or dataset_root.name).strip()
     if not q:
         abort(400, description='Missing q')
 
     try:
-        result = AXIS_BAYES_ENGINE.create_axis(
+        engine = AXIS_BAYES_ENGINE
+        if requested_semantic_method is not None or requested_norm is not None or mode is not None or model_type is not None:
+            engine = _make_axis_engine(
+                model_type=model_type or AXIS_MODEL_TYPE,
+                mode=mode or AXIS_BAYES_MODE,
+                semantic_method=requested_semantic_method or AXIS_BAYES_SEMANTIC_METHOD,
+                norm=AXIS_BAYES_NORM if requested_norm is None else requested_norm,
+            )
+        result = engine.create_axis(
             collection_id=collection_id,
             dataset_root=str(dataset_root),
             q=q,
             mode=mode,
             model_type=model_type,
         )
+        axis_id = str(result.get('axis_id') or '').strip()
+        state = getattr(engine, '_axes', {}).get(axis_id)
+        if state is not None:
+            AXIS_BAYES_ENGINE._axes[axis_id] = state
     except Exception as e:
         abort(500, description=f'Axis creation failed: {e}')
     return jsonify(result)
@@ -1696,7 +1880,7 @@ def axis_move():
         abort(400, description='Missing axis_id')
     if not image_id:
         abort(400, description='Missing image_id')
-    if move_type in {'undefined', 'exclude'}:
+    if move_type in {'undefined', 'exclude', 'delete', 'remove'}:
         new_score_0_100 = 0.0
     else:
         try:
@@ -1750,18 +1934,49 @@ def axis_update_prompts():
 def sessions_list():
     _migrate_legacy_axes_to_default_session()
     items = []
-    for session_name in SESSION_NAMES:
-        session_dir = _session_dir(session_name)
+    for session_name in iter_session_names(SESSIONS_ROOT, include_default=True):
         axes_count = len(_axis_library_read(session_name=session_name, include_artifact=False))
         visualizations_count = len(_visualization_library_read(session_name=session_name, include_artifact=False))
-        items.append({
-            'id': session_name,
-            'label': session_name,
-            'path': str(session_dir),
-            'axes_count': axes_count,
-            'visualizations_count': visualizations_count,
-        })
+        items.append(session_summary(
+            SESSIONS_ROOT,
+            session_name,
+            axes_count=axes_count,
+            visualizations_count=visualizations_count,
+        ))
     return jsonify({'items': items, 'default': DEFAULT_SESSION_NAME})
+
+
+@app.post('/sessions/open')
+def sessions_open():
+    payload = request.get_json(silent=True) or {}
+    requested = payload.get('session') or payload.get('name') or payload.get('value')
+    session_name = _normalize_session_name(requested)
+    axes_count = len(_axis_library_read(session_name=session_name, include_artifact=False))
+    visualizations_count = len(_visualization_library_read(session_name=session_name, include_artifact=False))
+    summary = session_summary(
+        SESSIONS_ROOT,
+        session_name,
+        axes_count=axes_count,
+        visualizations_count=visualizations_count,
+    )
+    _append_session_log(session_name, 'enter session', session_name)
+    return jsonify({'ok': True, 'session': session_name, 'item': summary})
+
+
+@app.post('/session/log')
+def session_log():
+    payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
+    action = payload.get('action')
+    detail = payload.get('detail')
+    if not str(action or '').strip():
+        abort(400, description='Missing action')
+    path = _append_session_log(session_name, action, detail)
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'path': str(path),
+    })
 
 
 @app.get('/axis/library')
@@ -1965,6 +2180,8 @@ def visualization_library_save():
         })
 
     histogram_slices = payload.get('histogram_slices') if isinstance(payload.get('histogram_slices'), list) else []
+    subset_chips = payload.get('subset_chips') if isinstance(payload.get('subset_chips'), list) else []
+    subset_filters = payload.get('subset_filters') if isinstance(payload.get('subset_filters'), list) else []
     subset_filter = payload.get('subset_filter') if isinstance(payload.get('subset_filter'), dict) else None
     view_state = payload.get('view_state') if isinstance(payload.get('view_state'), dict) else {}
     minimap_size_offset = float(payload.get('minimap_size_offset') or 0.0)
@@ -1991,6 +2208,8 @@ def visualization_library_save():
             'selected_x_name': selected_x_name,
             'selected_y_name': selected_y_name,
             'histogram_slices': histogram_slices,
+            'subset_chips': subset_chips,
+            'subset_filters': subset_filters,
             'subset_filter': subset_filter,
             'view_state': view_state,
             'minimap_size_offset': minimap_size_offset,
@@ -2015,6 +2234,8 @@ def visualization_library_save():
         'selected_x_name': selected_x_name,
         'selected_y_name': selected_y_name,
         'histogram_slices': histogram_slices,
+        'subset_chips': subset_chips,
+        'subset_filters': subset_filters,
         'subset_filter': subset_filter,
         'view_state': view_state,
         'minimap_size_offset': minimap_size_offset,
@@ -2108,6 +2329,8 @@ def visualization_library_project():
         'selected_x_name': str(item.get('selected_x_name') or ''),
         'selected_y_name': str(item.get('selected_y_name') or ''),
         'histogram_slices': item.get('histogram_slices') if isinstance(item.get('histogram_slices'), list) else [],
+        'subset_chips': item.get('subset_chips') if isinstance(item.get('subset_chips'), list) else [],
+        'subset_filters': item.get('subset_filters') if isinstance(item.get('subset_filters'), list) else [],
         'subset_filter': item.get('subset_filter') if isinstance(item.get('subset_filter'), dict) else None,
         'view_state': item.get('view_state') if isinstance(item.get('view_state'), dict) else {},
         'minimap_size_offset': float(item.get('minimap_size_offset') or 0.0),
@@ -2120,6 +2343,114 @@ def visualization_library_project():
         'visualization': visualization,
         'projected_axes': projected_axes,
         'axis_id_map': axis_id_map,
+    })
+
+
+@app.get('/subset/library')
+def subset_library_list():
+    session_name = _resolve_session_from_payload(None)
+    items = _subset_library_read(session_name=session_name, include_artifact=False)
+    return jsonify({'session': session_name, 'items': items})
+
+
+@app.post('/subset/library/save')
+def subset_library_save():
+    payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
+    dataset_root = _resolve_dataset_from_payload(payload)
+    dataset_name = str(payload.get('dataset') or dataset_root.name).strip() or dataset_root.name
+    name = str(payload.get('name') or '').strip()
+    if not name:
+        abort(400, description='Missing subset name')
+
+    subset_chips = payload.get('subset_chips') if isinstance(payload.get('subset_chips'), list) else []
+    image_count = int(payload.get('image_count') or 0)
+    if len(subset_chips) == 0:
+        abort(400, description='Missing subset_chips')
+
+    items = _subset_library_read(session_name=session_name, include_artifact=True)
+    existing = next(
+        (
+            it for it in items
+            if str(it.get('name') or '').strip().lower() == name.lower()
+            and str(it.get('dataset') or '').strip().lower() == dataset_name.lower()
+        ),
+        None,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if existing:
+        existing.update({
+            'dataset': dataset_name,
+            'subset_chips': subset_chips,
+            'image_count': image_count,
+            'updated_at': now_iso,
+        })
+        _subset_library_write(session_name, items)
+        return jsonify({
+            'ok': True,
+            'session': session_name,
+            'item': _subset_library_item(existing),
+            'items': _subset_library_read(session_name=session_name),
+        })
+
+    item = {
+        'id': f'subsetlib:{uuid.uuid4().hex[:12]}',
+        'name': name,
+        'dataset': dataset_name,
+        'subset_chips': subset_chips,
+        'image_count': image_count,
+        'created_at': now_iso,
+        'updated_at': now_iso,
+    }
+    items.append(item)
+    _subset_library_write(session_name, items)
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'item': _subset_library_item(item),
+        'items': _subset_library_read(session_name=session_name),
+    })
+
+
+@app.delete('/subset/library/<path:item_id>')
+def subset_library_delete(item_id: str):
+    session_name = _resolve_session_from_payload(None)
+    subset_id = str(item_id or '').strip()
+    if not subset_id:
+        abort(400, description='Missing item id')
+    items = _subset_library_read(session_name=session_name, include_artifact=True)
+    next_items = [it for it in items if str(it.get('id') or '').strip() != subset_id]
+    if len(next_items) == len(items):
+        abort(404, description='Subset library item not found')
+    _subset_library_write(session_name, next_items)
+    return jsonify({'ok': True, 'session': session_name, 'items': _subset_library_read(session_name=session_name)})
+
+
+@app.post('/subset/library/project')
+def subset_library_project():
+    payload = request.get_json(silent=True) or {}
+    session_name = _resolve_session_from_payload(payload)
+    subset_id = str(payload.get('subset_id') or payload.get('id') or '').strip()
+    if not subset_id:
+        abort(400, description='Missing subset_id')
+
+    items = _subset_library_read(session_name=session_name, include_artifact=True)
+    item = next((it for it in items if str(it.get('id') or '').strip() == subset_id), None)
+    if not item:
+        abort(404, description='Subset library item not found')
+
+    subset = {
+        'id': str(item.get('id') or ''),
+        'name': str(item.get('name') or ''),
+        'dataset': str(item.get('dataset') or ''),
+        'subset_chips': item.get('subset_chips') if isinstance(item.get('subset_chips'), list) else [],
+        'image_count': int(item.get('image_count') or 0),
+        'session': session_name,
+    }
+    return jsonify({
+        'ok': True,
+        'session': session_name,
+        'subset': subset,
     })
 
 
@@ -2152,6 +2483,7 @@ def llm_extract_attributes():
     result = LLM_ENGINE.extract_attributes(
         prompt=prompt,
         max_attributes=max_attributes,
+        dataset_name=dataset_root.name,
     )
     attrs = result.get('attributes') or []
     if len(attrs) == 0:
@@ -2544,7 +2876,7 @@ def text_force():
     - rect: { x, y, w, h } in normalized [0,1] (required)
     - embed: embedding method for text/image space, e.g., 'siglip2' (default 'siglip2')
     - alpha: float force strength (default 0.25)
-    - method: 'pca' or 'umap' for 2D reduction (default 'pca')
+    - method: 'pca', 'umap', or 'tsne' for 2D reduction (default is the backend gallery default)
     """
     dataset = app.config.get('DATASET_ROOT') or str(DATASET_PATH)
     if not dataset or not Path(dataset).exists():
@@ -2553,7 +2885,10 @@ def text_force():
     text = payload.get('text', '').strip()
     rect = payload.get('rect') or {}
     embed_method = normalize_multimodal_method(payload.get('embed') or DEFAULT_SEMANTIC_EMBED_METHOD)
-    red_method = (payload.get('method') or 'pca').lower()
+    try:
+        red_method = normalize_reduction_method(payload.get('method', INITIAL_GALLERY_PROJECTION_METHOD))
+    except ValueError as exc:
+        abort(400, description=str(exc))
     alpha = float(payload.get('alpha') or 0.25)
     if not text or not isinstance(rect, dict) or not all(k in rect for k in ('x','y','w','h')):
         abort(400, description='Missing text or rect')
@@ -2614,7 +2949,7 @@ def text_forces():
     - base_coords: [[x,y], ...] optional — initial positions; if missing, uses 2D coords from embed
     - embed: embedding method for similarity space (default 'siglip2')
     - alpha: float force scale (default 0.25)
-    - method: dimensionality reduction method for fallback base coords (default 'pca')
+    - method: dimensionality reduction method for fallback base coords (pca, umap, tsne)
     """
     dataset = app.config.get('DATASET_ROOT') or str(DATASET_PATH)
     if not dataset or not Path(dataset).exists():
@@ -2624,7 +2959,10 @@ def text_forces():
     ids = payload.get('ids') or []
     base_coords = payload.get('base_coords')
     embed_method = normalize_multimodal_method(payload.get('embed') or DEFAULT_SEMANTIC_EMBED_METHOD)
-    red_method = (payload.get('method') or 'pca').lower()
+    try:
+        red_method = normalize_reduction_method(payload.get('method', INITIAL_GALLERY_PROJECTION_METHOD))
+    except ValueError as exc:
+        abort(400, description=str(exc))
     alpha = float(payload.get('alpha') or 0.25)
     if (not isinstance(texts, list)) or len(texts) == 0:
         abort(400, description='Missing texts array')

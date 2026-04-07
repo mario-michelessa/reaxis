@@ -1,24 +1,31 @@
 <script>
   import { onDestroy, onMount } from 'svelte'
   import AxesMinimap from './components/AxesMinimap.svelte'
+  import LoadingGate from './components/LoadingGate.svelte'
   import PromptSidebar from './components/PromptSidebar.svelte'
   import MaterialIcon from './components/MaterialIcon.svelte'
+  import { buildApiUrl, resolveApiBase } from './lib/apiBase'
+  import { appendSessionActivity, openSession } from './lib/sessionApi'
   import { axisBuildersStore } from './lib/axisBuilderStore'
+  import { axisSessionFromResponse } from './lib/axisSessions'
+  import {
+    deriveEffectiveSubsetIds,
+    hasActiveSubset,
+    normalizeHistogramSlices,
+    normalizeSubsetFilters,
+    stateFromSubsetChips,
+    subsetChipsFromState,
+  } from './lib/subsetState'
 
-  const API_BASE = (() => {
-    const fromEnv = (import.meta.env && import.meta.env.VITE_API_BASE) ? String(import.meta.env.VITE_API_BASE).trim() : ''
-    if (fromEnv) return fromEnv
-    if (typeof window !== 'undefined' && window.location) {
-      const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
-      const host = window.location.hostname || '127.0.0.1'
-      return `${protocol}//${host}:5002`
-    }
-    return 'http://127.0.0.1:5002'
-  })()
+  const API_BASE = resolveApiBase()
+  const SYSTEM_NAME = 'ReQuest'
+  const SESSION_STORAGE_KEY = 'request.activeSession'
 
   let datasets = []
-  let sessions = []
-  let currentSession = 'P0'
+  let currentSession = ''
+  let sessionPending = false
+  let sessionError = ''
+  let workspaceReady = false
   let datasetPath = ''
   let allImages = []
   let warningMsg = ''
@@ -28,8 +35,12 @@
   let axes = []
   let selectedAxisX = null
   let selectedAxisY = null
-  let embedMethod = 'siglip2'
+  let embedMethod = 'clip'
+  let axisDebugAppliedEmbeddingOption = 'clip_raw'
+  let axisDebugAppliedPriorMode = 'rank'
+  let embedFileName = ''
   let histogramSlices = []
+  let subsetFilters = []
   let minimapSizeOffset = 0
   let minimapFocusRequest = null
   let minimapViewState = null
@@ -45,6 +56,11 @@
   let savedVisualizationsSaving = false
   let savedVisualizationsBusyId = ''
   let savedVisualizationsError = ''
+  let savedSubsets = []
+  let savedSubsetsLoading = false
+  let savedSubsetsSaving = false
+  let savedSubsetsBusyId = ''
+  let savedSubsetsError = ''
 
   let minimapContainerRef
   let windowWidth = 0
@@ -66,8 +82,25 @@
   }
 
   function apiUrl(path) {
-    const base = String(API_BASE || '').trim().replace(/\/+$/, '')
-    return `${base}${path}`
+    return buildApiUrl(API_BASE, path)
+  }
+
+  $: normalizedHistogramSlices = normalizeHistogramSlices(histogramSlices)
+  $: normalizedSubsetFilters = normalizeSubsetFilters(subsetFilters)
+  $: subsetChips = subsetChipsFromState(normalizedHistogramSlices, normalizedSubsetFilters)
+  $: subsetActive = hasActiveSubset(normalizedHistogramSlices, normalizedSubsetFilters)
+  $: effectiveSubsetIds = deriveEffectiveSubsetIds(allImages, normalizedHistogramSlices, normalizedSubsetFilters)
+
+  function axisDebugRequestForOption(rawOption) {
+    const raw = String(rawOption || 'clip_raw').trim().toLowerCase()
+    if (raw === 'clip') return { semanticMethod: 'clip', norm: true }
+    if (raw === 'clip_raw') return { semanticMethod: 'clip', norm: false }
+    if (raw === 'siglip2') return { semanticMethod: 'siglip2', norm: true }
+    return { semanticMethod: 'siglip2', norm: false }
+  }
+
+  function axisDebugLayoutMethod(rawOption) {
+    return String(axisDebugRequestForOption(rawOption)?.semanticMethod || 'clip').trim() || 'clip'
   }
 
   async function postJson(path, body) {
@@ -110,55 +143,109 @@
     window.removeEventListener('pointerup', onSidebarResizeEnd)
   }
 
-  function sessionFromAxisResponse(label, data) {
-    const axis = data?.axis
-    if (!axis?.id || !axis?.coords) return null
-    const name = String(label || axis?.name || data?.q || '').trim()
-    return {
-      axisId: axis.id,
-      q: String(data?.q || name || axis?.name || '').trim(),
-      axis: {
-        ...axis,
-        name: name || axis.name,
-      },
-      ids: Array.isArray(data?.ids) ? data.ids.map((v) => String(v || '').trim()) : [],
-      projectionValues: Array.isArray(data?.projection_values) ? data.projection_values.map((v) => Number(v) || 0) : [],
-      projectionMin: Number(data?.projection_min || 0),
-      projectionMax: Number(data?.projection_max || 0),
-      scores: Array.isArray(data?.scores) ? data.scores.map((v) => Number(v) || 0) : [],
-      std: Array.isArray(data?.std) ? data.std.map((v) => Number(v) || 0) : [],
-      decileExemplars: Array.isArray(data?.decile_exemplars) ? data.decile_exemplars : [],
-      hotspots: Array.isArray(data?.hotspots) ? data.hotspots : [],
-      moveCount: Number(data?.move_count || 0),
-      maxMoves: Number(data?.max_moves || 0),
-      moves: Array.isArray(data?.moves) ? data.moves : [],
-      undefinedIds: Array.isArray(data?.undefined_ids) ? data.undefined_ids.map((v) => String(v || '').trim()).filter(Boolean) : [],
-      w0Summary: data?.w0_summary || {},
-      moveHistory: [],
+  function persistSessionName(sessionName) {
+    if (typeof window === 'undefined') return
+    try {
+      if (sessionName) window.localStorage.setItem(SESSION_STORAGE_KEY, sessionName)
+      else window.localStorage.removeItem(SESSION_STORAGE_KEY)
+    } catch (_) {}
+  }
+
+  async function logSessionAction(action, detail) {
+    if (!currentSession) return
+    try {
+      await appendSessionActivity(API_BASE, currentSession, action, detail)
+    } catch (_) {}
+  }
+
+  function queueSessionAction(action, detail) {
+    logSessionAction(action, detail)
+  }
+
+  function resetSessionScopedUiState() {
+    labelDB = {}
+    histogramSlices = []
+    subsetFilters = []
+    minimapViewState = null
+    minimapRestoreState = null
+    savedAxes = []
+    savedVisualizations = []
+    savedSubsets = []
+    savedAxesBusyId = ''
+    savedVisualizationsBusyId = ''
+    savedSubsetsBusyId = ''
+    savedAxesError = ''
+    savedVisualizationsError = ''
+    savedSubsetsError = ''
+    savedAxesOpen = false
+    axisBuildersStore.reset()
+    axes = (axes || []).filter((axis) => {
+      const group = String(axis?.group || '')
+      return group === 'base' || group === 'meta'
+    })
+    selectedAxisX = fallbackAxisId('x', axes)
+    selectedAxisY = fallbackAxisId('y', axes)
+  }
+
+  async function ensureWorkspaceLoaded() {
+    if (workspaceReady) return
+    await loadDatasets()
+    await loadGallery()
+    workspaceReady = true
+  }
+
+  async function activateSession(rawSessionName) {
+    const requested = String(rawSessionName || '').trim()
+    if (!requested) {
+      sessionError = 'Enter a session name first.'
+      return
+    }
+    sessionPending = true
+    sessionError = ''
+    try {
+      const data = await openSession(API_BASE, requested)
+      const nextSession = String(data?.session || data?.item?.id || '').trim()
+      if (!nextSession) throw new Error('Backend did not return a session name.')
+      const changed = nextSession !== currentSession
+      currentSession = nextSession
+      persistSessionName(nextSession)
+      await ensureWorkspaceLoaded()
+      if (changed) resetSessionScopedUiState()
+      await reloadSavedLibraries()
+    } catch (err) {
+      currentSession = ''
+      persistSessionName('')
+      sessionError = `Failed to open session: ${String(err)}`
+    } finally {
+      sessionPending = false
     }
   }
 
-  async function loadSessions() {
-    try {
-      const res = await fetch(apiUrl('/sessions'))
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
-      const nextSessions = Array.isArray(data?.items) ? data.items : []
-      sessions = nextSessions.length > 0 ? nextSessions : Array.from({ length: 16 }, (_, i) => ({ id: `P${i}`, label: `P${i}` }))
-      const preferred = String(data?.default || currentSession || 'P0').trim()
-      currentSession = sessions.some((item) => item?.id === preferred) ? preferred : (sessions[0]?.id || 'P0')
-    } catch (_) {
-      sessions = Array.from({ length: 16 }, (_, i) => ({ id: `P${i}`, label: `P${i}` }))
-      if (!sessions.some((item) => item.id === currentSession)) currentSession = 'P0'
-    }
+  function closeSessionGate() {
+    currentSession = ''
+    sessionError = ''
+    sessionPending = false
+    savedAxesLoading = false
+    savedAxesSaving = false
+    savedVisualizationsLoading = false
+    savedVisualizationsSaving = false
+    savedSubsetsLoading = false
+    savedSubsetsSaving = false
+    persistSessionName('')
+    resetSessionScopedUiState()
   }
 
   async function loadSavedAxesLibrary() {
+    if (!currentSession) {
+      savedAxes = []
+      savedAxesLoading = false
+      return
+    }
     savedAxesLoading = true
     savedAxesError = ''
     try {
       const qs = new URLSearchParams()
-      qs.set('session', currentSession || 'P0')
+      qs.set('session', currentSession)
       const res = await fetch(apiUrl(`/axis/library?${qs.toString()}`))
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -172,11 +259,16 @@
   }
 
   async function loadSavedVisualizationsLibrary() {
+    if (!currentSession) {
+      savedVisualizations = []
+      savedVisualizationsLoading = false
+      return
+    }
     savedVisualizationsLoading = true
     savedVisualizationsError = ''
     try {
       const qs = new URLSearchParams()
-      qs.set('session', currentSession || 'P0')
+      qs.set('session', currentSession)
       const res = await fetch(apiUrl(`/visualization/library?${qs.toString()}`))
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -189,14 +281,66 @@
     }
   }
 
+  async function loadSavedSubsetsLibrary() {
+    if (!currentSession) {
+      savedSubsets = []
+      savedSubsetsLoading = false
+      return
+    }
+    savedSubsetsLoading = true
+    savedSubsetsError = ''
+    try {
+      const qs = new URLSearchParams()
+      qs.set('session', currentSession)
+      const res = await fetch(apiUrl(`/subset/library?${qs.toString()}`))
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      savedSubsets = Array.isArray(data?.items) ? data.items : []
+    } catch (e) {
+      savedSubsets = []
+      savedSubsetsError = `Failed to load saved subsets: ${String(e)}`
+    } finally {
+      savedSubsetsLoading = false
+    }
+  }
+
   async function reloadSavedLibraries() {
     await Promise.all([
       loadSavedAxesLibrary(),
       loadSavedVisualizationsLibrary(),
+      loadSavedSubsetsLibrary(),
     ])
   }
 
+  async function saveCurrentSubset() {
+    if (!currentSession || !datasetPath || !subsetActive) return
+    const defaultName = `${datasetPath} · ${effectiveSubsetIds.length} imgs`
+    const entered = typeof window !== 'undefined' ? window.prompt('Save subset as', defaultName) : defaultName
+    const name = String(entered || '').trim()
+    if (!name) return
+
+    savedSubsetsSaving = true
+    savedSubsetsError = ''
+    try {
+      const data = await postJson('/subset/library/save', {
+        session: currentSession,
+        name,
+        dataset: datasetPath || undefined,
+        subset_chips: subsetChips,
+        image_count: effectiveSubsetIds.length,
+      })
+      savedSubsets = Array.isArray(data?.items) ? data.items : savedSubsets
+      savedAxesOpen = true
+      await logSessionAction('save subset', name)
+    } catch (err) {
+      savedSubsetsError = `Save failed: ${String(err)}`
+    } finally {
+      savedSubsetsSaving = false
+    }
+  }
+
   async function saveAxisToLibrary(e) {
+    if (!currentSession) return
     const axisId = String(e?.detail?.axisId || '').trim()
     const axisName = String(e?.detail?.axisName || '').trim()
     const q = String(e?.detail?.q || axisName).trim()
@@ -206,7 +350,7 @@
     savedAxesError = ''
     try {
       const data = await postJson('/axis/library/save', {
-        session: currentSession || 'P0',
+        session: currentSession,
         axis_id: axisId,
         name: axisName,
         q,
@@ -216,6 +360,7 @@
       })
       savedAxes = Array.isArray(data?.items) ? data.items : savedAxes
       savedAxesOpen = true
+      await logSessionAction('save ax', axisName)
     } catch (err) {
       savedAxesError = `Save failed: ${String(err)}`
     } finally {
@@ -223,21 +368,73 @@
     }
   }
 
+  async function projectSavedSubset(item) {
+    if (!currentSession || !item?.id) return
+    savedSubsetsBusyId = String(item.id)
+    savedSubsetsError = ''
+    try {
+      const data = await postJson('/subset/library/project', {
+        session: currentSession,
+        subset_id: item.id,
+      })
+      const subset = data?.subset || {}
+      const targetDataset = String(subset?.dataset || '').trim() || datasetPath
+      if (targetDataset && targetDataset !== datasetPath) {
+        datasetPath = targetDataset
+        resetStateForDatasetChange()
+        await loadGallery()
+      } else if ((allImages || []).length === 0 && targetDataset) {
+        await loadGallery()
+      }
+      const restored = stateFromSubsetChips(Array.isArray(subset?.subset_chips) ? subset.subset_chips : [])
+      histogramSlices = restored.histogramSlices
+      subsetFilters = restored.subsetFilters
+      savedAxesOpen = false
+      await logSessionAction('retrieve subset', item?.name || item?.id || 'none')
+    } catch (err) {
+      savedSubsetsError = `Load failed: ${String(err)}`
+    } finally {
+      savedSubsetsBusyId = ''
+    }
+  }
+
+  async function removeSavedSubset(itemId) {
+    if (!currentSession) return
+    const id = String(itemId || '').trim()
+    if (!id) return
+    savedSubsetsBusyId = id
+    savedSubsetsError = ''
+    try {
+      const qs = new URLSearchParams()
+      qs.set('session', currentSession)
+      const res = await fetch(apiUrl(`/subset/library/${encodeURIComponent(id)}?${qs.toString()}`), { method: 'DELETE' })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      savedSubsets = Array.isArray(data?.items) ? data.items : savedSubsets.filter((it) => String(it?.id || '') !== id)
+    } catch (err) {
+      savedSubsetsError = `Delete failed: ${String(err)}`
+    } finally {
+      savedSubsetsBusyId = ''
+    }
+  }
+
   async function projectSavedAxis(item) {
+    if (!currentSession) return
     if (!item?.id) return
     savedAxesBusyId = String(item.id)
     savedAxesError = ''
     try {
       const data = await postJson('/axis/library/project', {
-        session: currentSession || 'P0',
+        session: currentSession,
         library_axis_id: item.id,
         dataset: datasetPath || undefined,
         collection_id: datasetPath || undefined,
       })
-      if (data?.axis?.id) {
-        upsertAxisValue({ ...data.axis, group: data.axis.group || 'prompt' })
-        const session = sessionFromAxisResponse(item.name, data)
-        if (session) axisBuildersStore.upsert(session)
+      const session = axisSessionFromResponse({ q: item.name, axis: { name: item.name } }, data, { preferredName: item.name })
+      if (session?.axis?.id) {
+        upsertAxisValue({ ...session.axis, group: session.axis.group || 'prompt' })
+        axisBuildersStore.upsert(session)
+        await logSessionAction('retrieve axis', item?.name || item?.q || item?.id || 'none')
       }
     } catch (err) {
       savedAxesError = `Load failed: ${String(err)}`
@@ -247,13 +444,14 @@
   }
 
   async function removeSavedAxis(itemId) {
+    if (!currentSession) return
     const id = String(itemId || '').trim()
     if (!id) return
     savedAxesBusyId = id
     savedAxesError = ''
     try {
       const qs = new URLSearchParams()
-      qs.set('session', currentSession || 'P0')
+      qs.set('session', currentSession)
       const res = await fetch(apiUrl(`/axis/library/${encodeURIComponent(id)}?${qs.toString()}`), { method: 'DELETE' })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -270,6 +468,24 @@
     return (axes || []).find((axis) => String(axis?.id || '').trim() === key)?.name || ''
   }
 
+  function describeViewSelection(xId = selectedAxisX, yId = selectedAxisY) {
+    const xName = axisNameById(xId) || 'none'
+    const yName = axisNameById(yId) || 'none'
+    return `x:${xName}, y:${yName}`
+  }
+
+  function applyUserAxisSelection(nextX, nextY) {
+    selectedAxisX = String(nextX || '').trim() || null
+    selectedAxisY = String(nextY || '').trim() || null
+    queueSessionAction('change view', describeViewSelection(selectedAxisX, selectedAxisY))
+  }
+
+  function applyUserAxisSelectionSlot(slot, nextId) {
+    const id = String(nextId || '').trim() || null
+    if (slot === 'x') applyUserAxisSelection(id, selectedAxisY)
+    else applyUserAxisSelection(selectedAxisX, id)
+  }
+
   function customAxesForSnapshot() {
     const builderIds = new Set((axisBuilderSessions || []).map((entry) => String(entry?.axisId || '').trim()).filter(Boolean))
     return (axes || [])
@@ -282,6 +498,7 @@
   }
 
   async function saveCurrentVisualization() {
+    if (!currentSession) return
     if (!datasetPath) return
     const defaultNameParts = [datasetPath]
     if (selectedAxisX) defaultNameParts.push(axisNameById(selectedAxisX) || 'X')
@@ -296,15 +513,17 @@
     savedVisualizationsError = ''
     try {
       const data = await postJson('/visualization/library/save', {
-        session: currentSession || 'P0',
+        session: currentSession,
         name,
         dataset: datasetPath || undefined,
         selected_x: selectedAxisX || '',
         selected_y: selectedAxisY || '',
         selected_x_name: axisNameById(selectedAxisX),
         selected_y_name: axisNameById(selectedAxisY),
-        histogram_slices: histogramSlices || [],
-        subset_filter: minimapViewState?.subsetFilter || null,
+        histogram_slices: normalizedHistogramSlices || [],
+        subset_chips: subsetChips || [],
+        subset_filters: normalizedSubsetFilters || [],
+        subset_filter: null,
         view_state: minimapViewState || {},
         minimap_size_offset: minimapSizeOffset || 0,
         axis_ids: customAxes.map((axis) => axis.id),
@@ -312,6 +531,7 @@
       })
       savedVisualizations = Array.isArray(data?.items) ? data.items : savedVisualizations
       savedAxesOpen = true
+      await logSessionAction('save visualization', name)
     } catch (err) {
       savedVisualizationsError = `Save failed: ${String(err)}`
     } finally {
@@ -335,12 +555,13 @@
   }
 
   async function projectSavedVisualization(item) {
+    if (!currentSession) return
     if (!item?.id) return
     savedVisualizationsBusyId = String(item.id)
     savedVisualizationsError = ''
     try {
       const data = await postJson('/visualization/library/project', {
-        session: currentSession || 'P0',
+        session: currentSession,
         visualization_id: item.id,
       })
       const visualization = data?.visualization || {}
@@ -357,10 +578,12 @@
 
       const projectedAxes = Array.isArray(data?.projected_axes) ? data.projected_axes : []
       for (const payload of projectedAxes) {
-        if (payload?.axis?.id) {
-          upsertAxisValue({ ...payload.axis, group: payload.axis.group || 'prompt' })
-          const nextSession = sessionFromAxisResponse(payload.axis.name, payload)
-          if (nextSession) axisBuildersStore.upsert(nextSession)
+        const nextSession = axisSessionFromResponse({ q: payload?.q || payload?.axis?.name, axis: { name: payload?.axis?.name } }, payload, {
+          preferredName: payload?.axis?.name,
+        })
+        if (nextSession?.axis?.id) {
+          upsertAxisValue({ ...nextSession.axis, group: nextSession.axis.group || 'prompt' })
+          axisBuildersStore.upsert(nextSession)
         }
       }
 
@@ -373,20 +596,43 @@
       if (selectedAxisY && !(axes || []).some((axis) => axis?.id === selectedAxisY)) {
         selectedAxisY = fallbackAxisId('y', axes)
       }
-      histogramSlices = (Array.isArray(visualization?.histogram_slices) ? visualization.histogram_slices : [])
-        .map((slice) => {
-          if (!slice || typeof slice !== 'object') return null
-          const axisId = mapSavedAxisId(slice.axisId, axisIdMap)
-          return axisId ? { ...slice, axisId } : null
-        })
-        .filter(Boolean)
+      const restoredSubsetState = (() => {
+        const subsetChipsPayload = Array.isArray(visualization?.subset_chips) ? visualization.subset_chips : []
+        if (subsetChipsPayload.length > 0) {
+          const restored = stateFromSubsetChips(subsetChipsPayload)
+          return {
+            histogramSlices: restored.histogramSlices
+              .map((slice) => {
+                const axisId = mapSavedAxisId(slice.axisId, axisIdMap)
+                return axisId ? { ...slice, axisId } : slice
+              }),
+            subsetFilters: restored.subsetFilters,
+          }
+        }
+        const legacySlices = (Array.isArray(visualization?.histogram_slices) ? visualization.histogram_slices : [])
+          .map((slice) => {
+            if (!slice || typeof slice !== 'object') return null
+            const axisId = mapSavedAxisId(slice.axisId, axisIdMap)
+            return axisId ? { ...slice, axisId } : null
+          })
+          .filter(Boolean)
+        const legacyFilters = Array.isArray(visualization?.subset_filters)
+          ? visualization.subset_filters
+          : (visualization?.subset_filter ? [visualization.subset_filter] : [])
+        return {
+          histogramSlices: legacySlices,
+          subsetFilters: legacyFilters,
+        }
+      })()
+      histogramSlices = restoredSubsetState.histogramSlices
+      subsetFilters = restoredSubsetState.subsetFilters
       minimapSizeOffset = Number(visualization?.minimap_size_offset || 0) || 0
       minimapRestoreState = {
         ...(visualization?.view_state && typeof visualization.view_state === 'object' ? visualization.view_state : {}),
-        subsetFilter: visualization?.subset_filter || visualization?.view_state?.subsetFilter || null,
         nonce: Date.now(),
       }
       savedAxesOpen = false
+      await logSessionAction('retrieve visualization', item?.name || item?.id || 'none')
     } catch (err) {
       savedVisualizationsError = `Load failed: ${String(err)}`
     } finally {
@@ -395,13 +641,14 @@
   }
 
   async function removeSavedVisualization(itemId) {
+    if (!currentSession) return
     const id = String(itemId || '').trim()
     if (!id) return
     savedVisualizationsBusyId = id
     savedVisualizationsError = ''
     try {
       const qs = new URLSearchParams()
-      qs.set('session', currentSession || 'P0')
+      qs.set('session', currentSession)
       const res = await fetch(apiUrl(`/visualization/library/${encodeURIComponent(id)}?${qs.toString()}`), { method: 'DELETE' })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -441,9 +688,10 @@
     axes = []
     selectedAxisX = null
     selectedAxisY = null
-    embedMethod = 'siglip2'
+    embedMethod = axisDebugLayoutMethod(axisDebugAppliedEmbeddingOption)
     labelDB = {}
     histogramSlices = []
+    subsetFilters = []
     minimapViewState = null
     minimapRestoreState = null
     minimapSizeOffset = 0
@@ -452,10 +700,20 @@
     axisBuildersStore.reset()
   }
 
+  function isBaseAxisId(axisId) {
+    const id = String(axisId || '').trim()
+    if (!id) return false
+    if (/^axis:[^:]+:[xy]$/.test(id)) return true
+    const axis = (axes || []).find((entry) => String(entry?.id || '').trim() === id)
+    return String(axis?.group || '').trim() === 'base'
+  }
+
   function ensureDefaultAxesForCurrentProjection() {
-    const methodName = String(embedMethod || 'siglip2')
+    const methodName = String(embedMethod || 'clip')
     const idX = `axis:${methodName}:x`
     const idY = `axis:${methodName}:y`
+    const previousXWasBase = isBaseAxisId(selectedAxisX)
+    const previousYWasBase = isBaseAxisId(selectedAxisY)
 
     const coordsX = {}
     const coordsY = {}
@@ -464,13 +722,17 @@
       coordsY[item.id] = Number(item.y ?? 0)
     }
 
-    const next = new Map(axes.map((axis) => [axis.id, axis]))
+    const next = new Map(
+      (axes || [])
+        .filter((axis) => String(axis?.group || '').trim() !== 'base')
+        .map((axis) => [axis.id, axis])
+    )
     next.set(idX, { id: idX, name: 'Embedding X', coords: coordsX, group: 'base' })
     next.set(idY, { id: idY, name: 'Embedding Y', coords: coordsY, group: 'base' })
     axes = Array.from(next.values())
 
-    if (!selectedAxisX || !next.has(selectedAxisX)) selectedAxisX = idX
-    if (!selectedAxisY || !next.has(selectedAxisY)) selectedAxisY = idY
+    if (!selectedAxisX || previousXWasBase || !next.has(selectedAxisX)) selectedAxisX = idX
+    if (!selectedAxisY || previousYWasBase || !next.has(selectedAxisY)) selectedAxisY = idY
   }
 
   function toThumbPath(u, size = MINIMAP_THUMB_SIZE) {
@@ -482,7 +744,7 @@
   function prefixUrl(u) {
     if (!u) return ''
     if (u.startsWith('http://') || u.startsWith('https://')) return u
-    if (u.startsWith('/')) return API_BASE + u
+    if (u.startsWith('/')) return buildApiUrl(API_BASE, u)
     return u
   }
 
@@ -519,7 +781,7 @@
 
   async function loadDatasets() {
     try {
-      const res = await fetch(`${API_BASE}/datasets`)
+      const res = await fetch(apiUrl('/datasets'))
       if (!res.ok) throw new Error(`datasets ${res.status}`)
       const data = await res.json()
       if (!Array.isArray(data) || data.length === 0) throw new Error('empty datasets')
@@ -527,7 +789,10 @@
         label: d?.label || d?.value || 'Dataset',
         value: d?.value || d?.label || '',
       }))
-      if (!datasetPath && datasets.length > 0) datasetPath = datasets[0].value
+      if (!datasetPath && datasets.length > 0) {
+        const preferredDataset = datasets.find((item) => String(item?.value || '').trim() === 'EmoSet')
+        datasetPath = preferredDataset?.value || datasets[0].value
+      }
       return
     } catch (e) {
       datasets = []
@@ -537,27 +802,29 @@
   }
 
   async function loadGallery() {
-    const cacheKey = `${datasetPath}|${embedMethod}|pca`
+    const cacheKey = `${datasetPath}|${embedMethod}|initial`
     if (galleryCache.has(cacheKey)) {
       const cached = galleryCache.get(cacheKey)
       allImages = cached.items
       warningMsg = cached.warning || ''
+      embedFileName = String(cached.embeddingFile || '').trim()
+      embedMethod = String(cached.embedMethod || embedMethod || 'clip').trim() || 'clip'
       ensureDefaultAxesForCurrentProjection()
-      return
+      return true
     }
 
     const qs = new URLSearchParams()
-    qs.set('method', 'pca')
     qs.set('embed', embedMethod)
     if (datasetPath) qs.set('dataset', datasetPath)
 
     try {
-      const res = await fetch(`${API_BASE}/gallery.json?${qs.toString()}`)
+      const res = await fetch(apiUrl(`/gallery.json?${qs.toString()}`))
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
       if (!data || !Array.isArray(data.items)) throw new Error('Invalid gallery payload')
-      const effectiveEmbedMethod = String(data.embed || embedMethod || 'siglip2')
+      const effectiveEmbedMethod = String(data.embed || embedMethod || 'clip')
       if (effectiveEmbedMethod) embedMethod = effectiveEmbedMethod
+      embedFileName = String(data.embedding_file || '').trim()
 
       allImages = data.items.map((item) => ({
         ...(() => {
@@ -597,22 +864,29 @@
         axes = Array.from(existing.values())
       }
 
-      galleryCache.set(cacheKey, { items: allImages, warning: warningMsg })
+      galleryCache.set(cacheKey, {
+        items: allImages,
+        warning: warningMsg,
+        embeddingFile: embedFileName,
+        embedMethod: String(embedMethod || effectiveEmbedMethod || 'clip').trim() || 'clip',
+      })
       schedulePrefetch(allImages.slice(0, PREFETCH_MAX).map((item) => item.thumbUrl || item.url))
       ensureDefaultAxesForCurrentProjection()
-      return
+      return true
     } catch (e) {
       warningMsg = `Failed to load gallery from backend: ${String(e)}`
       allImages = []
+      embedFileName = ''
       ensureDefaultAxesForCurrentProjection()
+      return false
     }
   }
 
   onMount(async () => {
-    await loadSessions()
-    await loadDatasets()
-    await loadGallery()
-    await reloadSavedLibraries()
+    const stored = typeof window !== 'undefined'
+      ? String(window.localStorage.getItem(SESSION_STORAGE_KEY) || '').trim()
+      : ''
+    if (stored) await activateSession(stored)
   })
 
   onDestroy(() => {
@@ -642,15 +916,27 @@
     }
   }
 
+  function cloneAxisValue(axis, existing = null) {
+    const source = axis && typeof axis === 'object' ? axis : {}
+    const previous = existing && typeof existing === 'object' ? existing : {}
+    return {
+      ...source,
+      group: String(source.group || previous.group || 'prompt').trim() || 'prompt',
+      coords: source.coords && typeof source.coords === 'object' ? { ...source.coords } : {},
+      labels: Array.isArray(source.labels) ? [...source.labels] : [],
+      label_positions: Array.isArray(source.label_positions) ? [...source.label_positions] : [],
+    }
+  }
+
   function upsertAxisValue(axis) {
     if (!axis || !axis.id) return
     let found = false
     const next = axes.map((existing) => {
       if (existing.id !== axis.id) return existing
       found = true
-      return { ...existing, ...axis }
+      return cloneAxisValue(axis, existing)
     })
-    axes = found ? next : [{ ...axis, group: axis.group || 'prompt' }, ...next]
+    axes = found ? next : [cloneAxisValue(axis), ...next]
   }
 
   function upsertAxis(e) {
@@ -658,7 +944,7 @@
   }
 
   function fallbackAxisId(slot, nextAxes) {
-    const preferred = `axis:${String(embedMethod || 'siglip2')}:${slot}`
+    const preferred = `axis:${String(embedMethod || 'clip')}:${slot}`
     if (Array.isArray(nextAxes) && nextAxes.some((axis) => axis?.id === preferred)) return preferred
     return Array.isArray(nextAxes) && nextAxes.length > 0 ? nextAxes[0].id : null
   }
@@ -682,6 +968,7 @@
 
 <svelte:window bind:innerWidth={windowWidth} bind:innerHeight={windowHeight} />
 
+{#if currentSession}
 <div class="app-main app-shell text-gray-900">
   <header class="app-header">
     <div class="app-header-inner">
@@ -697,7 +984,8 @@
             if ((datasetPath || '') === (next || '')) return
             datasetPath = next
             resetStateForDatasetChange()
-            await loadGallery()
+            const loaded = await loadGallery()
+            if (loaded) await logSessionAction('change dataset', next)
           }}
         >
           {#each datasets as d}
@@ -705,22 +993,16 @@
           {/each}
         </select>
       </div>
-      <div class="inline-flex items-center gap-2">
-        <label for="session-select" class="text-xs text-gray-700">Session</label>
-        <select
-          id="session-select"
-          class="text-xs"
-          on:change={async (e) => {
-            const next = String(e.currentTarget.value || '').trim()
-            if (!next || next === currentSession) return
-            currentSession = next
-            await reloadSavedLibraries()
-          }}
-        >
-          {#each sessions as s}
-            <option value={s.id} selected={(currentSession || '') === (s.id || '')}>{s.label || s.id}</option>
-          {/each}
-        </select>
+      <div class="session-chip" title={`Active session: ${currentSession}`}>
+        <span class="session-chip-label">Session</span>
+        <span class="session-chip-value">{currentSession}</span>
+        <button
+          type="button"
+          class="session-chip-close"
+          aria-label="Switch session"
+          title="Switch session"
+          on:click={closeSessionGate}
+        ><MaterialIcon name="lock" size={14} /></button>
       </div>
       <div class="flex-1" />
       <button
@@ -745,21 +1027,26 @@
         <div class="tile tile-primary">
           <div class="tile-header flex items-center gap-2">
             <span class="i-heroicons-chat-bubble-left-right text-slate-600" />
-            Axes creation
+            Axis suggestion
           </div>
           <div class="tile-content">
             <PromptSidebar
               {axes}
               items={allImages}
-              externalSlices={histogramSlices}
+              externalSlices={normalizedHistogramSlices}
+              subsetIds={effectiveSubsetIds}
+              subsetActive={subsetActive}
               selectedX={selectedAxisX}
               selectedY={selectedAxisY}
               apiBase={API_BASE}
               dataset={datasetPath}
+              axisDebugEmbeddingOption={axisDebugAppliedEmbeddingOption}
+              axisDebugPriorMode={axisDebugAppliedPriorMode}
               on:upsertAxis={upsertAxis}
+              on:logAction={(e) => queueSessionAction(e.detail?.action, e.detail?.detail)}
               on:removeAxis={onRemoveAxis}
-              on:setX={(e) => { if (e.detail?.id) selectedAxisX = e.detail.id }}
-              on:setY={(e) => { if (e.detail?.id) selectedAxisY = e.detail.id }}
+              on:setX={(e) => { if (e.detail?.id) applyUserAxisSelectionSlot('x', e.detail.id) }}
+              on:setY={(e) => { if (e.detail?.id) applyUserAxisSelectionSlot('y', e.detail.id) }}
               on:sliceChange={(e) => {
                 const many = Array.isArray(e.detail?.slices) ? e.detail.slices : null
                 const single = e.detail?.slice
@@ -790,15 +1077,9 @@
           <div class="tile-header flex items-center gap-2">
             <span class="i-heroicons-chart-bar-square text-slate-600" />
             Visualization
-            <div class="flex-1" />
-            <button
-              type="button"
-              class="btn btn-icon btn-ui-secondary saved-visualization-save"
-              aria-label="Save visualization"
-              title="Save visualization"
-              disabled={!datasetPath || savedVisualizationsSaving}
-              on:click={saveCurrentVisualization}
-            ><MaterialIcon name="save" /></button>
+            {#if embedFileName}
+              <span class="visualization-embed-file" title={`Gallery layout cache: ${embedFileName}`}>Layout: {embedFileName}</span>
+            {/if}
           </div>
           <div class="tile-content flush minimap-panel" bind:this={minimapContainerRef}>
             <AxesMinimap
@@ -810,11 +1091,15 @@
               height={minimapSide}
               focusImageRequest={minimapFocusRequest}
               labels={new Map(Object.entries(labelDB))}
-              histogramSlices={histogramSlices}
+              histogramSlices={normalizedHistogramSlices}
+              subsetFilters={normalizedSubsetFilters}
+              saveVisualizationDisabled={!datasetPath || savedVisualizationsSaving}
               selectionToolsEnabled={false}
               restoreViewState={minimapRestoreState}
               bind:selectedX={selectedAxisX}
               bind:selectedY={selectedAxisY}
+              on:logAction={(e) => queueSessionAction(e.detail?.action, e.detail?.detail)}
+              on:saveVisualization={saveCurrentVisualization}
               on:sliceChange={(e) => {
                 const many = Array.isArray(e.detail?.slices) ? e.detail.slices : null
                 const single = e.detail?.slice
@@ -823,9 +1108,13 @@
               on:viewStateChange={(e) => {
                 minimapViewState = e.detail || {}
               }}
+              on:subsetFiltersChange={(e) => {
+                subsetFilters = Array.isArray(e.detail?.filters) ? e.detail.filters : []
+              }}
+              on:saveSubset={saveCurrentSubset}
               on:axesChange={(e) => {
-                selectedAxisX = e.detail.selectedX
-                selectedAxisY = e.detail.selectedY
+                selectedAxisX = String(e.detail?.selectedX || '').trim() || null
+                selectedAxisY = String(e.detail?.selectedY || '').trim() || null
               }}
               on:label={onScribbleLabel}
               on:create={(e) => {
@@ -934,9 +1223,55 @@
           {/if}
         </div>
       </section>
+      <section class="saved-library-section">
+        <div class="saved-library-section-header">
+          <div class="saved-library-section-title">Saved subsets</div>
+          <div class="saved-library-section-meta">{savedSubsetsSaving ? 'Saving...' : `${savedSubsets.length}`}</div>
+        </div>
+        {#if savedSubsetsError}
+          <div class="saved-axes-error">{savedSubsetsError}</div>
+        {/if}
+        <div class="saved-axes-body">
+          {#if savedSubsetsLoading}
+            <div class="saved-axes-empty">Loading...</div>
+          {:else if savedSubsets.length === 0}
+            <div class="saved-axes-empty">No saved subsets</div>
+          {:else}
+            {#each savedSubsets as item (item.id)}
+              <div class="saved-axis-row">
+                <button
+                  type="button"
+                  class="saved-axis-load"
+                  disabled={savedSubsetsBusyId === item.id}
+                  on:click={() => projectSavedSubset(item)}
+                >
+                  <div class="saved-axis-name">{item.name || item.id}</div>
+                  <div class="saved-axis-origin">{item.dataset || 'unknown'} · {item.image_count || 0} imgs</div>
+                </button>
+                <button
+                  type="button"
+                  class="saved-axis-delete"
+                  aria-label="Remove saved subset"
+                  title="Remove saved subset"
+                  disabled={savedSubsetsBusyId === item.id}
+                  on:click|stopPropagation={() => removeSavedSubset(item.id)}
+                ><MaterialIcon name="close" /></button>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      </section>
     </div>
   </aside>
 </div>
+{:else}
+  <LoadingGate
+    systemName={SYSTEM_NAME}
+    busy={sessionPending}
+    error={sessionError}
+    on:submit={(e) => activateSession(e.detail?.sessionName)}
+  />
+{/if}
 
 <style>
   :global(html, body, #app) { height: 100%; }
@@ -1039,6 +1374,43 @@
     overflow: visible;
   }
 
+  .session-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px 4px 10px;
+    border-radius: 999px;
+    background: #f8fafc;
+    border: 1px solid #d5dde8;
+    color: #475569;
+  }
+
+  .session-chip-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #94a3b8;
+  }
+
+  .session-chip-value {
+    font-size: 12px;
+    font-weight: 700;
+    color: #1e293b;
+  }
+
+  .session-chip-close {
+    width: 22px;
+    height: 22px;
+    border: 0;
+    border-radius: 999px;
+    background: #e2e8f0;
+    color: #475569;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
   .saved-axes-toggle {
     margin-left: 4px;
     width: 28px;
@@ -1118,7 +1490,7 @@
     flex: 1 1 auto;
     min-height: 0;
     display: grid;
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: repeat(3, minmax(0, 1fr));
   }
 
   .saved-library-section {
@@ -1224,11 +1596,14 @@
     text-align: center;
   }
 
-  .saved-visualization-save {
-    width: 28px;
-    height: 28px;
-    color: #475569;
-    border-color: #d5dde8;
+  .visualization-embed-file {
+    max-width: 34ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--font-size-small);
+    font-weight: 500;
+    color: #94a3b8;
   }
 
   @media (max-width: 1080px) {

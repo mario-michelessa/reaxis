@@ -2,7 +2,7 @@
 
 Minimal Flask backend that:
 - Lists images in a dataset and serves precomputed feature spaces, with `siglip2` as the default semantic embedding.
-- Reduces embeddings to 2D (PCA by default; UMAP if installed) and snaps them to a grid.
+- Reduces embeddings to 2D (`pca`, `umap`, or `tsne`) and snaps them to a grid.
 - Serves a JSON gallery payload and the corresponding image files.
 - Accepts image uploads into the dataset.
 
@@ -11,7 +11,7 @@ This backend is designed to power the existing frontend without changing its des
 ## Endpoints
 
 - `GET /health` — quick health check
-- `GET /gallery.json?dataset=PATH&method=umap|pca&embed=color_rgb|siglip2|clip|dino|dift_sd&n_layer=64&n_tile=8` — returns items with `{ id, url, className, x, y, gx, gy }`
+- `GET /gallery.json?dataset=PATH&method=pca|umap|tsne&embed=color_rgb|siglip2|clip|dino|dift_sd&n_layer=64&n_tile=8` — returns items with `{ id, url, className, x, y, gx, gy }`
 - `GET /images/<path>` — serves images relative to the selected dataset
 - `POST /upload` — multipart form upload with fields: `file` (required), `class` (optional subfolder), `dataset` (optional root). Returns `{ ok, path }`.
 - `POST /llm/extract_attributes` — extract key measurable attributes from a prompt
@@ -79,7 +79,7 @@ python backend/precompute_embeddings.py
 python backend/precompute_embeddings.py /path/to/dataset --methods color_rgb,siglip2,clip,dino,dift_sd
 ```
 
-Caches are stored under `/path/to/dataset/.cache/embeddings_<method>.npz`.
+Caches are stored under `/path/to/dataset/.cache/embeddings_<method>.npz` and `/path/to/dataset/.cache/coords_<reduction>2d_<method>.npz`.
 With no positional dataset arguments, the script scans every directory under `data/datasets/`, defaults to `siglip2`, and skips datasets whose requested caches already exist unless `--include-complete` is passed.
 
 ## Import Curated Datasets
@@ -89,7 +89,7 @@ To prepare datasets for this UI, use the curated importer. It:
 - downloads a source dataset or archive
 - flattens images into `data/datasets/<name>/`
 - writes `metadata.csv`
-- precomputes embedding caches and PCA coordinates
+- precomputes embedding caches and 2D reduction coordinates
 
 Examples:
 

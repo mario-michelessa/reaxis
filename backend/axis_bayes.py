@@ -21,6 +21,7 @@ except Exception:
 
 try:
     from .constants import (
+        AXIS_BAYES_NORM,
         AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE,
         AXIS_BUILDER_LLM_PROMPT_COUNT,
@@ -32,10 +33,11 @@ try:
         AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
         AXIS_RESIDUAL_JITTER,
     )
-    from .embeddings import build_multimodal_extractor, normalize_multimodal_method
+    from .embeddings import build_multimodal_extractor, embedding_cache_filename, normalize_multimodal_method
     from .gallery_backend import ImageGalleryEngine
 except ImportError:
     from constants import (
+        AXIS_BAYES_NORM,
         AXIS_BAYES_SEMANTIC_METHOD,
         AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE,
         AXIS_BUILDER_LLM_PROMPT_COUNT,
@@ -47,7 +49,7 @@ except ImportError:
         AXIS_RESIDUAL_LENGTHSCALE_MULTIPLIER,
         AXIS_RESIDUAL_JITTER,
     )
-    from embeddings import build_multimodal_extractor, normalize_multimodal_method
+    from embeddings import build_multimodal_extractor, embedding_cache_filename, normalize_multimodal_method
     from gallery_backend import ImageGalleryEngine
 
 
@@ -68,6 +70,42 @@ def _normalize_vec(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=np.float32).reshape(-1)
     denom = float(np.linalg.norm(arr)) + 1e-8
     return (arr / denom).astype(np.float32)
+
+
+def _row_l2_norms(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError('Expected NxD array')
+    return np.linalg.norm(arr, axis=1).astype(np.float32)
+
+
+def _cosine_scores_rows_to_vec(
+    rows: np.ndarray,
+    vec: np.ndarray,
+    *,
+    row_norms: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    arr_rows = np.asarray(rows, dtype=np.float32)
+    if arr_rows.ndim != 2:
+        raise ValueError('Expected NxD array')
+    arr_vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr_rows.shape[1] != arr_vec.shape[0]:
+        raise ValueError(f'Dim mismatch: rows={arr_rows.shape} vec={arr_vec.shape}')
+    if arr_rows.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    vec_norm = float(np.linalg.norm(arr_vec))
+    if vec_norm <= 1e-8:
+        return np.zeros((arr_rows.shape[0],), dtype=np.float32)
+    norms = None
+    if row_norms is not None:
+        candidate = np.asarray(row_norms, dtype=np.float32).reshape(-1)
+        if candidate.shape[0] == arr_rows.shape[0]:
+            norms = candidate
+    if norms is None:
+        norms = _row_l2_norms(arr_rows)
+    denom = np.maximum(norms, 1e-8) * max(vec_norm, 1e-8)
+    scores = (arr_rows @ arr_vec) / denom
+    return np.clip(scores, -1.0, 1.0).astype(np.float32)
 
 
 def _normalize_semantic_method(method: str) -> str:
@@ -100,7 +138,14 @@ def _rank_percentile_01(values: np.ndarray) -> np.ndarray:
 
 
 def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    return float(max(0.0, 1.0 - float(np.dot(a, b))))
+    arr_a = np.asarray(a, dtype=np.float32).reshape(-1)
+    arr_b = np.asarray(b, dtype=np.float32).reshape(-1)
+    denom = float(np.linalg.norm(arr_a)) * float(np.linalg.norm(arr_b))
+    if denom <= 1e-8:
+        return 1.0
+    sim = float(np.dot(arr_a, arr_b) / denom)
+    sim = max(-1.0, min(1.0, sim))
+    return float(max(0.0, 1.0 - sim))
 
 
 def _format_axis_value(v: float) -> str:
@@ -158,9 +203,11 @@ class CollectionCache:
     collection_id: str
     ids: List[str]
     embeddings: np.ndarray
+    embedding_norms: np.ndarray
     id_to_index: Dict[str, int]
     feature_space: str
     semantic_method: str
+    norm: bool
     clip_dim: int
     dino_dim: int
     clip_scale: float
@@ -185,6 +232,7 @@ class AxisBayesState:
     ids: List[str]
     image_embeddings: np.ndarray
     id_to_index: Dict[str, int]
+    image_embedding_norms: np.ndarray
     w0: np.ndarray
     pos_prompt_ensemble: List[str]
     neg_prompt_ensemble: List[str]
@@ -194,6 +242,7 @@ class AxisBayesState:
     mode: str
     feature_space: str
     semantic_method: str
+    norm: bool
     clip_dim: int
     dino_dim: int
     clip_scale: float
@@ -710,6 +759,7 @@ class AxisBayesEngine:
         mode: str = 'gaussian',
         feature_space: str = 'clip',
         semantic_method: str = AXIS_BAYES_SEMANTIC_METHOD,
+        norm: bool = AXIS_BAYES_NORM,
         clip_weight: float = 0.7,
         dino_weight: float = 0.3,
         piecewise_num_experts: int = 2,
@@ -758,6 +808,7 @@ class AxisBayesEngine:
         fs = str(feature_space or '').strip().lower()
         self.feature_space = 'clip_dino' if fs in {'clip_dino', 'clip+dino', 'dino_clip'} else 'clip'
         self.semantic_method = _normalize_semantic_method(semantic_method)
+        self.norm = bool(norm)
         c_w = float(max(1e-6, clip_weight))
         d_w = float(max(1e-6, dino_weight))
         w_sum = c_w + d_w
@@ -815,6 +866,22 @@ class AxisBayesEngine:
             'residual': ResidualAxisScorer(),
         }
 
+    def _maybe_normalize_rows(self, x: np.ndarray, norm: Optional[bool] = None) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError('Expected NxD array')
+        use_norm = self.norm if norm is None else bool(norm)
+        if not use_norm:
+            return arr.astype(np.float32)
+        return _normalize_rows(arr)
+
+    def _maybe_normalize_vec(self, x: np.ndarray, norm: Optional[bool] = None) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float32).reshape(-1)
+        use_norm = self.norm if norm is None else bool(norm)
+        if not use_norm:
+            return arr.astype(np.float32)
+        return _normalize_vec(arr)
+
     def _log(self, msg: str, *args):
         if args:
             try:
@@ -833,6 +900,27 @@ class AxisBayesEngine:
                 raise RuntimeError(f'No text extractor available for semantic method {method}')
             self._text_extractors[method] = extractor
         return extractor
+
+    def _text_encoder_debug_info(self, semantic_method: Optional[str] = None) -> Dict[str, str]:
+        method = _normalize_semantic_method(semantic_method or self.semantic_method)
+        extractor = self._get_text_extractor(method)
+        model = getattr(extractor, 'model', None)
+        processor = getattr(extractor, 'processor', None)
+        tokenizer = getattr(extractor, 'tokenizer', None)
+        model_name = str(
+            getattr(extractor, 'model_name', '')
+            or getattr(getattr(model, 'config', None), '_name_or_path', '')
+            or getattr(model, 'name_or_path', '')
+            or ''
+        ).strip()
+        return {
+            'semantic_method': method,
+            'extractor_class': extractor.__class__.__name__,
+            'model_class': model.__class__.__name__ if model is not None else '',
+            'model_name': model_name,
+            'processor_class': processor.__class__.__name__ if processor is not None else '',
+            'tokenizer_class': tokenizer.__class__.__name__ if tokenizer is not None else '',
+        }
 
     def _build_fixed_prompt_ensemble(self, q: str) -> tuple[List[str], List[str]]:
         query = re.sub(r'\s+', ' ', str(q or '').strip())
@@ -872,14 +960,16 @@ class AxisBayesEngine:
         if not isinstance(values, (list, tuple)):
             return out
         for raw in values:
-            text = re.sub(r'\s+', ' ', str(raw or '').strip())
-            if not text:
-                continue
-            key = text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(text)
+            parts = re.split(r'(?:\r?\n|\\n)+', str(raw or ''))
+            for part in parts:
+                text = re.sub(r'\s+', ' ', str(part or '').strip())
+                if not text:
+                    continue
+                key = text.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(text)
         return out
 
     def _embed_prompt_lists(
@@ -888,6 +978,7 @@ class AxisBayesEngine:
         neg_prompts: Any,
         *,
         semantic_method: str,
+        norm: Optional[bool] = None,
         source: str,
         provider: str,
     ) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
@@ -896,14 +987,26 @@ class AxisBayesEngine:
         if len(pos_list) == 0 or len(neg_list) == 0:
             raise ValueError('Both positive and negative prompt lists must contain at least one prompt')
         ext = self._get_text_extractor(semantic_method)
-        pos_vecs = [_normalize_vec(ext.extract_text_embedding(prompt)) for prompt in pos_list]
-        neg_vecs = [_normalize_vec(ext.extract_text_embedding(prompt)) for prompt in neg_list]
+        use_norm = self.norm if norm is None else bool(norm)
+        pos_vecs = [
+            self._maybe_normalize_vec(ext.extract_text_embedding(prompt, normalize=use_norm), norm=norm)
+            for prompt in pos_list
+        ]
+        neg_vecs = [
+            self._maybe_normalize_vec(ext.extract_text_embedding(prompt, normalize=use_norm), norm=norm)
+            for prompt in neg_list
+        ]
         pos_avg = np.mean(np.vstack(pos_vecs), axis=0, dtype=np.float32)
         neg_avg = np.mean(np.vstack(neg_vecs), axis=0, dtype=np.float32)
-        w0 = _normalize_vec(pos_avg - neg_avg)
+        w0 = self._maybe_normalize_vec(pos_avg - neg_avg, norm=norm)
         return w0, pos_list, neg_list, {'source': str(source or 'unknown'), 'provider': str(provider or 'unknown')}
 
-    def build_prompt_ensemble(self, q: str) -> tuple[List[str], List[str], Dict[str, str]]:
+    def build_prompt_ensemble(
+        self,
+        q: str,
+        *,
+        dataset_name: str = '',
+    ) -> tuple[List[str], List[str], Dict[str, str]]:
         query = re.sub(r'\s+', ' ', str(q or '').strip())
         if not query:
             return [], [], {'source': 'none', 'provider': 'none'}
@@ -918,10 +1021,18 @@ class AxisBayesEngine:
             )
             return pos_prompts, neg_prompts, {'source': 'fixed_template', 'provider': 'fixed_template'}
         if self.llm_engine is None:
-            raise RuntimeError('axis bounds text source is llm but no llm_engine is configured')
+            pos_prompts, neg_prompts = self._build_fixed_prompt_ensemble(query)
+            self._log(
+                'llm prompt ensemble unavailable q="%s"; falling back to fixed template pos_count=%d neg_count=%d',
+                query,
+                len(pos_prompts),
+                len(neg_prompts),
+            )
+            return pos_prompts, neg_prompts, {'source': 'fixed_template_fallback', 'provider': 'fixed_template'}
         result = self.llm_engine.generate_axis_prompt_ensemble(
             attribute=query,
             n_prompts=self.llm_prompt_count,
+            dataset_name=dataset_name,
         )
         pos_prompts = [
             str(v).strip()
@@ -933,16 +1044,27 @@ class AxisBayesEngine:
             for v in (result.get('neg_prompts') or [])
             if str(v).strip()
         ]
-        if len(pos_prompts) < 2 or len(neg_prompts) < 2:
+        required_count = max(2, int(self.llm_prompt_count))
+        if len(pos_prompts) < required_count or len(neg_prompts) < required_count:
+            llm_pos_count = len(pos_prompts)
+            llm_neg_count = len(neg_prompts)
+            error_text = (
+                result.get('error')
+                or f'invalid prompt lists: expected {required_count} positive and {required_count} negative prompts'
+            )
             pos_prompts, neg_prompts = self._build_fixed_prompt_ensemble(query)
             self._log(
-                'llm prompt ensemble invalid q="%s"; falling back to fixed template pos_count=%d neg_count=%d error=%s',
+                'llm prompt ensemble invalid q="%s" pos_count=%d neg_count=%d error=%s; falling back to fixed template fallback_pos_count=%d fallback_neg_count=%d',
                 query,
+                llm_pos_count,
+                llm_neg_count,
+                error_text,
                 len(pos_prompts),
                 len(neg_prompts),
-                result.get('error') or 'invalid prompt lists',
             )
             return pos_prompts, neg_prompts, {'source': 'fixed_template_fallback', 'provider': 'fixed_template'}
+        pos_prompts = pos_prompts[:required_count]
+        neg_prompts = neg_prompts[:required_count]
         provider = str(result.get('provider') or 'huggingface_local')
         self._log(
             'using llm prompt ensemble q="%s" pos_count=%d neg_count=%d provider=%s',
@@ -953,12 +1075,22 @@ class AxisBayesEngine:
         )
         return pos_prompts, neg_prompts, {'source': 'llm', 'provider': provider}
 
-    def _embed_prompt_ensemble(self, q: str, semantic_method: str) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
-        pos_prompts, neg_prompts, prompt_meta = self.build_prompt_ensemble(q)
+    def _embed_prompt_ensemble(
+        self,
+        q: str,
+        semantic_method: str,
+        norm: Optional[bool] = None,
+        dataset_name: str = '',
+    ) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
+        pos_prompts, neg_prompts, prompt_meta = self.build_prompt_ensemble(
+            q,
+            dataset_name=dataset_name,
+        )
         return self._embed_prompt_lists(
             pos_prompts,
             neg_prompts,
             semantic_method=semantic_method,
+            norm=norm,
             source=prompt_meta.get('source') or 'unknown',
             provider=prompt_meta.get('provider') or 'unknown',
         )
@@ -981,7 +1113,7 @@ class AxisBayesEngine:
 
     def _get_collection(self, dataset_root: str, collection_id: str) -> CollectionCache:
         dataset_key = str(Path(dataset_root).resolve())
-        key = f'{dataset_key}|{self.feature_space}|cw={self.clip_scale:.6f}|dw={self.dino_scale:.6f}'
+        key = f'{dataset_key}|{self.feature_space}|norm={int(self.norm)}|cw={self.clip_scale:.6f}|dw={self.dino_scale:.6f}'
         cached = self._collections.get(key)
         if cached is not None:
             return cached
@@ -994,7 +1126,10 @@ class AxisBayesEngine:
         semantic_method = None
         semantic_embs = None
         for candidate in (_normalize_semantic_method(self.semantic_method), 'clip'):
-            semantic_embs = engine._load_embeddings_only(entries, method=candidate)
+            semantic_embs = engine._load_embeddings_only(entries, method=candidate, normalize=self.norm)
+            if semantic_embs is None and not self.norm:
+                self._log('raw semantic cache miss method=%s dataset=%s; computing once', candidate, dataset_key)
+                semantic_embs = engine._load_or_compute_embeddings(entries, method=candidate, normalize=False)
             if semantic_embs is not None:
                 semantic_method = candidate
                 break
@@ -1005,7 +1140,7 @@ class AxisBayesEngine:
             )
         if semantic_method != _normalize_semantic_method(self.semantic_method):
             self._log('semantic cache fallback preferred=%s actual=%s', self.semantic_method, semantic_method)
-        X_clip = _normalize_rows(np.asarray(semantic_embs, dtype=np.float32))
+        X_clip = self._maybe_normalize_rows(np.asarray(semantic_embs, dtype=np.float32))
         clip_dim = int(X_clip.shape[1])
         dino_dim = 0
         X = X_clip
@@ -1017,7 +1152,7 @@ class AxisBayesEngine:
                     f'DINO embeddings not available for collection "{dataset_key}" while '
                     f'AXIS_BAYES_FEATURE_SPACE=clip_dino; expected cache at {dino_cache}'
                 )
-            X_dino = _normalize_rows(np.asarray(dino_embs, dtype=np.float32))
+            X_dino = self._maybe_normalize_rows(np.asarray(dino_embs, dtype=np.float32))
             if int(X_dino.shape[0]) != int(X_clip.shape[0]):
                 raise ValueError(f'DINO embedding count mismatch: clip={X_clip.shape[0]} dino={X_dino.shape[0]}')
             dino_dim = int(X_dino.shape[1])
@@ -1030,6 +1165,7 @@ class AxisBayesEngine:
             ).astype(np.float32)
             self._log('feature fusion enabled clip_dim=%d dino_dim=%d clip_w=%.3f dino_w=%.3f',
                       clip_dim, dino_dim, self.clip_weight, self.dino_weight)
+        embedding_norms = _row_l2_norms(X) if int(X.shape[0]) > 0 else np.zeros((0,), dtype=np.float32)
         ids = [str(e.id) for e in entries]
         id_to_index = {image_id: i for i, image_id in enumerate(ids)}
         cached = CollectionCache(
@@ -1037,9 +1173,11 @@ class AxisBayesEngine:
             collection_id=str(collection_id or Path(dataset_root).name),
             ids=ids,
             embeddings=X,
+            embedding_norms=embedding_norms,
             id_to_index=id_to_index,
             feature_space=self.feature_space,
             semantic_method=semantic_method,
+            norm=bool(self.norm),
             clip_dim=clip_dim,
             dino_dim=dino_dim,
             clip_scale=self.clip_scale,
@@ -1057,6 +1195,27 @@ class AxisBayesEngine:
 
     def _scorer_for_state(self, state: AxisBayesState) -> BaseAxisScorer:
         return self._scorer_for_model_type(state.model_type)
+
+    def _state_embedding_norms(self, state: AxisBayesState) -> np.ndarray:
+        norms = np.asarray(state.image_embedding_norms, dtype=np.float32).reshape(-1)
+        n = int(state.image_embeddings.shape[0]) if state.image_embeddings.ndim == 2 else 0
+        if norms.shape[0] != n:
+            norms = _row_l2_norms(state.image_embeddings) if n > 0 else np.zeros((0,), dtype=np.float32)
+            state.image_embedding_norms = np.asarray(norms, dtype=np.float32)
+        return norms
+
+    def _score_direction_rows(
+        self,
+        rows: np.ndarray,
+        direction: np.ndarray,
+        *,
+        row_norms: Optional[np.ndarray] = None,
+        bias: float = 0.0,
+    ) -> np.ndarray:
+        scores = _cosine_scores_rows_to_vec(rows, direction, row_norms=row_norms)
+        if abs(float(bias)) <= 1e-12:
+            return scores.astype(np.float32)
+        return (scores + float(bias)).astype(np.float32)
 
     def _fit_state(self, state: AxisBayesState) -> None:
         self._scorer_for_state(state).fit_from_feedback(self, state)
@@ -1157,8 +1316,8 @@ class AxisBayesEngine:
         if state.feature_space == 'clip_dino' and int(state.dino_dim) > 0:
             dino_raw = X[:, state.clip_dim :] / max(1e-8, float(state.dino_scale))
             fused = np.concatenate([clip_raw, dino_raw], axis=1).astype(np.float32)
-            return _normalize_rows(fused)
-        return _normalize_rows(clip_raw.astype(np.float32))
+            return self._maybe_normalize_rows(fused, norm=state.norm)
+        return self._maybe_normalize_rows(clip_raw.astype(np.float32), norm=state.norm)
 
     def _build_residual_prior_scores(self, state: AxisBayesState) -> np.ndarray:
         X = np.asarray(state.image_embeddings, dtype=np.float32)
@@ -1166,9 +1325,15 @@ class AxisBayesEngine:
             return np.zeros((len(state.ids),), dtype=np.float32)
         if state.feature_space == 'clip_dino':
             clip_raw = X[:, : state.clip_dim] / max(1e-8, float(state.clip_scale))
+            clip_norms = _row_l2_norms(clip_raw)
         else:
             clip_raw = X[:, : state.clip_dim]
-        raw_prior = clip_raw @ np.asarray(state.w0[: state.clip_dim], dtype=np.float32)
+            clip_norms = self._state_embedding_norms(state)
+        raw_prior = self._score_direction_rows(
+            clip_raw,
+            np.asarray(state.w0[: state.clip_dim], dtype=np.float32),
+            row_norms=clip_norms,
+        )
         stable_prior = _rank_percentile_01(np.asarray(raw_prior, dtype=np.float32))
         return (
             (float(state.residual_alpha) * stable_prior) + float(state.residual_beta)
@@ -1274,7 +1439,7 @@ class AxisBayesEngine:
 
     def _collection_piecewise_basis(self, state: AxisBayesState, features: np.ndarray) -> np.ndarray:
         coll = self._collections.get(
-            f'{state.dataset_root}|{state.feature_space}|cw={self.clip_scale:.6f}|dw={self.dino_scale:.6f}'
+            f'{state.dataset_root}|{state.feature_space}|norm={int(state.norm)}|cw={self.clip_scale:.6f}|dw={self.dino_scale:.6f}'
         )
         arr = np.asarray(features, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[0] <= 1:
@@ -1406,7 +1571,8 @@ class AxisBayesEngine:
             return coll
 
         k = min(max(1, int(self.graph_knn_k)), n - 1)
-        sim = np.asarray(X @ X.T, dtype=np.float32)
+        X_unit = _normalize_rows(X)
+        sim = np.asarray(X_unit @ X_unit.T, dtype=np.float32)
         np.fill_diagonal(sim, -np.inf)
 
         kth = max(0, k - 1)
@@ -1456,7 +1622,12 @@ class AxisBayesEngine:
             if state.graph_posterior_mean.size == len(state.ids):
                 return np.asarray(state.graph_posterior_mean, dtype=np.float32)
             return np.asarray(state.z0_all, dtype=np.float32)
-        return np.asarray((state.image_embeddings @ state.mu) + float(state.b), dtype=np.float32)
+        return self._score_direction_rows(
+            state.image_embeddings,
+            state.mu,
+            row_norms=self._state_embedding_norms(state),
+            bias=float(state.b),
+        )
 
     def _append_rank_pairs_from_move(self, state: AxisBayesState, image_idx: int, target_p01: float):
         if int(state.image_embeddings.shape[0]) <= 1:
@@ -1613,12 +1784,8 @@ class AxisBayesEngine:
         if float(np.dot(mu, state.w0)) < 0.0:
             mu = -mu
             b = -b
-        mu_norm = float(np.linalg.norm(mu))
-        if mu_norm > 1e-8:
-            mu = (mu / mu_norm).astype(np.float32)
-            b = float(b / mu_norm)
-        else:
-            mu = _normalize_vec(state.w0)
+        if float(np.linalg.norm(mu)) <= 1e-8:
+            mu = np.asarray(state.w0, dtype=np.float32).copy()
             b = float(state.b0)
 
         state.X = X
@@ -1691,10 +1858,7 @@ class AxisBayesEngine:
 
         if float(np.dot(w, state.w0)) < 0.0:
             w = -w
-        w_norm = float(np.linalg.norm(w))
-        if w_norm > 1e-8:
-            w = (w / w_norm).astype(np.float32)
-        else:
+        if float(np.linalg.norm(w)) <= 1e-8:
             w = np.asarray(state.w0, dtype=np.float32).copy()
 
         u = (D @ w) / eta
@@ -2016,6 +2180,9 @@ class AxisBayesEngine:
             scoring_method = 'bayesian_pairwise_rank'
         else:
             scoring_method = 'bayesian_ridge_refinement'
+        semantic_embedding_file = embedding_cache_filename(state.semantic_method, normalize=state.norm)
+        semantic_embedding_path = str(Path(state.dataset_root) / '.cache' / semantic_embedding_file)
+        text_encoder = self._text_encoder_debug_info(state.semantic_method)
 
         return {
             'axis_id': state.axis_id,
@@ -2024,6 +2191,7 @@ class AxisBayesEngine:
             'q': state.q,
             'mode': mode_name,
             'model_type': str(state.model_type),
+            'norm': bool(state.norm),
             'w0_summary': {
                 'prompt_count': int(len(state.prompt_ensemble)),
                 'pos_prompt_count': int(len(state.pos_prompt_ensemble)),
@@ -2042,6 +2210,7 @@ class AxisBayesEngine:
                 'posterior_projection_max': float(np.max(z)) if z.size > 0 else 0.0,
                 'feature_space': str(state.feature_space),
                 'semantic_method': str(state.semantic_method),
+                'norm': bool(state.norm),
                 'clip_dim': int(state.clip_dim),
                 'dino_dim': int(state.dino_dim),
                 'clip_scale': float(state.clip_scale),
@@ -2086,6 +2255,14 @@ class AxisBayesEngine:
             'undefined_count': int(len(state.undefined_order)),
             'undefined_ids': list(state.undefined_order),
             'moves': move_payload,
+            'semantic_embedding_file': semantic_embedding_file,
+            'semantic_embedding_path': semantic_embedding_path,
+            'text_encoder': text_encoder,
+            'debug': {
+                'semantic_embedding_file': semantic_embedding_file,
+                'semantic_embedding_path': semantic_embedding_path,
+                'text_encoder': text_encoder,
+            },
             'ids': list(state.ids),
             'projection_values': z.astype(np.float32).tolist(),
             'projection_min': z_min,
@@ -2134,6 +2311,8 @@ class AxisBayesEngine:
         w0_clip, pos_prompts, neg_prompts, prompt_meta = self._embed_prompt_ensemble(
             query,
             semantic_method=coll.semantic_method,
+            norm=coll.norm,
+            dataset_name=Path(dataset_root).name,
         )
         if int(w0_clip.shape[0]) != int(coll.clip_dim):
             raise ValueError(f'Semantic text/image dim mismatch: text={w0_clip.shape[0]} image_semantic={coll.clip_dim}')
@@ -2153,11 +2332,21 @@ class AxisBayesEngine:
             else:
                 clip_raw = coll.embeddings[:, : coll.clip_dim]
             z0_all = (
-                (float(self.residual_alpha) * _rank_percentile_01(clip_raw @ w0[: coll.clip_dim]))
+                (float(self.residual_alpha) * _rank_percentile_01(
+                    self._score_direction_rows(
+                        clip_raw,
+                        w0[: coll.clip_dim],
+                        row_norms=_row_l2_norms(clip_raw),
+                    )
+                ))
                 + float(self.residual_beta)
             ).astype(np.float32)
         else:
-            z0_all = (coll.embeddings @ w0).astype(np.float32)
+            z0_all = self._score_direction_rows(
+                coll.embeddings,
+                w0,
+                row_norms=np.asarray(coll.embedding_norms, dtype=np.float32),
+            )
         z0_sorted = np.sort(z0_all).astype(np.float32)
         alpha_vec = np.concatenate(
             [
@@ -2178,6 +2367,7 @@ class AxisBayesEngine:
             model_type=model_name,
             ids=list(coll.ids),
             image_embeddings=coll.embeddings,
+            image_embedding_norms=np.asarray(coll.embedding_norms, dtype=np.float32),
             id_to_index=coll.id_to_index,
             w0=w0,
             pos_prompt_ensemble=list(pos_prompts),
@@ -2188,6 +2378,7 @@ class AxisBayesEngine:
             mode=mode_name,
             feature_space=coll.feature_space,
             semantic_method=coll.semantic_method,
+            norm=bool(coll.norm),
             clip_dim=int(coll.clip_dim),
             dino_dim=int(coll.dino_dim),
             clip_scale=float(coll.clip_scale),
@@ -2270,7 +2461,11 @@ class AxisBayesEngine:
         if state.model_type == 'residual':
             self._refresh_residual_prior(state)
         else:
-            state.z0_all = np.asarray(state.image_embeddings @ state.w0, dtype=np.float32)
+            state.z0_all = self._score_direction_rows(
+                state.image_embeddings,
+                state.w0,
+                row_norms=self._state_embedding_norms(state),
+            )
         state.z0_sorted = np.sort(state.z0_all).astype(np.float32)
         state.X = np.zeros((0, d), dtype=np.float32)
         state.y = np.zeros((0,), dtype=np.float32)
@@ -2332,6 +2527,7 @@ class AxisBayesEngine:
             pos_prompts,
             neg_prompts,
             semantic_method=state.semantic_method,
+            norm=state.norm,
             source='manual_edit',
             provider='user_edit',
         )
@@ -2386,6 +2582,17 @@ class AxisBayesEngine:
                 state.axis_id,
                 image_key,
                 len(state.undefined_order),
+                state.model_type,
+            )
+            return self._state_payload(state)
+        if move_kind in {'delete', 'remove'}:
+            self._remove_image_feedback(state, image_key)
+            self._fit_state(state)
+            self._log(
+                'axis move axis_id=%s image_id=%s move_type=delete move_count=%d model_type=%s',
+                state.axis_id,
+                image_key,
+                len(state.move_order),
                 state.model_type,
             )
             return self._state_payload(state)
@@ -2449,6 +2656,7 @@ class AxisBayesEngine:
             'prompt_provider': str(state.prompt_provider),
             'feature_space': str(state.feature_space),
             'semantic_method': str(state.semantic_method),
+            'norm': bool(state.norm),
             'clip_dim': int(state.clip_dim),
             'dino_dim': int(state.dino_dim),
             'clip_scale': float(state.clip_scale),
@@ -2530,6 +2738,8 @@ class AxisBayesEngine:
             'prompt_source': str(state.prompt_source),
             'prompt_provider': str(state.prompt_provider),
             'feature_space': str(state.feature_space),
+            'semantic_method': str(state.semantic_method),
+            'norm': bool(state.norm),
             'clip_dim': int(state.clip_dim),
             'dino_dim': int(state.dino_dim),
             'clip_scale': float(state.clip_scale),
@@ -2613,6 +2823,7 @@ class AxisBayesEngine:
             model_type=model_type,
             ids=ids,
             image_embeddings=np.asarray(payload.get('image_embeddings') or [], dtype=np.float32),
+            image_embedding_norms=np.asarray(payload.get('image_embedding_norms') or [], dtype=np.float32),
             id_to_index=id_to_index,
             w0=np.asarray(payload.get('w0') or [], dtype=np.float32),
             pos_prompt_ensemble=[str(v) for v in (payload.get('pos_prompt_ensemble') or [])],
@@ -2623,6 +2834,7 @@ class AxisBayesEngine:
             mode=_normalize_mode(payload.get('mode') or self.mode),
             feature_space=str(payload.get('feature_space') or self.feature_space),
             semantic_method=_normalize_semantic_method(payload.get('semantic_method') or self.semantic_method),
+            norm=bool(payload.get('norm') if 'norm' in payload else self.norm),
             clip_dim=int(payload.get('clip_dim') or 0),
             dino_dim=int(payload.get('dino_dim') or 0),
             clip_scale=float(payload.get('clip_scale') or self.clip_scale),
@@ -2751,6 +2963,7 @@ class AxisBayesEngine:
             model_type=model_type,
             ids=list(coll.ids),
             image_embeddings=np.asarray(coll.embeddings, dtype=np.float32),
+            image_embedding_norms=np.asarray(coll.embedding_norms, dtype=np.float32),
             id_to_index=dict(coll.id_to_index),
             w0=np.asarray(w0, dtype=np.float32).copy(),
             pos_prompt_ensemble=[str(v) for v in (payload.get('pos_prompt_ensemble') or [])],
@@ -2761,6 +2974,7 @@ class AxisBayesEngine:
             mode=mode_name,
             feature_space=str(payload.get('feature_space') or coll.feature_space),
             semantic_method=_normalize_semantic_method(payload.get('semantic_method') or coll.semantic_method),
+            norm=bool(payload.get('norm') if 'norm' in payload else self.norm),
             clip_dim=int(payload.get('clip_dim') or coll.clip_dim),
             dino_dim=int(payload.get('dino_dim') or coll.dino_dim),
             clip_scale=float(payload.get('clip_scale') or coll.clip_scale),
@@ -2871,7 +3085,12 @@ class AxisBayesEngine:
             state.graph_obs_indices = []
             state.graph_obs_var = np.zeros((0,), dtype=np.float32)
             state.graph_obs_S_inv = np.zeros((0, 0), dtype=np.float32)
-            state.z0_all = np.asarray((state.image_embeddings @ state.mu) + float(state.b0), dtype=np.float32)
+            state.z0_all = self._score_direction_rows(
+                state.image_embeddings,
+                state.mu,
+                row_norms=self._state_embedding_norms(state),
+                bias=float(state.b0),
+            )
             state.z0_sorted = np.sort(state.z0_all).astype(np.float32)
 
         self._axes[state.axis_id] = state

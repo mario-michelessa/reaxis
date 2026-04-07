@@ -1,0 +1,231 @@
+nohup: ignoring input
+Queue: /home/mario/codes/promptherder/data/datasets/CUB missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/EmoSet missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/HAM10000 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/HubbleStars missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ISIC2017 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ISIC2020 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ImageNet missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ImageNet_R missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ImageNet_n029583 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/Imagenette1500 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/MapillaryVistas missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/VIS30K missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/VIS30KGUI missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/WikiArt1500 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/ancient_tamil_inscriptions missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/archaeomind_images missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/brain_mri_images missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/broden1_224 missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/celeba_dataset missing=['clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/chartqa_images missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/chest_xray_pneumonia missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/egyptian_stone_statues missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/inat2021birds missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/metal_albums_artwork missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/paintings_wikiart missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/qajar_carpets missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/sinhala_brahmi_inscriptions missing=['siglip2_raw', 'clip_raw']
+Queue: /home/mario/codes/promptherder/data/datasets/stars_hubble missing=['siglip2_raw', 'clip_raw']
+Dataset: /home/mario/codes/promptherder/data/datasets/CUB
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/CUB/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/CUB/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/EmoSet
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/EmoSet/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/EmoSet/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/HAM10000
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/HAM10000/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/HAM10000/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/HubbleStars
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/HubbleStars/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/HubbleStars/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ISIC2017
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ISIC2017/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ISIC2017/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ISIC2020
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ISIC2020/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ISIC2020/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ImageNet
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ImageNet_R
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet_R/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet_R/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ImageNet_n029583
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet_n029583/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ImageNet_n029583/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/Imagenette1500
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/Imagenette1500/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/Imagenette1500/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/MapillaryVistas
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/MapillaryVistas/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/MapillaryVistas/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/VIS30K
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/VIS30K/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/VIS30K/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/VIS30KGUI
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/VIS30KGUI/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/VIS30KGUI/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/WikiArt1500
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/WikiArt1500/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/WikiArt1500/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/ancient_tamil_inscriptions
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ancient_tamil_inscriptions/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/ancient_tamil_inscriptions/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/archaeomind_images
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/archaeomind_images/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/archaeomind_images/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/brain_mri_images
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/brain_mri_images/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/brain_mri_images/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/broden1_224
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/broden1_224/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/broden1_224/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/celeba_dataset
+[emb] attempting to load cache: /home/mario/codes/promptherder/data/datasets/celeba_dataset/.cache/embeddings_siglip2_raw.npz
+[emb] cache loaded, available keys: ['paths', 'mtimes', 'embeddings']
+[emb] found full format with paths/embeddings
+[emb] validation results - paths match: True
+[emb] paths match, embeddings shape=(2000, 768)
+[emb] returning full format embeddings
+[import] skipping embedding compute for siglip2 (cache hit: embeddings_siglip2_raw.npz)
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/celeba_dataset/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/chartqa_images
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/chartqa_images/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/chartqa_images/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/chest_xray_pneumonia
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/chest_xray_pneumonia/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/chest_xray_pneumonia/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/egyptian_stone_statues
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/egyptian_stone_statues/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/egyptian_stone_statues/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/inat2021birds
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/inat2021birds/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/inat2021birds/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/metal_albums_artwork
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/metal_albums_artwork/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/metal_albums_artwork/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/paintings_wikiart
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/paintings_wikiart/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/paintings_wikiart/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/qajar_carpets
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/qajar_carpets/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/qajar_carpets/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/sinhala_brahmi_inscriptions
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/sinhala_brahmi_inscriptions/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/sinhala_brahmi_inscriptions/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+Dataset: /home/mario/codes/promptherder/data/datasets/stars_hubble
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/stars_hubble/.cache/embeddings_siglip2_raw.npz
+[import] computing embeddings for siglip2 normalize=False
+[import] skipping PCA coords for siglip2 (disabled)
+[emb] cache file not found: /home/mario/codes/promptherder/data/datasets/stars_hubble/.cache/embeddings_clip_raw.npz
+[import] computing embeddings for clip normalize=False
+[import] skipping PCA coords for clip (disabled)
+All done.

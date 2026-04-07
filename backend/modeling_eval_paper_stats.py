@@ -77,6 +77,7 @@ def build_report(modeling_dir: Path, run_id: str) -> Dict[str, Any]:
 
     prior = prior[prior['method'].isin(['clip_text_similarity', 'prompt_ensemble', TARGET_METHOD])].copy()
     prior_summary = mean_series(prior, ['method'], ['spearman', 'auroc_binary', 'kendall_tau', 'pairwise_acc'])
+    prior_per_dataset = mean_series(prior, ['dataset', 'method'], ['spearman', 'auroc_binary', 'kendall_tau', 'pairwise_acc'])
 
     prior_pivot = prior.pivot_table(index=['dataset', 'task_id'], columns='method', values=['spearman', 'auroc_binary'], aggfunc='first')
     prior_equivalence: Dict[str, Dict[str, float]] = {}
@@ -107,9 +108,25 @@ def build_report(modeling_dir: Path, run_id: str) -> Dict[str, Any]:
     final_budget = int(pd.to_numeric(steps['interaction_count'], errors='coerce').max())
     final_steps = steps[steps['interaction_count'] == final_budget].copy()
     final_summary = mean_series(final_steps, ['method'], ['spearman_all', 'auroc_binary_all', 'kendall_tau_all', 'pairwise_acc_all'])
+    final_summary_per_dataset = mean_series(final_steps, ['dataset', 'method'], ['spearman_all', 'auroc_binary_all', 'kendall_tau_all', 'pairwise_acc_all'])
 
     aulc_spearman = task_level_auc(steps, 'spearman_all')
     aulc_auroc = task_level_auc(steps.dropna(subset=['auroc_binary_all']).copy(), 'auroc_binary_all')
+    aulc_per_dataset_rows: List[Dict[str, Any]] = []
+    for dataset_name, dataset_frame in steps.groupby('dataset', dropna=False):
+        spearman_by_method = task_level_auc(dataset_frame, 'spearman_all')
+        auroc_by_method = task_level_auc(dataset_frame.dropna(subset=['auroc_binary_all']).copy(), 'auroc_binary_all')
+        for method in PAPER_METHODS:
+            if method not in spearman_by_method and method not in auroc_by_method:
+                continue
+            aulc_per_dataset_rows.append(
+                {
+                    'dataset': str(dataset_name),
+                    'method': method,
+                    'spearman_aulc': float(spearman_by_method.get(method, float('nan'))),
+                    'auroc_aulc': float(auroc_by_method.get(method, float('nan'))),
+                }
+            )
 
     gain_rows: List[Dict[str, Any]] = []
     for interaction_count, frame in steps.groupby('interaction_count', dropna=False):
@@ -151,10 +168,12 @@ def build_report(modeling_dir: Path, run_id: str) -> Dict[str, Any]:
         'n_tasks': int(len(tasks)),
         'tasks_per_dataset': {str(key): int(value) for key, value in tasks.groupby('dataset').size().to_dict().items()},
         'prior_summary': prior_summary,
+        'prior_per_dataset': prior_per_dataset,
         'prior_equivalence': prior_equivalence,
         'interaction_curve_summary': curve_summary,
         'final_budget': final_budget,
         'final_summary': final_summary,
+        'final_summary_per_dataset': final_summary_per_dataset,
         'aulc_summary': [
             {
                 'method': method,
@@ -164,6 +183,7 @@ def build_report(modeling_dir: Path, run_id: str) -> Dict[str, Any]:
             for method in PAPER_METHODS
             if method in aulc_spearman or method in aulc_auroc
         ],
+        'aulc_summary_per_dataset': aulc_per_dataset_rows,
         'gain_vs_best_baseline': gain_rows,
         'uncertainty_summary': uncertainty_summary,
         'query_policy_summary': query_summary,

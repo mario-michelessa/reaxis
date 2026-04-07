@@ -3,7 +3,11 @@ from __future__ import annotations
 
 # Backend server runtime constants.
 BACKEND_HOST = '0.0.0.0'
-BACKEND_PORT = 5002
+BACKEND_PORT = 5001
+
+# Initial gallery projection shown by the UI when no explicit /gallery.json
+# `method` query is provided.
+INITIAL_GALLERY_PROJECTION_METHOD = 'pca'  # 'pca' | 'umap' | 'tsne'
 
 
 # LLM provider configuration.
@@ -13,7 +17,10 @@ LLM_PROVIDER = 'gemini_api'
 
 # Gemini API configuration.
 # Keep the API key in an ignored local file, not in tracked source.
+# GEMINI_MODEL_NAME = 'gemma-3-27b'
 GEMINI_MODEL_NAME = 'gemini-2.5-flash-lite'
+# GEMINI_MODEL_NAME = 'gemini-2.5-flash'
+# GEMINI_MODEL_NAME = 'gemini-3-flash'
 GEMINI_API_KEY_PATH = 'data/secrets/gemini_api_key.txt'
 GEMINI_API_TIMEOUT_SEC = 45
 
@@ -37,6 +44,39 @@ DEFAULT_MAX_ATTRIBUTES = 8
 DEFAULT_VALUE_COUNT = 5
 MAX_VALUE_COUNT = 9
 
+# Short dataset descriptions used as LLM context for axis suggestion and
+# prompt-ensemble generation.
+DATASET_LLM_CONTEXT: dict[str, str] = {
+    'CUB': 'Photos of birds spanning many species, poses, plumage patterns, and natural backgrounds.',
+    'EmoSet': 'Images labeled by emotion, including people, objects, scenes, and symbolic visuals designed to evoke feelings.',
+    'HAM10000': 'Dermoscopy close-ups of skin lesions with diagnosis-relevant color, border, and texture variation.',
+    'HubbleStars': 'Hubble astronomy images focused on stars, stellar clusters, nebulae, and bright celestial structures.',
+    'ISIC2017': 'Dermoscopy images of skin lesions used for melanoma-related visual assessment.',
+    'ISIC2020': 'Dermoscopy images of skin lesions with clinically relevant variation in pigmentation, borders, and structure.',
+    'ImageNet': 'Natural photographs of diverse everyday objects, animals, and scenes across many categories.',
+    'ImageNet_R': 'Artistic, rendered, or stylized depictions of ImageNet object classes rather than plain natural photos.',
+    'ImageNet_n029583': 'A single ImageNet object class collection, so useful axes should focus on within-class visual variation.',
+    'Imagenette1500': 'Natural photos from ten broad object classes in the Imagenette subset.',
+    'MapillaryVistas': 'Street-scene photos with roads, cars, signs, buildings, sidewalks, and urban outdoor layouts.',
+    'VIS30K': 'Visualization images such as charts, diagrams, plots, maps, and other designed graphics.',
+    'VIS30KGUI': 'Information visualization and interface images, including charts, dashboards, and GUI-like visual designs.',
+    'WikiArt1500': 'Artwork images spanning many painting styles, subjects, palettes, and compositions.',
+    'ancient_tamil_inscriptions': 'Photos of ancient Tamil stone inscriptions with variation in carving, erosion, and surface appearance.',
+    'archaeomind_images': 'Archaeological imagery containing artifacts and non-artifacts with varied materials, shapes, and excavation context.',
+    'brain_mri_images': 'Brain MRI scans with medical structure, intensity, and possible tumor-related variation.',
+    'broden1_224': 'Everyday images with richly varied scenes, objects, parts, materials, and textures.',
+    'celeba_dataset': 'Face photos with variation in identity, hairstyle, expression, accessories, and facial attributes.',
+    'chartqa_images': 'Chart and plot images used for chart question answering, with bars, lines, legends, and labels.',
+    'chest_xray_pneumonia': 'Chest X-ray images with medically relevant lung opacity and anatomy variation.',
+    'egyptian_stone_statues': 'Photos of Egyptian stone statues with variation in pose, damage, carving style, and material weathering.',
+    'inat2021birds': 'Bird photographs in natural environments with strong variation in species, pose, color, and habitat.',
+    'metal_albums_artwork': 'Album-cover artworks with strong variation in style, typography, mood, and graphic composition.',
+    'paintings_wikiart': 'Paintings across artists, genres, and styles with wide variation in brushwork, subject, and color.',
+    'qajar_carpets': 'Images of Qajar carpets with variation in motifs, symmetry, palette, and ornamental density.',
+    'sinhala_brahmi_inscriptions': 'Photos of Sinhala Brahmi inscriptions carved into stone with variation in script, wear, and contrast.',
+    'stars_hubble': 'Hubble astronomy images focused on stars, stellar clusters, nebulae, and bright celestial structures.',
+}
+
 # Zero-shot regressor defaults.
 ZERO_SHOT_SOFTMAX_TEMPERATURE = 12.0
 ZERO_SHOT_HISTOGRAM_BINS = 20
@@ -59,11 +99,16 @@ AXIS_BAYES_MODE = 'rank'  # 'gaussian' | 'rank' | 'graph'
 # - 'clip': compatibility fallback
 AXIS_BAYES_SEMANTIC_METHOD = 'siglip2'  # 'siglip2' | 'clip'
 
+# Whether Axis Bayes should use the normalized semantic caches directly.
+# When False, raw semantic vectors are preserved in state and cosine normalization
+# happens only at similarity-evaluation time inside the Bayes scorer.
+AXIS_BAYES_NORM = False
+
 # Feature space used by Axis Bayes.
 # Legacy names are kept for compatibility:
 # - 'clip': semantic VLM block only
 # - 'clip_dino': semantic VLM block concatenated with DINO
-AXIS_BAYES_FEATURE_SPACE = 'clip_dino'  # 'clip' | 'clip_dino'
+AXIS_BAYES_FEATURE_SPACE = 'clip'  # 'clip' | 'clip_dino'
 
 # Relative contribution of semantic-VLM and DINO blocks in fused features.
 # Effective scaling uses normalized weights:
@@ -104,7 +149,7 @@ AXIS_PIECEWISE_MAX_REFINE_STEPS = 48
 # Prior precision for CLIP block (all CLIP dimensions).
 # Larger -> stronger pull toward CLIP text prior; smaller -> faster adaptation.
 # Current default follows the best rank-mode sweep winner (Trial 69).
-AXIS_BAYES_ALPHA = 0.34361647953904884
+AXIS_BAYES_ALPHA = 1.64361647953904884
 
 # Prior precision for DINO block (all DINO dimensions) when using 'clip_dino'.
 # Larger than AXIS_BAYES_ALPHA keeps DINO conservative unless moves support it.
@@ -423,75 +468,142 @@ Attribute: {attribute}
 """.strip()
 
 # Axis builder prompt-ensemble configuration.
-# Select how axis-bound texts are created:
-# - 'template': fast fixed templates (no LLM call)
-# - 'llm': ask the LLM for prompt ensemble
-AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE = 'template'  # 'template' | 'llm'
+# This is the main on/off switch for Gemini-generated positive/negative text anchors:
+# - 'llm': ask the same Gemini API path used for axis suggestion
+# - 'template': use the old fixed prompt template
+AXIS_BUILDER_AXIS_BOUNDS_TEXT_SOURCE = 'llm'  # 'template' | 'llm'
 
 AXIS_BUILDER_USE_LLM_PROMPT_ENSEMBLE = True
-AXIS_BUILDER_LLM_PROMPT_COUNT = 8
+AXIS_BUILDER_LLM_PROMPT_COUNT = 3
 
 AXIS_BUILDER_PROMPT_ENSEMBLE_SYSTEM_PROMPT = """
-You are a helpful assistant. 
+You generate prompts for the two ends of a visual axis.
 
 Task:
-Produce examples of high-value and low-value manifestations of an attribute. 
+Given an ATTRIBUTE and a prompt count, infer the most natural visual opposite, then write prompts for both ends.
 
-Output rules (strict):
-- Return ONLY valid JSON.
+Important:
+Do not assume the opposite is always "absence".
+Use the most natural contrast.
+
+Examples of natural contrasts:
+- age -> old vs young
+- blur -> blurry vs sharp
+- brightness -> bright vs dark
+- clutter -> cluttered vs sparse
+- baroque -> baroque vs modern
+- smile -> smiling vs neutral
+
+Rules:
+- `pos_prompts` = one end of the axis
+- `neg_prompts` = the opposite end
+- Both sides must match the same visual axis
+- Use the provided dataset context when available so prompts stay plausible for the current collection
+- Keep prompts short, concrete, and visual
+- Use visible scenes, objects, faces, poses, or environments
+- Avoid bad opposites like "no age" or "absence of baroque"
+
+Output rules:
+- Return ONLY valid JSON
 - Format exactly:
-  {"pos_prompts": ["...", "..."], "neg_prompts": ["...", "..."]}.
-- pos_prompts must describe high value of this attribute. for example age should be old.
-- neg_prompts must describe absence, minimality, or the opposite expression of pos_prompt. for example age should be young.
-- Prompts should vary context and subject.
-- Keep prompts short, concrete, and visually grounded.
-- No explanations, no markdown, no extra keys.
+  {"pos_prompts":["..."],"neg_prompts":["..."]}
+- The number of strings in each list must exactly match the requested count
+- No markdown
+- No explanations
+- No extra keys
 
-Example 1
-ATTRIBUTE:
-"blur"
+Example
+ATTRIBUTE: "age"
 Requested prompt count: 3
 OUTPUT:
 {"pos_prompts":[
-  "a blurry night street photo with motion blur",
-  "a slightly soft product photo",
-  "a heavily blurred surveillance frame"
+  "an elderly man with deep wrinkles",
+  "an old woman with white hair",
+  "an old tree with a thick twisted trunk"
 ],"neg_prompts":[
-  "a sharp portrait with crisp facial details",
-  "a clear product photo with hard edges",
-  "a landscape photo in perfect focus",
-]}
-
-Example 2
-ATTRIBUTE:
-"age"
-Requested prompt count: 3
-OUTPUT:
-{"pos_prompts":[
-  "a painting of a very old lady"
-  "a photo of a ancient ruin",
-  "a photo of a dinosaur fossil"
-],"neg_prompts":[
-  "a photo of a newborn baby",
-  "a photo of a new car",
-  "a photo of a baby cat"
-]}
-
-Example 3
-ATTRIBUTE:
-"baroque"
-Requested prompt count: 3
-OUTPUT:
-{"pos_prompts":[
-  "a baroque church ",
-  "a baroque painting",
-  "a baroque sculpture",
-],"neg_prompts":[
-  "a modern building",
-  "a abstract painting",
-  "a brutalist sculpture",
+  "a young child with a smooth face",
+  "a teenage girl with youthful features",
+  "a young sapling with thin green branches"
 ]}
 """.strip()
+# AXIS_BUILDER_PROMPT_ENSEMBLE_SYSTEM_PROMPT = """
+# You are a helpful assistant.
+
+# Task:
+# Produce examples of high-value and low-value manifestations of an attribute.
+
+# Output rules (strict):
+# - Return ONLY valid JSON.
+# - Format exactly:
+#   {"pos_prompts": ["...", "..."], "neg_prompts": ["...", "..."]}.
+# - The number of strings in each list must exactly match the requested prompt count.
+# - `pos_prompts` must describe strong or clear visual presence of the attribute.
+# - `neg_prompts` must describe absence, minimality, neutrality, or an opposite visual expression of the attribute.
+# - Prompts should vary context and subject.
+# - Keep prompts short, concrete, and visually grounded.
+# - If the attribute is abstract, express it through visible scenes, facial expressions, poses, objects, or environments.
+# - No explanations, no markdown, no extra keys.
+
+# Example 1
+# ATTRIBUTE:
+# "blur"
+# Requested prompt count: 3
+# OUTPUT:
+# {"pos_prompts":[
+#   "a blurry night street photo with motion blur",
+#   "a slightly soft product photo",
+#   "a heavily blurred surveillance frame"
+# ],"neg_prompts":[
+#   "a sharp portrait with crisp facial details",
+#   "a clear product photo with hard edges",
+#   "a landscape photo in perfect focus"
+# ]}
+
+# Example 2
+# ATTRIBUTE:
+# "age"
+# Requested prompt count: 3
+# OUTPUT:
+# {"pos_prompts":[
+#   "a portrait of a very old woman",
+#   "an ancient stone ruin",
+#   "a dinosaur fossil in a museum"
+# ],"neg_prompts":[
+#   "a newborn baby wrapped in a blanket",
+#   "a brand new car in a showroom",
+#   "a young kitten"
+# ]}
+
+# Example 3
+# ATTRIBUTE:
+# "baroque"
+# Requested prompt count: 3
+# OUTPUT:
+# {"pos_prompts":[
+#   "a baroque church interior",
+#   "a baroque oil painting",
+#   "a baroque marble sculpture"
+# ],"neg_prompts":[
+#   "a modern glass building",
+#   "an abstract painting",
+#   "a brutalist concrete sculpture"
+# ]}
+
+# Example 4
+# ATTRIBUTE:
+# "emotion"
+# Requested prompt count: 3
+# OUTPUT:
+# {"pos_prompts":[
+#   "a face showing intense joy",
+#   "a person crying in deep sadness",
+#   "a dramatic expression of anger"
+# ],"neg_prompts":[
+#   "a neutral face with no clear emotion",
+#   "a blank expression",
+#   "a calm passport-style portrait"
+# ]}
+# """.strip()
 
 AXIS_BUILDER_PROMPT_ENSEMBLE_USER_PROMPT_TEMPLATE = """
 ATTRIBUTE: {attribute}

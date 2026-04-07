@@ -12,6 +12,12 @@ Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also pow
 
 ## Technical considerations
 
+## API routing
+
+- The frontend defaults to a same-origin `/api` base in browser builds so production traffic can flow through a reverse proxy such as Nginx.
+- Override the API base explicitly with `VITE_API_BASE` when the backend is hosted elsewhere.
+- `npm run dev` proxies `/api` to `http://127.0.0.1:5001` by default; set `VITE_BACKEND_PROXY_TARGET` to change the local proxy target without changing browser-side request paths.
+
 **Why use this over SvelteKit?**
 
 - It brings its own routing solution which might not be preferable for some users.

@@ -25,16 +25,18 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 try:
     from .gallery_backend import ImageGalleryEngine
-    from .embeddings import normalize_multimodal_method
+    from .embeddings import embedding_cache_filename
+    from .reduction_cache import coords_cache_filename, parse_reduction_methods
 except ImportError:
     from gallery_backend import ImageGalleryEngine
-    from embeddings import normalize_multimodal_method
+    from embeddings import embedding_cache_filename
+    from reduction_cache import coords_cache_filename, parse_reduction_methods
 
 
 DATASETS_ROOT = (Path(__file__).resolve().parent.parent / 'data' / 'datasets').resolve()
 DEFAULT_LOCAL_ROOT = Path('/mnt/raid/mario/datasets')
 DEFAULT_METHODS = ('color_rgb', 'siglip2', 'clip', 'dino')
-DEFAULT_REDUCTION = 'pca'
+DEFAULT_REDUCTION = 'all'
 DEFAULT_MAX_EDGE = 512
 DEFAULT_LIMIT = 2000
 DEFAULT_MAX_SOURCE_PIXELS = 80_000_000
@@ -1518,58 +1520,88 @@ def import_archive_preset(
         return kept
 
 
-def save_embedding_cache(dataset_root: Path, method: str, embeddings: np.ndarray, entries: Sequence[Any]) -> None:
+def save_embedding_cache(
+    dataset_root: Path,
+    method: str,
+    embeddings: np.ndarray,
+    entries: Sequence[Any],
+    *,
+    normalize: bool = True,
+) -> None:
     cache_dir = dataset_root / '.cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_method = normalize_multimodal_method(method)
     paths = np.array([entry.path for entry in entries])
     mtimes = np.array([int(Path(path).stat().st_mtime) if Path(path).exists() else 0 for path in paths], dtype=np.int64)
     np.savez_compressed(
-        cache_dir / f'embeddings_{cache_method}.npz',
+        cache_dir / embedding_cache_filename(method, normalize=normalize),
         paths=paths,
         mtimes=mtimes,
         embeddings=np.asarray(embeddings, dtype=np.float32),
     )
 
 
-def save_pca_cache(dataset_root: Path, method: str, coords2d: np.ndarray, entries: Sequence[Any]) -> None:
+def save_coords_cache(dataset_root: Path, method: str, reduction: str, coords2d: np.ndarray, entries: Sequence[Any]) -> None:
     cache_dir = dataset_root / '.cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_method = normalize_multimodal_method(method)
     paths = np.array([entry.path for entry in entries])
     mtimes = np.array([int(Path(path).stat().st_mtime) if Path(path).exists() else 0 for path in paths], dtype=np.int64)
     np.savez_compressed(
-        cache_dir / f'coords_pca2d_{cache_method}.npz',
+        cache_dir / coords_cache_filename(method, reduction=reduction),
         paths=paths,
         mtimes=mtimes,
         coords=np.asarray(coords2d, dtype=np.float32),
     )
 
 
-def precompute_dataset(dataset_root: Path, methods: Sequence[str], reduction: str) -> None:
+def precompute_dataset(
+    dataset_root: Path,
+    methods: Sequence[str],
+    reduction: str | Sequence[str],
+    *,
+    normalize: bool = True,
+    include_coords: bool = True,
+) -> None:
     engine = ImageGalleryEngine(str(dataset_root))
     entries = engine.list_images()
     if not entries:
         raise RuntimeError(f'No images found under {dataset_root}')
+    reduction_methods = parse_reduction_methods(reduction) if include_coords else []
     for method in methods:
-        cached_embeddings = engine._load_embeddings_only(entries, method=method)
+        cached_embeddings = engine._load_embeddings_only(entries, method=method, normalize=normalize)
         if cached_embeddings is not None:
             embeddings = np.asarray(cached_embeddings, dtype=np.float32)
-            log(f'skipping embedding compute for {method} (cache hit)')
+            cache_label = embedding_cache_filename(method, normalize=normalize)
+            log(f'skipping embedding compute for {method} (cache hit: {cache_label})')
         else:
-            log(f'computing embeddings for {method}')
-            embeddings = engine.estimate_embeddings(entries, method=method)
+            log(f'computing embeddings for {method} normalize={bool(normalize)}')
+            embeddings = engine.estimate_embeddings(entries, method=method, normalize=normalize)
             if embeddings.ndim != 2 or embeddings.shape[0] != len(entries):
                 raise RuntimeError(f'Unsupported embedding shape for method={method}: {tuple(embeddings.shape)}')
-            save_embedding_cache(dataset_root=dataset_root, method=method, embeddings=embeddings, entries=entries)
+            save_embedding_cache(
+                dataset_root=dataset_root,
+                method=method,
+                embeddings=embeddings,
+                entries=entries,
+                normalize=normalize,
+            )
 
-        cached_coords = engine._load_cached_coords(entries, method=method)
-        if cached_coords is not None:
-            log(f'skipping {reduction.upper()} coords for {method} (cache hit)')
+        if not include_coords:
+            log(f'skipping coords for {method} (disabled)')
             continue
-        log(f'computing {reduction.upper()} coords for {method}')
-        coords2d = engine.reduce_to_2d(embeddings, method=reduction)
-        save_pca_cache(dataset_root=dataset_root, method=method, coords2d=coords2d, entries=entries)
+        for reduction_method in reduction_methods:
+            cached_coords = engine._load_cached_coords(entries, method=method, reduction=reduction_method)
+            if cached_coords is not None:
+                log(f'skipping {reduction_method.upper()} coords for {method} (cache hit)')
+                continue
+            log(f'computing {reduction_method.upper()} coords for {method}')
+            coords2d = engine.reduce_to_2d(embeddings, method=reduction_method)
+            save_coords_cache(
+                dataset_root=dataset_root,
+                method=method,
+                reduction=reduction_method,
+                coords2d=coords2d,
+                entries=entries,
+            )
 
 
 def parse_methods(raw: str) -> List[str]:
@@ -1587,7 +1619,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-edge', type=int, default=DEFAULT_MAX_EDGE, help='Resize the largest image edge to this value.')
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--methods', default=','.join(DEFAULT_METHODS), help='Comma-separated embedding methods to precompute.')
-    parser.add_argument('--reduction', default=DEFAULT_REDUCTION, choices=('pca', 'umap'))
+    parser.add_argument(
+        '--reduction',
+        default=DEFAULT_REDUCTION,
+        help='Comma-separated 2D reduction methods to precompute: pca, umap, tsne, or all.',
+    )
     parser.add_argument('--max-source-pixels', type=int, default=DEFAULT_MAX_SOURCE_PIXELS, help='Downscale source images above this pixel count before the normal import resize step.')
     parser.add_argument('--local-root', default=str(DEFAULT_LOCAL_ROOT), help='Base folder for local curated dataset presets.')
     parser.add_argument('--overwrite', action='store_true', help='Replace an existing dataset directory.')

@@ -368,16 +368,22 @@ class SweepAxisBayesEngine(AxisBayesEngine):
             for key, value in prompt_overrides.items()
         }
 
-    def build_prompt_ensemble(self, q: str) -> tuple[List[str], List[str], Dict[str, str]]:
+    def build_prompt_ensemble(self, q: str, *, dataset_name: str = '') -> tuple[List[str], List[str], Dict[str, str]]:
         query = ' '.join(str(q or '').strip().split())
         if query in self._sweep_prompt_overrides:
             pos, neg = self._sweep_prompt_overrides[query]
             return list(pos), list(neg), {'source': 'sweep_override', 'provider': 'fixed_template'}
-        return super().build_prompt_ensemble(query)
+        return super().build_prompt_ensemble(query, dataset_name=dataset_name)
 
-    def _embed_prompt_ensemble(self, q: str) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
+    def _embed_prompt_ensemble(
+        self,
+        q: str,
+        semantic_method: str,
+        norm: Optional[bool] = None,
+        dataset_name: str = '',
+    ) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
         query = ' '.join(str(q or '').strip().split())
-        cache_key = (self.axis_bounds_text_source, query)
+        cache_key = (self.axis_bounds_text_source, dataset_name, query, semantic_method, bool(self.norm if norm is None else norm))
         cached = self._prompt_embed_cache.get(cache_key)
         if cached is not None:
             return (
@@ -386,7 +392,12 @@ class SweepAxisBayesEngine(AxisBayesEngine):
                 list(cached[2]),
                 dict(cached[3]),
             )
-        result = super()._embed_prompt_ensemble(query)
+        result = super()._embed_prompt_ensemble(
+            query,
+            semantic_method=semantic_method,
+            norm=norm,
+            dataset_name=dataset_name,
+        )
         self._prompt_embed_cache[cache_key] = (
             np.asarray(result[0], dtype=np.float32).copy(),
             list(result[1]),

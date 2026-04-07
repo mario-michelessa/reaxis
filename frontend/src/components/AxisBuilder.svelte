@@ -1,10 +1,11 @@
 <script>
-  import { createEventDispatcher, onDestroy } from 'svelte'
+  import { createEventDispatcher, onDestroy, onMount } from 'svelte'
   import MaterialIcon from './MaterialIcon.svelte'
 
   export let session = null
   export let itemsById = new Map()
-  export let representativeImageIds = []
+  export let subsetIds = []
+  export let subsetActive = false
   export let selectedX = null
   export let selectedY = null
   export let busy = false
@@ -21,6 +22,7 @@
   const HISTOGRAM_HEIGHT = 84
   let dragSlice = null
   let localActiveSlice = null
+  let pendingCommittedSlice = null
   let hoveredDecileIndex = null
   let previewDecileIndex = null
   let previewHistogramIndex = null
@@ -30,6 +32,10 @@
   let openPriorPromptSide = null // 'neg' | 'pos' | null
   let editingPriorPromptSide = null
   let promptDraftText = ''
+  let feedbackDrag = null
+  let hoveredFeedbackId = ''
+  let deleteModifierActive = false
+  let subsetOnly = false
 
   function normalizeImageId(v) {
     return String(v || '').trim()
@@ -71,6 +77,10 @@
     return clamp01((Number(v) || 0) / 100) * 100
   }
 
+  $: normalizedSubsetIds = Array.isArray(subsetIds) ? subsetIds.map((id) => String(id || '').trim()).filter(Boolean) : []
+  $: subsetIdSet = new Set(normalizedSubsetIds)
+  $: if (!subsetActive) subsetOnly = false
+
   function formatRawValue(v) {
     const n = Number(v)
     if (!Number.isFinite(n)) return '0'
@@ -92,9 +102,20 @@
       return {
         imageId: String(parsed.imageId || ''),
         score: Number(parsed.score || 0),
+        sourceRow: String(parsed.sourceRow || '').trim(),
+        sourceRank: parsed.sourceRank === undefined || parsed.sourceRank === null ? '' : String(parsed.sourceRank).trim(),
       }
     } catch (_) {
       return null
+    }
+  }
+
+  function buildDragPayload(item, extras = {}) {
+    return {
+      imageId: item?.id,
+      score: Number(item?.score_0_100 || 0),
+      sourceRow: String(extras?.sourceRow || '').trim(),
+      sourceRank: extras?.sourceRank === undefined || extras?.sourceRank === null ? '' : String(extras.sourceRank).trim(),
     }
   }
 
@@ -105,14 +126,12 @@
     } catch (_) {}
   }
 
-  function onDragStart(e, item) {
+  function onDragStart(e, item, extras = {}) {
     if (!item?.id || busy) return
     try {
+      const payload = buildDragPayload(item, extras)
       e.dataTransfer.effectAllowed = 'move'
-      e.dataTransfer.setData('application/x-axis-builder-item', JSON.stringify({
-        imageId: item.id,
-        score: Number(item.score_0_100 || 0),
-      }))
+      e.dataTransfer.setData('application/x-axis-builder-item', JSON.stringify(payload))
       e.dataTransfer.setData('text/plain', String(item.id))
     } catch (_) {}
   }
@@ -122,13 +141,119 @@
     return (idx * 10) + 5
   }
 
-  function dispatchMove(imageId, fromScore0To100, targetPct, moveType = 'score') {
+  function dispatchMove(imageId, fromScore0To100, targetPct, moveType = 'score', extra = {}) {
     dispatch('move', {
       axisId: session?.axis?.id || session?.axisId,
       imageId,
       newScore0To100: clamp100(targetPct),
       fromScore0To100: clamp100(fromScore0To100),
       moveType,
+      sourceRow: String(extra?.sourceRow || '').trim(),
+      sourceRank: extra?.sourceRank === undefined || extra?.sourceRank === null ? '' : String(extra.sourceRank).trim(),
+      targetRank: moveType === 'undefined' ? 'undefined' : String(extra?.targetRank || '').trim(),
+    })
+  }
+
+  function isDeleteModifierKey(key) {
+    const normalized = String(key || '').trim().toLowerCase()
+    return normalized === 'delete' || normalized === 'backspace'
+  }
+
+  function clearFeedbackPointerListeners() {
+    window.removeEventListener('pointermove', onWindowFeedbackPointerMove)
+    window.removeEventListener('pointerup', onWindowFeedbackPointerUp)
+  }
+
+  function clearFeedbackDrag() {
+    feedbackDrag = null
+    clearFeedbackPointerListeners()
+  }
+
+  function feedbackTargetRank(targetPct) {
+    const pct = clamp100(targetPct)
+    if (pct >= 100) return 10
+    return Math.max(1, Math.min(10, Math.floor(pct / 10) + 1))
+  }
+
+  function feedbackDisplayPct(entry) {
+    const entryId = normalizeImageId(entry?.id)
+    if (feedbackDrag && feedbackDrag.imageId === entryId) {
+      return clamp100(feedbackDrag.currentPct)
+    }
+    return clamp100(entry?.score_0_100 || 0)
+  }
+
+  function feedbackTrackRect(target) {
+    return target?.closest?.('.feedback-track')?.getBoundingClientRect?.() || null
+  }
+
+  function onWindowFeedbackKeyDown(e) {
+    if (isDeleteModifierKey(e?.key)) deleteModifierActive = true
+  }
+
+  function onWindowFeedbackKeyUp(e) {
+    if (isDeleteModifierKey(e?.key)) deleteModifierActive = false
+  }
+
+  function onWindowFeedbackBlur() {
+    deleteModifierActive = false
+    clearFeedbackDrag()
+  }
+
+  function startFeedbackPointInteraction(e, entry) {
+    const imageId = normalizeImageId(entry?.id)
+    if (!imageId || busy) return
+    if (Number(e?.button ?? 0) !== 0) return
+    const currentPct = clamp100(entry?.score_0_100 || 0)
+    if (deleteModifierActive) {
+      dispatchMove(imageId, currentPct, currentPct, 'delete', {
+        sourceRow: 'feedback',
+        sourceRank: 'feedback',
+        targetRank: 'deleted',
+      })
+      try { e.preventDefault() } catch (_) {}
+      return
+    }
+    const rect = feedbackTrackRect(e?.currentTarget)
+    if (!rect) return
+    feedbackDrag = {
+      imageId,
+      rect,
+      fromScore0To100: currentPct,
+      currentPct,
+      moved: false,
+    }
+    hoveredFeedbackId = imageId
+    window.addEventListener('pointermove', onWindowFeedbackPointerMove)
+    window.addEventListener('pointerup', onWindowFeedbackPointerUp, { once: true })
+    try { e.preventDefault() } catch (_) {}
+  }
+
+  function onWindowFeedbackPointerMove(e) {
+    if (!feedbackDrag) return
+    const nextPct = clientPct(e, feedbackDrag.rect)
+    feedbackDrag = {
+      ...feedbackDrag,
+      currentPct: nextPct,
+      moved: feedbackDrag.moved || Math.abs(nextPct - feedbackDrag.fromScore0To100) >= 0.6,
+    }
+  }
+
+  function onWindowFeedbackPointerUp(e) {
+    if (!feedbackDrag) return
+    const active = feedbackDrag
+    clearFeedbackPointerListeners()
+    const nextPct = clientPct(e, active.rect)
+    const didMove = active.moved || Math.abs(nextPct - active.fromScore0To100) >= 0.6
+    feedbackDrag = null
+    if (!didMove) {
+      openImage(active.imageId)
+      return
+    }
+    dispatchMove(active.imageId, active.fromScore0To100, nextPct, 'score', {
+      sourceRow: 'feedback',
+      sourceRank: 'feedback',
+      targetRank: feedbackTargetRank(nextPct),
     })
   }
 
@@ -149,7 +274,11 @@
     const idx = Math.max(0, Math.min(9, Number(index) || 0))
     dropDecileIndex = null
     hoveredDecileIndex = idx
-    dispatchMove(payload.imageId, payload.score, decileTargetPct(idx), 'score')
+    dispatchMove(payload.imageId, payload.score, decileTargetPct(idx), 'score', {
+      sourceRow: payload.sourceRow,
+      sourceRank: payload.sourceRank,
+      targetRank: idx + 1,
+    })
   }
 
   function onUndefinedDropEnter() {
@@ -165,7 +294,11 @@
     if (!payload?.imageId) return
     dropUndefinedActive = false
     undefinedTooltipOpen = false
-    dispatchMove(payload.imageId, payload.score, payload.score, 'undefined')
+    dispatchMove(payload.imageId, payload.score, payload.score, 'undefined', {
+      sourceRow: payload.sourceRow,
+      sourceRank: payload.sourceRank || 'undefined',
+      targetRank: 'undefined',
+    })
   }
 
   function toggleUndefinedTooltip() {
@@ -213,11 +346,40 @@
     dispatch('sliceChange', { slice: nextSlice || null })
   }
 
+  function commitSliceFinal(nextSlice) {
+    localActiveSlice = nextSlice
+    pendingCommittedSlice = nextSlice || null
+    dispatch('sliceChange', { slice: nextSlice || null, final: true })
+  }
+
   function clearSlice() {
     localActiveSlice = null
+    pendingCommittedSlice = null
     dragSlice = null
-    window.removeEventListener('pointermove', onWindowPointerMove)
+    stopSlicePointerListeners()
     dispatch('sliceChange', { slice: null })
+  }
+
+  function sliceSignature(slice) {
+    if (!slice || typeof slice !== 'object') return ''
+    const ids = Array.isArray(slice.ids) ? slice.ids.map((id) => String(id || '').trim()).filter(Boolean) : []
+    return JSON.stringify({
+      axisId: String(slice.axisId || '').trim(),
+      rangeStartPct: clamp100(slice.rangeStartPct || 0),
+      rangeEndPct: clamp100(slice.rangeEndPct || 0),
+      ids,
+    })
+  }
+
+  function startSlicePointerListeners() {
+    stopSlicePointerListeners()
+    window.addEventListener('pointermove', onWindowPointerMove)
+    window.addEventListener('pointerup', onWindowPointerUp)
+  }
+
+  function stopSlicePointerListeners() {
+    window.removeEventListener('pointermove', onWindowPointerMove)
+    window.removeEventListener('pointerup', onWindowPointerUp)
   }
 
   function clientPct(e, rect) {
@@ -229,26 +391,58 @@
     const rect = e.currentTarget?.getBoundingClientRect?.()
     if (!rect) return
     const startDisplayPct = clientPct(e, rect)
-    dragSlice = { rect, startDisplayPct, lastDisplayPct: startDisplayPct }
-    window.addEventListener('pointermove', onWindowPointerMove)
-    window.addEventListener('pointerup', onWindowPointerUp, { once: true })
+    dragSlice = { kind: 'create', rect, startDisplayPct, lastDisplayPct: startDisplayPct }
+    startSlicePointerListeners()
     try { e.preventDefault() } catch (_) {}
+  }
+
+  function slicePreviewFromDrag() {
+    if (!dragSlice) return null
+    if (dragSlice.kind === 'resize') {
+      return buildSlice(dragSlice.fixedDisplayPct, dragSlice.movingDisplayPct)
+    }
+    return buildSlice(dragSlice.startDisplayPct, dragSlice.lastDisplayPct)
+  }
+
+  function startSliceResize(e, side) {
+    if (!localActiveSlice || busy) return
+    const shell = e?.currentTarget?.closest?.('.histogram-shell')
+    const rect = shell?.getBoundingClientRect?.()
+    if (!rect) return
+    dragSlice = {
+      kind: 'resize',
+      rect,
+      side: side === 'end' ? 'end' : 'start',
+      fixedDisplayPct: side === 'end'
+        ? clamp100(localActiveSlice.rangeStartPct || 0)
+        : clamp100(localActiveSlice.rangeEndPct || 0),
+      movingDisplayPct: side === 'end'
+        ? clamp100(localActiveSlice.rangeEndPct || 0)
+        : clamp100(localActiveSlice.rangeStartPct || 0),
+    }
+    startSlicePointerListeners()
+    try { e.preventDefault() } catch (_) {}
+    try { e.stopPropagation() } catch (_) {}
   }
 
   function onWindowPointerMove(e) {
     if (!dragSlice) return
-    dragSlice.lastDisplayPct = clientPct(e, dragSlice.rect)
-    const nextSlice = buildSlice(dragSlice.startDisplayPct, dragSlice.lastDisplayPct)
+    if (dragSlice.kind === 'resize') {
+      dragSlice.movingDisplayPct = clientPct(e, dragSlice.rect)
+    } else {
+      dragSlice.lastDisplayPct = clientPct(e, dragSlice.rect)
+    }
+    const nextSlice = slicePreviewFromDrag()
     if (nextSlice) commitSlice(nextSlice)
   }
 
   function onWindowPointerUp() {
     if (dragSlice) {
-      const nextSlice = buildSlice(dragSlice.startDisplayPct, dragSlice.lastDisplayPct)
-      if (nextSlice) commitSlice(nextSlice)
+      const nextSlice = slicePreviewFromDrag()
+      if (nextSlice) commitSliceFinal(nextSlice)
     }
     dragSlice = null
-    window.removeEventListener('pointermove', onWindowPointerMove)
+    stopSlicePointerListeners()
   }
 
   function buildDensityPlot(values, width = KDE_WIDTH, height = KDE_HEIGHT) {
@@ -441,12 +635,16 @@
     return points[points.length - 1]?.y ?? fallbackY
   }
 
-  function decileColumns(deciles) {
+  function decileColumns(deciles, activeSubsetIds = null) {
     const rows = Array.isArray(deciles) ? deciles : []
+    const allowed = activeSubsetIds instanceof Set ? activeSubsetIds : null
     return Array.from({ length: 10 }, (_, idx) => {
       const row = rows.find((entry) => Number(entry?.bin_index || 0) === idx) || {}
       const rawExemplars = Array.isArray(row?.exemplars) ? row.exemplars : []
-      const sortedExemplars = [...rawExemplars].sort((a, b) => (Number(a?.std) || 0) - (Number(b?.std) || 0))
+      const filteredExemplars = allowed
+        ? rawExemplars.filter((entry) => allowed.has(String(entry?.id || '').trim()))
+        : rawExemplars
+      const sortedExemplars = [...filteredExemplars].sort((a, b) => (Number(a?.std) || 0) - (Number(b?.std) || 0))
       const mostCertain = sortedExemplars.length > 0 ? sortedExemplars[0] : null
       const leastCertain = sortedExemplars.length > 0 ? sortedExemplars[sortedExemplars.length - 1] : null
       return {
@@ -548,7 +746,9 @@
 
   function priorPromptList(side) {
     const summary = session?.w0Summary || {}
-    const raw = side === 'neg' ? summary?.neg_prompts : summary?.pos_prompts
+    const raw = side === 'neg'
+      ? (summary?.neg_prompts || session?.negPromptEnsemble || session?.axis?.neg_prompt_ensemble || session?.axis?.negPromptEnsemble)
+      : (summary?.pos_prompts || session?.posPromptEnsemble || session?.axis?.pos_prompt_ensemble || session?.axis?.posPromptEnsemble)
     if (!Array.isArray(raw)) return []
     return raw.map((v) => String(v || '').trim()).filter((v) => v.length > 0)
   }
@@ -584,13 +784,25 @@
     promptDraftText = ''
   }
 
+  function parsePromptDraftLines(value) {
+    const out = []
+    const seen = new Set()
+    const parts = String(value || '').split(/\r?\n|\\n/g)
+    for (const raw of parts) {
+      const text = String(raw || '').trim()
+      if (!text) continue
+      const key = text.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(text)
+    }
+    return out
+  }
+
   function savePromptEdit() {
     const axisId = String(session?.axis?.id || session?.axisId || '').trim()
     if (!axisId || !editingPriorPromptSide) return
-    const editedPrompts = String(promptDraftText || '')
-      .split('\n')
-      .map((line) => String(line || '').trim())
-      .filter(Boolean)
+    const editedPrompts = parsePromptDraftLines(promptDraftText)
     if (editedPrompts.length === 0) return
     const posPrompts = editingPriorPromptSide === 'pos' ? editedPrompts : posPriorPrompts
     const negPrompts = editingPriorPromptSide === 'neg' ? editedPrompts : negPriorPrompts
@@ -598,6 +810,8 @@
       axisId,
       posPrompts,
       negPrompts,
+      editedSide: editingPriorPromptSide,
+      editedPrompts,
       onSuccess: () => {
         closePriorPromptMenu()
       },
@@ -611,11 +825,24 @@
     dispatch('openImage', { imageId: id })
   }
 
-  onDestroy(() => {
-    window.removeEventListener('pointermove', onWindowPointerMove)
+  onMount(() => {
+    window.addEventListener('keydown', onWindowFeedbackKeyDown)
+    window.addEventListener('keyup', onWindowFeedbackKeyUp)
+    window.addEventListener('blur', onWindowFeedbackBlur)
+    return () => {
+      window.removeEventListener('keydown', onWindowFeedbackKeyDown)
+      window.removeEventListener('keyup', onWindowFeedbackKeyUp)
+      window.removeEventListener('blur', onWindowFeedbackBlur)
+      clearFeedbackDrag()
+    }
   })
 
-  $: scoreEntries = (() => {
+  onDestroy(() => {
+    stopSlicePointerListeners()
+    clearFeedbackDrag()
+  })
+
+  $: baseScoreEntries = (() => {
     const ids = Array.isArray(session?.ids) ? session.ids : []
     const scores = Array.isArray(session?.scores) ? session.scores : []
     const rawValues = Array.isArray(session?.projectionValues) ? session.projectionValues : []
@@ -631,6 +858,9 @@
     }
     return out
   })()
+  $: scoreEntries = subsetOnly
+    ? baseScoreEntries.filter((entry) => subsetIdSet.has(entry.id))
+    : baseScoreEntries
 
   $: undefinedIds = new Set(Array.isArray(session?.undefinedIds) ? session.undefinedIds.map((v) => String(v || '').trim()).filter(Boolean) : [])
   $: rawEntries = scoreEntries.filter((entry) => !undefinedIds.has(entry.id))
@@ -676,7 +906,7 @@
     densityPlot.width,
     densityPlot.height,
   )
-  $: exampleDeciles = decileColumns(session?.decileExemplars)
+  $: exampleDeciles = decileColumns(session?.decileExemplars, subsetOnly ? subsetIdSet : null)
   $: decileMarkers = rawValuesSorted.length === 0 ? [] : exampleDeciles.map((decile) => {
     const q = (decile.index + 0.5) / 10
     const rawValue = quantileSorted(rawValuesSorted, q)
@@ -691,37 +921,36 @@
     }
   })
   $: scoreEntryById = new Map(scoreEntries.map((entry) => [entry.id, entry]))
-  $: representativeEntries = (() => {
-    const seen = new Set()
-    const entries = []
-    for (const rawId of Array.isArray(representativeImageIds) ? representativeImageIds : []) {
-      const id = normalizeImageId(rawId)
-      if (!id || seen.has(id)) continue
-      seen.add(id)
+  $: exampleSlots = Array.from({ length: 10 }, (_, idx) => {
+    const bin = histogramBins[idx]
+    const samples = Array.isArray(bin?.samples) ? bin.samples : []
+    return samples.length > 0 ? samples[0] : null
+  })
+  $: movedIds = new Set(Array.isArray(session?.moves) ? session.moves.map((move) => String(move?.image_id || '')) : [])
+  $: movedFeedbackEntries = (() => {
+    const ordered = new Map()
+    for (const move of Array.isArray(session?.moves) ? session.moves : []) {
+      const id = String(move?.image_id || '').trim()
+      if (!id || ordered.has(id)) continue
       const entry = scoreEntryById.get(id)
       if (!entry) continue
-      entries.push(entry)
+      ordered.set(id, entry)
     }
-    entries.sort((a, b) => {
+    return Array.from(ordered.values()).sort((a, b) => {
       const scoreDelta = Number(a?.score_0_100 || 0) - Number(b?.score_0_100 || 0)
       if (Math.abs(scoreDelta) > 1e-8) return scoreDelta
-      const rawDelta = Number(a?.rawValue || 0) - Number(b?.rawValue || 0)
-      if (Math.abs(rawDelta) > 1e-8) return rawDelta
       return String(a?.id || '').localeCompare(String(b?.id || ''))
     })
-    return entries
   })()
-  $: representativeSlots = Array.from({ length: 10 }, (_, idx) => representativeEntries[idx] || null)
-  $: movedIds = new Set(Array.isArray(session?.moves) ? session.moves.map((move) => String(move?.image_id || '')) : [])
   $: undefinedEntries = Array.from(undefinedIds)
     .map((id) => {
-      const idx = scoreEntries.findIndex((entry) => entry.id === id)
-      if (idx < 0) return null
+      const entry = scoreEntryById.get(id)
+      if (!entry) return null
       return {
         id,
-        score_0_100: Number(scoreEntries[idx]?.score_0_100 || 0),
-        rawValue: Number(scoreEntries[idx]?.rawValue || 0),
-        std: Number(scoreEntries[idx]?.std || 0),
+        score_0_100: Number(entry?.score_0_100 || 0),
+        rawValue: Number(entry?.rawValue || 0),
+        std: Number(entry?.std || 0),
       }
     })
     .filter(Boolean)
@@ -736,8 +965,14 @@
   $: activePriorPrompts = openPriorPromptSide === 'neg' ? negPriorPrompts : (openPriorPromptSide === 'pos' ? posPriorPrompts : [])
   $: {
     const axisId = session?.axis?.id || session?.axisId
-    if (activeSlice && activeSlice?.axisId === axisId) {
-      localActiveSlice = activeSlice
+    const externalSlice = activeSlice && activeSlice?.axisId === axisId ? activeSlice : null
+    if (externalSlice) {
+      localActiveSlice = externalSlice
+      if (!pendingCommittedSlice || sliceSignature(pendingCommittedSlice) === sliceSignature(externalSlice)) {
+        pendingCommittedSlice = null
+      }
+    } else if (!dragSlice && pendingCommittedSlice && pendingCommittedSlice?.axisId === axisId) {
+      localActiveSlice = pendingCommittedSlice
     } else if (!dragSlice) {
       localActiveSlice = null
     }
@@ -746,19 +981,10 @@
 
 <article class="axis-builder-card">
   <div class="axis-builder-header">
-    <div class="axis-builder-title">{session?.axis?.name || session?.q || 'Axis'}</div>
+    <div class="axis-builder-title-wrap">
+      <div class="axis-builder-title">{session?.axis?.name || session?.q || 'Axis'}</div>
+    </div>
     <div class="axis-builder-actions">
-      <button
-        type="button"
-        class="axis-action axis-save"
-        on:click={() => dispatch('save', {
-          axisId: session?.axis?.id || session?.axisId,
-          axis: session?.axis,
-          q: session?.q || session?.axis?.name || '',
-        })}
-        aria-label="Save axis"
-        title="Save axis to library"
-      ><MaterialIcon name="save" /></button>
       <button
         type="button"
         class={`axis-action ${selectedX === session?.axis?.id ? 'active x' : ''}`}
@@ -773,10 +999,34 @@
         aria-label="Use axis as Y"
         title="Use as Y"
       >Y</button>
+      {#if subsetActive}
+        <button
+          type="button"
+          class={`axis-action axis-action-subset ${subsetOnly ? 'active' : ''}`}
+          on:click={() => { subsetOnly = !subsetOnly }}
+          aria-pressed={subsetOnly}
+          title={subsetOnly ? `Showing only subset (${normalizedSubsetIds.length})` : `Filter builder to subset (${normalizedSubsetIds.length})`}
+          aria-label={subsetOnly ? `Showing only subset (${normalizedSubsetIds.length})` : `Filter builder to subset (${normalizedSubsetIds.length})`}
+        ><MaterialIcon name="replay" /></button>
+      {/if}
+      <button
+        type="button"
+        class="axis-action axis-save"
+        on:click={() => dispatch('save', {
+          axisId: session?.axis?.id || session?.axisId,
+          axis: session?.axis,
+          q: session?.q || session?.axis?.name || '',
+        })}
+        aria-label="Save axis"
+        title="Save axis to library"
+      ><MaterialIcon name="save" /></button>
       <button
         type="button"
         class="axis-action axis-remove"
-        on:click={() => dispatch('remove', { axisId: session?.axis?.id || session?.axisId })}
+        on:click={() => dispatch('remove', {
+          axisId: session?.axis?.id || session?.axisId,
+          axisName: session?.axis?.name || session?.q || session?.axisId || 'Axis',
+        })}
         aria-label="Remove axis"
         title="Remove axis"
       ><MaterialIcon name="close" /></button>
@@ -801,7 +1051,22 @@
           <div
             class="density-slice-overlay"
             style={`left:${clamp100(localActiveSlice.rangeStartPct || 0)}%;width:${Math.max(0.8, clamp100(localActiveSlice.rangeEndPct || 0) - clamp100(localActiveSlice.rangeStartPct || 0))}%;`}
-          />
+          >
+            <button
+              type="button"
+              class="density-slice-handle density-slice-handle-start"
+              aria-label="Adjust slice start"
+              title="Adjust slice start"
+              on:pointerdown|stopPropagation={($event) => startSliceResize($event, 'start')}
+            />
+            <button
+              type="button"
+              class="density-slice-handle density-slice-handle-end"
+              aria-label="Adjust slice end"
+              title="Adjust slice end"
+              on:pointerdown|stopPropagation={($event) => startSliceResize($event, 'end')}
+            />
+          </div>
         {/if}
         <svg
           class="density-plot histogram-plot"
@@ -948,7 +1213,7 @@
 
   <div class="decile-ribbons">
     <div class="scale-row uncertainty-strip-row" aria-label="Average uncertainty by rating bin">
-      <span class="decile-row-label uncertainty-strip-label" aria-hidden="true" />
+      <span class="decile-row-label uncertainty-strip-label" aria-label="Uncertainty" title="Uncertainty">Uncertainty</span>
       <div class="decile-track uncertainty-track">
         {#each uncertaintyHeatBins as bin (bin.index)}
           <span
@@ -962,31 +1227,30 @@
     </div>
 
     <div class="scale-row decile-row-wrap">
-      <span class="decile-row-label decile-row-icon" aria-label="Most sure" title="Most sure"><MaterialIcon name="check" size={16} /></span>
-      <div class="decile-track decile-row" role="list" aria-label="Most certain examples by decile">
-        {#each exampleDeciles as decile (decile.index)}
-          {@const exemplar = decile.mostCertain}
+      <span class="decile-row-label" aria-label="Examples" title="Examples">Examples</span>
+      <div class="decile-track decile-row" role="list" aria-label="Representative examples by histogram bin">
+        {#each exampleSlots as exemplar, idx (`example-${idx}-${exemplar?.id || 'empty'}`)}
           {@const item = exemplar ? resolveItem(exemplar.id) : null}
           <div
             role="listitem"
-            class={`decile-slot ${dropDecileIndex === decile.index ? 'drop-active' : ''}`}
-            on:mouseenter={() => onDecileEnter(decile.index)}
-            on:mouseleave={() => onDecileLeave(decile.index)}
+            class={`decile-slot ${dropDecileIndex === idx ? 'drop-active' : ''}`}
+            on:mouseenter={() => onDecileEnter(idx)}
+            on:mouseleave={() => onDecileLeave(idx)}
             on:dragover={allowDrop}
-            on:dragenter={() => onDropZoneEnter(decile.index)}
-            on:dragleave={() => onDropZoneLeave(decile.index)}
-            on:drop={(e) => onDropZone(e, decile.index)}
+            on:dragenter={() => onDropZoneEnter(idx)}
+            on:dragleave={() => onDropZoneLeave(idx)}
+            on:drop={(e) => onDropZone(e, idx)}
           >
             <button
               type="button"
               class={`decile-thumb-btn ${exemplar && movedIds.has(exemplar.id) ? 'moved' : ''}`}
               draggable={!busy && !!exemplar}
-              on:dragstart={(e) => { if (exemplar) onDragStart(e, exemplar) }}
+              on:dragstart={(e) => { if (exemplar) onDragStart(e, exemplar, { sourceRow: 'examples', sourceRank: idx + 1 }) }}
               on:click|stopPropagation={() => { if (exemplar?.id) openImage(exemplar.id) }}
-              title={exemplar?.id || decile.label}
+              title={exemplar?.id || `Example ${idx + 1}`}
             >
               {#if item?.thumbUrl || item?.url}
-                <img src={item.thumbUrl || item.url} alt={exemplar?.id || decile.label} class="decile-thumb" />
+                <img src={item.thumbUrl || item.url} alt={exemplar?.id || `Example ${idx + 1}`} class="decile-thumb" />
               {:else}
                 <div class="decile-thumb decile-thumb-empty" aria-hidden="true" />
               {/if}
@@ -1026,7 +1290,7 @@
                     type="button"
                     class="undefined-thumb-btn"
                     draggable={!busy}
-                    on:dragstart={(e) => onDragStart(e, entry)}
+                    on:dragstart={(e) => onDragStart(e, entry, { sourceRow: 'undefined', sourceRank: 'undefined' })}
                     on:click|stopPropagation={() => openImage(entry.id)}
                     title={entry.id}
                   >
@@ -1047,8 +1311,8 @@
     </div>
 
     <div class="scale-row decile-row-wrap">
-      <span class="decile-row-label decile-row-icon" aria-label="Least sure" title="Least sure"><MaterialIcon name="question_mark" size={16} /></span>
-      <div class="decile-track decile-row" role="list" aria-label="Least certain examples by decile">
+      <span class="decile-row-label" aria-label="Uncertain" title="Uncertain">Uncertain</span>
+      <div class="decile-track decile-row" role="list" aria-label="Most uncertain examples by decile">
         {#each exampleDeciles as decile (decile.index)}
           {@const exemplar = decile.leastCertain}
           {@const item = exemplar ? resolveItem(exemplar.id) : null}
@@ -1066,7 +1330,7 @@
               type="button"
               class={`decile-thumb-btn ${exemplar && movedIds.has(exemplar.id) ? 'moved' : ''}`}
               draggable={!busy && !!exemplar}
-              on:dragstart={(e) => { if (exemplar) onDragStart(e, exemplar) }}
+              on:dragstart={(e) => { if (exemplar) onDragStart(e, exemplar, { sourceRow: 'least sure', sourceRank: decile.index + 1 }) }}
               on:click|stopPropagation={() => { if (exemplar?.id) openImage(exemplar.id) }}
               title={exemplar?.id || decile.label}
             >
@@ -1082,28 +1346,40 @@
       <span class="scale-undefined-spacer" aria-hidden="true" />
     </div>
 
-    <div class="scale-row decile-row-wrap representative-row-wrap">
-      <span class="decile-row-label representative-row-label" aria-label="Representative images" title="Representative images">Rep</span>
-      <div class="decile-track decile-row representative-row" role="list" aria-label="Representative dataset images sorted by axis score">
-        {#each representativeSlots as entry, idx (`rep-${idx}-${entry?.id || 'empty'}`)}
-          {@const item = entry ? resolveItem(entry.id) : null}
-          <div role="listitem" class="decile-slot representative-slot">
-            <button
-              type="button"
-              class={`decile-thumb-btn representative-thumb-btn ${entry && movedIds.has(entry.id) ? 'moved' : ''}`}
-              draggable={!busy && !!entry}
-              disabled={!entry}
-              on:dragstart={(e) => { if (entry) onDragStart(e, entry) }}
-              on:click|stopPropagation={() => { if (entry?.id) openImage(entry.id) }}
-              title={entry?.id || 'Representative image'}
-            >
+    <div class="scale-row decile-row-wrap feedback-row-wrap">
+      <span class="decile-row-label feedback-row-label" aria-label="Refinement summary" title="Refinement summary">Refinement
+summary</span>
+      <div
+        class={`feedback-track ${feedbackDrag ? 'dragging' : ''}`}
+        aria-label="Moved image positions"
+        title="Drag dots to retarget moved images. Hold Delete and click a dot to remove that move."
+      >
+        <div class="feedback-line" />
+        <span class="feedback-end feedback-end-left">0</span>
+        <span class="feedback-end feedback-end-right">1</span>
+        {#each movedFeedbackEntries as entry (entry.id)}
+          {@const item = resolveItem(entry.id)}
+          <button
+            type="button"
+            class={`feedback-point ${feedbackDrag?.imageId === entry.id ? 'dragging' : ''} ${deleteModifierActive ? 'delete-armed' : ''}`}
+            style={`left:${feedbackDisplayPct(entry)}%;`}
+            aria-label={`Moved image ${entry.id}`}
+            title={entry.id}
+            on:mouseenter={() => { hoveredFeedbackId = entry.id }}
+            on:mouseleave={() => { if (hoveredFeedbackId === entry.id) hoveredFeedbackId = '' }}
+            on:focus={() => { hoveredFeedbackId = entry.id }}
+            on:blur={() => { if (hoveredFeedbackId === entry.id) hoveredFeedbackId = '' }}
+            on:pointerdown|stopPropagation={(e) => startFeedbackPointInteraction(e, entry)}
+          />
+          {#if hoveredFeedbackId === entry.id}
+            <div class="feedback-hover" style={`left:${feedbackDisplayPct(entry)}%;`}>
               {#if item?.thumbUrl || item?.url}
-                <img src={item.thumbUrl || item.url} alt={entry?.id || 'Representative image'} class="decile-thumb" />
+                <img src={item.thumbUrl || item.url} alt={entry.id} class="feedback-hover-image" />
               {:else}
-                <div class="decile-thumb decile-thumb-empty" aria-hidden="true" />
+                <div class="feedback-hover-image decile-thumb-empty" aria-hidden="true" />
               {/if}
-            </button>
-          </div>
+            </div>
+          {/if}
         {/each}
       </div>
       <span class="scale-undefined-spacer" aria-hidden="true" />
@@ -1115,7 +1391,7 @@
   .axis-builder-card,
   .decile-ribbons {
     --axis-bin-size: 50px;
-    --axis-label-width: 50px;
+    --axis-label-width: 64px;
     --axis-undefined-width: 50px;
   }
 
@@ -1145,6 +1421,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .axis-builder-title-wrap {
+    min-width: 0;
+    display: flex;
+    align-items: center;
   }
 
   .axis-builder-actions {
@@ -1234,6 +1516,28 @@
     border-right: 1px solid rgba(96, 165, 250, 0.38);
     pointer-events: none;
     z-index: 1;
+  }
+
+  .density-slice-handle {
+    position: absolute;
+    top: 50%;
+    width: 12px;
+    height: 24px;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgba(59, 130, 246, 0.58);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 2px 8px rgba(37, 99, 235, 0.2);
+    pointer-events: auto;
+    cursor: ew-resize;
+  }
+
+  .density-slice-handle-start {
+    left: 0;
+  }
+
+  .density-slice-handle-end {
+    left: 100%;
   }
 
   .density-plot {
@@ -1586,13 +1890,13 @@
   }
 
   .uncertainty-strip-row {
-    min-height: 10px;
+    min-height: 22px;
     margin-top: -1px;
     margin-bottom: 1px;
   }
 
   .uncertainty-strip-label {
-    height: 10px;
+    min-height: 22px;
   }
 
   .uncertainty-track {
@@ -1615,31 +1919,112 @@
     min-width: 0;
   }
 
-  .representative-row-wrap {
-    margin-top: 1px;
-  }
-
   .decile-row-label {
     width: var(--axis-label-width);
+    min-height: var(--axis-bin-size);
     display: inline-flex;
     align-items: center;
     justify-content: flex-end;
-    height: var(--axis-bin-size);
     padding-right: 4px;
     color: #7b8197;
-    font-size: var(--font-size-small);
-    line-height: 1;
-  }
-
-  .decile-row-icon {
-    color: #64748b;
-  }
-
-  .representative-row-label {
     font-size: 11px;
     font-weight: 700;
-    letter-spacing: 0.02em;
+    line-height: 1.1;
+    white-space: pre-line;
+    text-align: right;
     color: #64748b;
+  }
+
+  .feedback-row-wrap {
+    margin-top: 2px;
+  }
+
+  .feedback-row-label {
+    min-height: var(--axis-bin-size);
+  }
+
+  .feedback-track {
+    position: relative;
+    height: 22px;
+    min-width: 0;
+  }
+
+  .feedback-line {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 10px;
+    height: 2px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, rgba(148, 163, 184, 0.72) 0%, rgba(37, 99, 235, 0.84) 100%);
+  }
+
+  .feedback-end {
+    position: absolute;
+    top: 0;
+    font-size: 10px;
+    line-height: 1;
+    color: #94a3b8;
+  }
+
+  .feedback-end-left {
+    left: 0;
+  }
+
+  .feedback-end-right {
+    right: 0;
+  }
+
+  .feedback-point {
+    position: absolute;
+    top: 11px;
+    width: 12px;
+    height: 12px;
+    transform: translate(-50%, -50%);
+    border: 2px solid #ffffff;
+    border-radius: 999px;
+    background: #2563eb;
+    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.25);
+    padding: 0;
+    margin: 0;
+    cursor: grab;
+    touch-action: none;
+    transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+  }
+
+  .feedback-point.dragging {
+    cursor: grabbing;
+    transform: translate(-50%, -50%) scale(1.18);
+    box-shadow: 0 6px 16px rgba(37, 99, 235, 0.32);
+  }
+
+  .feedback-point.delete-armed {
+    background: #dc2626;
+    box-shadow: 0 4px 10px rgba(220, 38, 38, 0.24);
+  }
+
+  .feedback-hover {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    transform: translateX(-50%);
+    width: 56px;
+    height: 56px;
+    padding: 4px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid #d8dbe7;
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.14);
+    pointer-events: none;
+    z-index: 125;
+  }
+
+  .feedback-hover-image {
+    width: 100%;
+    height: 100%;
+    border-radius: 6px;
+    object-fit: cover;
+    display: block;
+    background: #f4f4f6;
   }
 
   .undefined-slot-wrap {
@@ -1809,7 +2194,7 @@
     .axis-builder-card,
     .decile-ribbons {
       --axis-bin-size: 46px;
-      --axis-label-width: 46px;
+      --axis-label-width: 58px;
       --axis-undefined-width: 46px;
     }
   }

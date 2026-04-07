@@ -67,6 +67,7 @@ try:
         AXIS_PIECEWISE_USE_GATING,
     )
     from .gallery_backend import ImageGalleryEngine
+    from .modeling_eval_prompt_cache import hydrate_prompt_cache
 except ImportError:
     from axis_bayes import AxisBayesEngine, CollectionCache
     from constants import (
@@ -106,6 +107,7 @@ except ImportError:
         AXIS_PIECEWISE_USE_GATING,
     )
     from gallery_backend import ImageGalleryEngine
+    from modeling_eval_prompt_cache import hydrate_prompt_cache
 
 
 # =============================
@@ -124,6 +126,7 @@ ACTIVE_DATASETS = [
     'celeba_dataset',
     'chest_xray_pneumonia',
     'brain_mri_images',
+    'HAM10000',
 ]
 
 # Optional substring filter over task ids. Leave empty to run all tasks coming
@@ -145,8 +148,6 @@ ACTIVE_METHODS = [
 # Ablations are declared separately so they can be run without cluttering the
 # main method list. Edit this list freely.
 ACTIVE_ABLATIONS = [
-    'ablate_clip_only',
-    'ablate_clip_dino',
     'ablate_no_text_prior',
 ]
 
@@ -165,7 +166,7 @@ REPRESENTATIVE_LOG_BUDGETS = [0, max(REFINEMENT_BUDGETS)]
 
 # Global evaluation knobs.
 GLOBAL_SEED = 20260313
-MAX_PAIRWISE_METRIC_PAIRS = 50_000
+MAX_PAIRWISE_METRIC_PAIRS = 500
 TOPK_FRAC = 0.10
 FUTURE_CORRECTION_ERROR_THRESHOLD = 0.20
 COVERAGE_POINTS = [0.25, 0.50, 0.75, 1.0]
@@ -177,6 +178,12 @@ DEFAULT_MAX_IMAGES_PER_DATASET = 0
 # When undefined supervision is enabled on a task, images inside the undefined
 # mask are sent as move_type='undefined' instead of a scalar target.
 DEFAULT_UNDEFINED_BAND = 0.10
+CONTRASTIVE_PROMPT_SOURCE = 'llm_cache'  # 'llm_cache' | 'template'
+CONTRASTIVE_PROMPT_CACHE_PATH = CACHE_DIR / 'contrastive_prompts.txt'
+CONTRASTIVE_PROMPT_COUNT = 3
+CONTRASTIVE_PROMPT_REGENERATE = False
+CONTRASTIVE_PROMPT_MAX_RETRIES = 4
+CONTRASTIVE_PROMPT_RETRY_WAIT_SEC = 65.0
 
 
 # =============================
@@ -193,6 +200,7 @@ class ConceptSpec:
     max_values: int = 0
     exclude_values: Tuple[str, ...] = ()
     positive_values: Tuple[str, ...] = ()
+    value_aliases: Tuple[Tuple[str, str], ...] = ()
     undefined_band: float = 0.0
     enabled: bool = True
 
@@ -308,6 +316,29 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
             ConceptSpec(kind='metadata_binary_value', name='tumor', field='label', positive_values=('yes',), min_count=1),
         ),
     ),
+    'HAM10000': DatasetSpec(
+        name='HAM10000',
+        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'HAM10000',
+        concepts=(
+            ConceptSpec(
+                kind='metadata_one_vs_rest',
+                name='lesion_type',
+                field='dx',
+                query_prefix='lesion type',
+                min_count=20,
+                max_values=7,
+                value_aliases=(
+                    ('akiec', 'actinic keratosis / Bowen disease'),
+                    ('bcc', 'basal cell carcinoma'),
+                    ('bkl', 'benign keratosis-like lesion'),
+                    ('df', 'dermatofibroma'),
+                    ('mel', 'melanoma'),
+                    ('nv', 'melanocytic nevus'),
+                    ('vasc', 'vascular lesion'),
+                ),
+            ),
+        ),
+    ),
 }
 
 
@@ -320,11 +351,16 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
 # values chosen for interactive use, while the paper study should use the
 # best sweep result for each evaluated method.
 GAUSSIAN_SWEEP_BEST: Dict[str, Any] = {
-    'feature_space': 'clip_dino',
-    'clip_weight': 0.5913735456374828,
-    'dino_weight': 0.4086264543625172,
+    'feature_space': 'clip',
+    'clip_weight': 1.0,
+    'dino_weight': 0.0,
     'alpha': 0.17392955514866384,
-    'dino_alpha': 0.7508090208834363,
+    'dino_alpha': 0.0,
+    # 'feature_space': 'clip_dino',
+    # 'clip_weight': 0.5913735456374828,
+    # 'dino_weight': 0.4086264543625172,
+    # 'alpha': 0.17392955514866384,
+    # 'dino_alpha': 0.7508090208834363,
     'bias_alpha': 0.02885457255148477,
     'sigma2': 0.0023543092401027846,
 }
@@ -333,11 +369,14 @@ GAUSSIAN_SWEEP_BEST: Dict[str, Any] = {
 # The rank sweep did not tune bias_alpha or sigma2, so those stay explicit here
 # as shared linear defaults for the study.
 RANK_SWEEP_BEST: Dict[str, Any] = {
-    'feature_space': 'clip_dino',
-    'clip_weight': 0.8041519207887364,
-    'dino_weight': 0.19584807921126357,
+    'feature_space': 'clip',
+    # 'feature_space': 'clip_dino',
+    'clip_weight': 1.0,
+    'dino_weight': 0.0,
+    # 'clip_weight': 0.8041519207887364,
+    # 'dino_weight': 0.19584807921126357,
     'alpha': 0.34361647953904884,
-    'dino_alpha': 0.41751659396568375,
+    'dino_alpha': 0.0,
     'bias_alpha': AXIS_BAYES_BIAS_ALPHA,
     'sigma2': AXIS_BAYES_SIGMA2,
     'rank_eta': 1.3185334419106902,
@@ -347,9 +386,9 @@ RANK_SWEEP_BEST: Dict[str, Any] = {
 }
 
 GRAPH_SWEEP_BEST: Dict[str, Any] = {
-    'feature_space': 'clip_dino',
-    'clip_weight': 0.8495719029864992,
-    'dino_weight': 0.1504280970135008,
+    'feature_space': 'clip',
+    'clip_weight': 1.0,
+    'dino_weight': 0.0,
     'sigma2': 0.0006123800590318016,
     'graph_knn_k': 4,
     'graph_lambda_smooth': 3.1392207160296035,
@@ -358,14 +397,14 @@ GRAPH_SWEEP_BEST: Dict[str, Any] = {
 }
 
 PIECEWISE_SWEEP_BEST: Dict[str, Any] = {
-    'feature_space': 'clip_dino',
-    'clip_weight': 0.6328098517346632,
-    'dino_weight': 0.3671901482653368,
+    'feature_space': 'clip',
+    'clip_weight': 1.0,
+    'dino_weight': 0.0,
     'piecewise_num_experts': 1,
     'piecewise_use_gating': True,
     'piecewise_aggregator': 'max',
     'piecewise_clip_scale': 1.3508877482680062,
-    'piecewise_dino_scale': 0.22659722214371478,
+    'piecewise_dino_scale': 0.0,
     'pairwise_from_scalar_margin': 0.34936776596459196,
     'piecewise_prior_strength': 0.11917005611546902,
     'piecewise_expert_diversity_strength': 0.5197325862847438,
@@ -375,9 +414,9 @@ PIECEWISE_SWEEP_BEST: Dict[str, Any] = {
 }
 
 RESIDUAL_DEFAULTS: Dict[str, Any] = {
-    'feature_space': 'clip_dino',
-    'clip_weight': AXIS_BAYES_CLIP_WEIGHT,
-    'dino_weight': AXIS_BAYES_DINO_WEIGHT,
+    'feature_space': 'clip',
+    'clip_weight': 1.0,
+    'dino_weight': 0.0,
     'residual_alpha': AXIS_RESIDUAL_ALPHA,
     'residual_beta': AXIS_RESIDUAL_BETA,
     'residual_lambda': AXIS_RESIDUAL_LAMBDA,
@@ -395,6 +434,8 @@ METHOD_REGISTRY: Dict[str, MethodSpec] = {
         supports_uncertainty=False,
         supports_undefined=False,
         feature_space='clip',
+        clip_weight=1.0,
+        dino_weight=0.0,
         params={'use_ensemble': False},
     ),
     'prompt_ensemble': MethodSpec(
@@ -405,6 +446,8 @@ METHOD_REGISTRY: Dict[str, MethodSpec] = {
         supports_uncertainty=False,
         supports_undefined=False,
         feature_space='clip',
+        clip_weight=1.0,
+        dino_weight=0.0,
         params={'use_ensemble': True},
     ),
     'label_only_linear': MethodSpec(
@@ -414,9 +457,9 @@ METHOD_REGISTRY: Dict[str, MethodSpec] = {
         supports_feedback=True,
         supports_uncertainty=False,
         supports_undefined=False,
-        feature_space=AXIS_BAYES_FEATURE_SPACE,
-        clip_weight=AXIS_BAYES_CLIP_WEIGHT,
-        dino_weight=AXIS_BAYES_DINO_WEIGHT,
+        feature_space='clip',
+        clip_weight=1.0,
+        dino_weight=0.0,
         params={'ridge_lambda': 1.0},
     ),
     'knn_label_propagation': MethodSpec(
@@ -426,9 +469,9 @@ METHOD_REGISTRY: Dict[str, MethodSpec] = {
         supports_feedback=True,
         supports_uncertainty=False,
         supports_undefined=False,
-        feature_space=AXIS_BAYES_FEATURE_SPACE,
-        clip_weight=AXIS_BAYES_CLIP_WEIGHT,
-        dino_weight=AXIS_BAYES_DINO_WEIGHT,
+        feature_space='clip',
+        clip_weight=1.0,
+        dino_weight=0.0,
         params={'k': 15, 'temperature': 12.0},
     ),
     'request_bayes_linear_gaussian': MethodSpec(
@@ -800,6 +843,38 @@ def compact_json(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=True, separators=(',', ':'), sort_keys=True)
 
 
+def normalize_query_text(query: str) -> str:
+    return ' '.join(str(query or '').strip().split())
+
+
+def normalize_dataset_name(dataset_name: str) -> str:
+    text = str(dataset_name or '').strip()
+    return str(Path(text).name).strip() if text else ''
+
+
+def prompt_override_key(dataset_name: str, query: str) -> str:
+    return f'{normalize_dataset_name(dataset_name).lower()}::{normalize_query_text(query).lower()}'
+
+
+def method_uses_dino(spec: MethodSpec) -> bool:
+    feature_space = str(spec.feature_space or '').strip().lower()
+    if feature_space == 'clip':
+        return False
+    if feature_space == 'clip_dino':
+        return True
+    if abs(float(spec.dino_weight)) > 1e-8:
+        return True
+    params = dict(spec.params or {})
+    for key in ('dino_alpha', 'piecewise_dino_scale'):
+        raw = params.get(key)
+        try:
+            if abs(float(raw)) > 1e-8:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def method_spec_payload(spec: MethodSpec) -> Dict[str, Any]:
     return {
         'name': str(spec.name),
@@ -1047,7 +1122,7 @@ def _sample_indices_stratified(values: Sequence[str], count: int, seed: int) -> 
     return np.asarray(sorted(picks[:count]), dtype=np.int64)
 
 
-def load_dataset(spec: DatasetSpec) -> LoadedDataset:
+def load_dataset(spec: DatasetSpec, *, require_dino: bool = False) -> LoadedDataset:
     dataset_root = Path(spec.dataset_root)
     if not dataset_root.exists():
         raise FileNotFoundError(f'Dataset not found: {dataset_root}')
@@ -1093,13 +1168,16 @@ def load_dataset(spec: DatasetSpec) -> LoadedDataset:
     meta = meta.iloc[keep_idx].reset_index(drop=True)
 
     clip_all = engine._load_embeddings_only(entries, method='clip')
-    dino_all = engine._load_embeddings_only(entries, method='dino')
     if clip_all is None:
         raise RuntimeError(f'CLIP embeddings not available for {dataset_root}')
-    if dino_all is None:
-        raise RuntimeError(f'DINO embeddings not available for {dataset_root}')
     x_clip = l2_normalize_rows(np.asarray(clip_all, dtype=np.float32)[keep_idx])
-    x_dino = l2_normalize_rows(np.asarray(dino_all, dtype=np.float32)[keep_idx])
+    if require_dino:
+        dino_all = engine._load_embeddings_only(entries, method='dino')
+        if dino_all is None:
+            raise RuntimeError(f'DINO embeddings not available for {dataset_root}')
+        x_dino = l2_normalize_rows(np.asarray(dino_all, dtype=np.float32)[keep_idx])
+    else:
+        x_dino = np.zeros((len(keep_idx), 0), dtype=np.float32)
     fused_default = build_fused_features(x_clip, x_dino, AXIS_BAYES_CLIP_WEIGHT, AXIS_BAYES_DINO_WEIGHT, AXIS_BAYES_FEATURE_SPACE)
     id_to_index = {image_id: idx for idx, image_id in enumerate(ids)}
     return LoadedDataset(
@@ -1210,6 +1288,18 @@ def _normalize_reference(values: np.ndarray) -> np.ndarray:
     return ((arr - lo) / span).astype(np.float32)
 
 
+def concept_display_value(spec: ConceptSpec, value: str) -> str:
+    raw_value = str(value or '').strip()
+    if not raw_value:
+        return ''
+    alias_map = {
+        str(raw_key).strip().lower(): str(display_value).strip()
+        for raw_key, display_value in tuple(spec.value_aliases or ())
+        if str(raw_key).strip() and str(display_value).strip()
+    }
+    return alias_map.get(raw_value.lower(), raw_value)
+
+
 def build_metadata_one_vs_rest_tasks(dataset: LoadedDataset, spec: ConceptSpec) -> List[EvaluationTask]:
     meta = dataset.metadata.copy()
     field_col = resolve_field_column(meta, spec.field)
@@ -1224,13 +1314,14 @@ def build_metadata_one_vs_rest_tasks(dataset: LoadedDataset, spec: ConceptSpec) 
     keep_mask = valid.to_numpy(dtype=bool)
     for value in kept_values:
         mask = values.isin([value]).to_numpy(dtype=bool)
+        display_value = concept_display_value(spec, value)
         ids = [dataset.ids[idx] for idx, flag in enumerate(keep_mask) if bool(flag)]
         paths = [dataset.paths[idx] for idx, flag in enumerate(keep_mask) if bool(flag)]
         x_clip = dataset.X_clip[keep_mask]
         x_dino = dataset.X_dino[keep_mask]
         fused = dataset.fused_default[keep_mask]
         ref = mask[keep_mask].astype(np.float32)
-        query, pos, neg = _task_query_and_prompts(spec.name, spec.query_prefix or spec.field, value)
+        query, pos, neg = _task_query_and_prompts(spec.name, spec.query_prefix or spec.field, display_value)
         task_id = f'{slugify(dataset.name)}__{slugify(spec.field)}__{slugify(value)}'
         tasks.append(
             EvaluationTask(
@@ -1239,7 +1330,7 @@ def build_metadata_one_vs_rest_tasks(dataset: LoadedDataset, spec: ConceptSpec) 
                 dataset_root=dataset.dataset_root,
                 collection_id=task_id,
                 concept_kind=spec.kind,
-                concept_name=capitalize_first(humanize_label(value)),
+                concept_name=capitalize_first(humanize_label(display_value)),
                 metadata_field=str(spec.field),
                 metadata_value=str(value),
                 query=query,
@@ -1253,7 +1344,7 @@ def build_metadata_one_vs_rest_tasks(dataset: LoadedDataset, spec: ConceptSpec) 
                 fused_default=np.asarray(fused, dtype=np.float32),
                 reference_scores01=np.asarray(ref, dtype=np.float32),
                 undefined_mask=np.zeros((len(ids),), dtype=bool),
-                reference_meta={'field': spec.field, 'value': value},
+                reference_meta={'field': spec.field, 'value': value, 'display_value': display_value},
             ),
         )
     return tasks
@@ -1488,7 +1579,7 @@ def task_is_active(task: EvaluationTask) -> bool:
 # Engine subclass for preloaded tasks
 # =============================
 class PreloadedAxisBayesEngine(AxisBayesEngine):
-    _prompt_embed_cache: Dict[Tuple[str, str], Tuple[np.ndarray, List[str], List[str], Dict[str, str]]] = {}
+    _prompt_embed_cache: Dict[Tuple[str, str, str, str, bool], Tuple[np.ndarray, List[str], List[str], Dict[str, str]]] = {}
 
     def __init__(
         self,
@@ -1499,20 +1590,29 @@ class PreloadedAxisBayesEngine(AxisBayesEngine):
         super().__init__(**kwargs)
         self._tasks_by_collection = dict(tasks_by_collection)
         self._prompt_overrides = {
-            str(key).strip(): (list(value[0]), list(value[1]))
+            str(key).strip().lower(): (list(value[0]), list(value[1]))
             for key, value in prompt_overrides.items()
         }
 
-    def build_prompt_ensemble(self, q: str) -> tuple[List[str], List[str], Dict[str, str]]:
-        query = ' '.join(str(q or '').strip().split())
-        if query in self._prompt_overrides:
-            pos, neg = self._prompt_overrides[query]
+    def build_prompt_ensemble(self, q: str, *, dataset_name: str = '') -> tuple[List[str], List[str], Dict[str, str]]:
+        query = normalize_query_text(q)
+        override = self._prompt_overrides.get(prompt_override_key(dataset_name, query))
+        if override is None:
+            override = self._prompt_overrides.get(query.lower())
+        if override is not None:
+            pos, neg = override
             return list(pos), list(neg), {'source': 'eval_override', 'provider': 'fixed_template'}
-        return super().build_prompt_ensemble(query)
+        return super().build_prompt_ensemble(query, dataset_name=dataset_name)
 
-    def _embed_prompt_ensemble(self, q: str) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
+    def _embed_prompt_ensemble(
+        self,
+        q: str,
+        semantic_method: str,
+        norm: Optional[bool] = None,
+        dataset_name: str = '',
+    ) -> tuple[np.ndarray, List[str], List[str], Dict[str, str]]:
         query = ' '.join(str(q or '').strip().split())
-        cache_key = (self.axis_bounds_text_source, query)
+        cache_key = (self.axis_bounds_text_source, dataset_name, query, semantic_method, bool(self.norm if norm is None else norm))
         cached = self._prompt_embed_cache.get(cache_key)
         if cached is not None:
             return (
@@ -1521,7 +1621,12 @@ class PreloadedAxisBayesEngine(AxisBayesEngine):
                 list(cached[2]),
                 dict(cached[3]),
             )
-        result = super()._embed_prompt_ensemble(query)
+        result = super()._embed_prompt_ensemble(
+            query,
+            semantic_method=semantic_method,
+            norm=norm,
+            dataset_name=dataset_name,
+        )
         self._prompt_embed_cache[cache_key] = (
             np.asarray(result[0], dtype=np.float32).copy(),
             list(result[1]),
@@ -1554,13 +1659,17 @@ class PreloadedAxisBayesEngine(AxisBayesEngine):
         else:
             x = l2_normalize_rows(x_clip)
             dino_dim = 0
+        embedding_norms = np.linalg.norm(np.asarray(x, dtype=np.float32), axis=1).astype(np.float32)
         cached = CollectionCache(
             dataset_root=str(task.dataset_root.resolve()),
             collection_id=key,
             ids=list(task.ids),
             embeddings=np.asarray(x, dtype=np.float32),
+            embedding_norms=embedding_norms,
             id_to_index=dict(task.id_to_index),
             feature_space=self.feature_space,
+            semantic_method='clip',
+            norm=True,
             clip_dim=clip_dim,
             dino_dim=dino_dim,
             clip_scale=float(self.clip_scale),
@@ -1613,9 +1722,23 @@ class ClipTextSession(BaseMethodSession):
         super().__init__(spec, task, rng)
         engine = context.get_text_engine()
         if bool(spec.params.get('use_ensemble')):
-            w0, _, _, _ = engine._embed_prompt_lists(task.pos_prompts, task.neg_prompts, source='eval', provider='template')
+            w0, _, _, _ = engine._embed_prompt_lists(
+                task.pos_prompts,
+                task.neg_prompts,
+                semantic_method='clip',
+                norm=True,
+                source='eval_override',
+                provider='precomputed_prompts',
+            )
         else:
-            w0, _, _, _ = engine._embed_prompt_lists(task.pos_prompts[:1], task.neg_prompts[:1], source='eval', provider='template')
+            w0, _, _, _ = engine._embed_prompt_lists(
+                task.pos_prompts[:1],
+                task.neg_prompts[:1],
+                semantic_method='clip',
+                norm=True,
+                source='eval_override',
+                provider='precomputed_prompts',
+            )
         self._scores = (np.asarray(task.X_clip, dtype=np.float32) @ np.asarray(w0, dtype=np.float32)).astype(np.float32)
 
     def current_scores(self) -> np.ndarray:
@@ -1728,7 +1851,10 @@ class EvaluationContext:
     def __init__(self, tasks: Sequence[EvaluationTask]):
         self.tasks = list(tasks)
         self.tasks_by_collection = {task.collection_id: task for task in self.tasks}
-        self.prompt_overrides = {task.query: (list(task.pos_prompts), list(task.neg_prompts)) for task in self.tasks}
+        self.prompt_overrides = {
+            prompt_override_key(task.dataset_root.name, task.query): (list(task.pos_prompts), list(task.neg_prompts))
+            for task in self.tasks
+        }
         self._engine_cache: Dict[str, PreloadedAxisBayesEngine] = {}
         self._text_engine: Optional[PreloadedAxisBayesEngine] = None
 
@@ -1740,6 +1866,8 @@ class EvaluationContext:
                 model_type='bayes_linear',
                 mode='gaussian',
                 feature_space='clip',
+                semantic_method='clip',
+                norm=True,
                 clip_weight=1.0,
                 dino_weight=0.0,
                 axis_bounds_text_source='template',
@@ -1770,6 +1898,8 @@ class EvaluationContext:
             model_type=spec.model_type or AXIS_MODEL_TYPE,
             mode=spec.mode or AXIS_BAYES_MODE,
             feature_space=spec.feature_space,
+            semantic_method='clip',
+            norm=True,
             clip_weight=float(spec.clip_weight),
             dino_weight=float(spec.dino_weight),
             alpha=float(params.get('alpha', AXIS_BAYES_ALPHA)),
@@ -2330,7 +2460,37 @@ def active_method_specs(names: Sequence[str], registry: Mapping[str, MethodSpec]
     return specs
 
 
-def load_active_tasks() -> List[EvaluationTask]:
+def apply_prompt_cache_to_tasks(tasks: Sequence[EvaluationTask], prompt_records: Mapping[str, Mapping[str, Any]]) -> int:
+    applied = 0
+    for task in tasks:
+        record = prompt_records.get(task.task_id)
+        if record is None:
+            continue
+        expected_dataset = normalize_dataset_name(task.dataset_root.name)
+        cached_dataset = normalize_dataset_name(str(record.get('dataset_name') or ''))
+        if cached_dataset and cached_dataset.lower() != expected_dataset.lower():
+            raise RuntimeError(
+                f'Prompt cache dataset mismatch for task_id={task.task_id}: '
+                f'cached={cached_dataset!r} expected={expected_dataset!r}'
+            )
+        expected_query = normalize_query_text(task.query)
+        cached_query = normalize_query_text(str(record.get('query') or ''))
+        if cached_query and cached_query.lower() != expected_query.lower():
+            raise RuntimeError(
+                f'Prompt cache query mismatch for task_id={task.task_id}: '
+                f'cached={cached_query!r} expected={expected_query!r}'
+            )
+        pos_prompts = [str(value).strip() for value in list(record.get('pos_prompts') or []) if str(value).strip()]
+        neg_prompts = [str(value).strip() for value in list(record.get('neg_prompts') or []) if str(value).strip()]
+        if len(pos_prompts) == 0 or len(neg_prompts) == 0:
+            raise RuntimeError(f'Prompt cache record for task_id={task.task_id} is missing positive or negative prompts')
+        task.pos_prompts = pos_prompts
+        task.neg_prompts = neg_prompts
+        applied += 1
+    return applied
+
+
+def load_active_tasks(*, require_dino: bool = False) -> List[EvaluationTask]:
     tasks: List[EvaluationTask] = []
     for dataset_name in ACTIVE_DATASETS:
         if dataset_name not in DATASET_REGISTRY:
@@ -2339,7 +2499,7 @@ def load_active_tasks() -> List[EvaluationTask]:
         if not spec.enabled:
             continue
         print(f'[modeling-eval] loading dataset={dataset_name} root={spec.dataset_root}')
-        loaded = load_dataset(spec)
+        loaded = load_dataset(spec, require_dino=require_dino)
         dataset_tasks = build_tasks_for_dataset(loaded, spec)
         dataset_tasks = [task for task in dataset_tasks if task_is_active(task)]
         print(f'[modeling-eval] dataset={dataset_name} tasks={len(dataset_tasks)} images={len(loaded.ids)}')
@@ -2347,99 +2507,79 @@ def load_active_tasks() -> List[EvaluationTask]:
     return tasks
 
 
-def build_loggers() -> Dict[str, CSVAppender]:
+TABLE_FIELDNAMES: Dict[str, List[str]] = {
+    'runs': [
+        'ts_utc', 'run_id', 'run_name', 'note', 'active_datasets_json', 'active_methods_json',
+        'method_specs_json', 'active_ablations_json', 'ablation_specs_json', 'budgets_json',
+        'main_policy', 'query_policies_json', 'representative_task_ids_json',
+        'representative_images_per_task',
+    ],
+    'tasks': [
+        'ts_utc', 'run_id', 'dataset', 'task_id', 'concept_name', 'concept_kind', 'metadata_field',
+        'metadata_value', 'query', 'image_count', 'undefined_count', 'pos_prompts_json',
+        'neg_prompts_json', 'reference_meta_json',
+    ],
+    'prior': [
+        'ts_utc', 'run_id', 'dataset', 'task_id', 'concept_name', 'method', 'spearman',
+        'kendall_tau', 'pairwise_acc', 'topk_extreme_precision', 'auroc_binary',
+        'image_count', 'undefined_count', 'status',
+    ],
+    'refinement': [
+        'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
+        'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
+        'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
+        'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
+        'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
+        'topk_extreme_precision_defined', 'auroc_binary_defined',
+    ],
+    'uncertainty': [
+        'ts_utc', 'run_id', 'row_type', 'dataset', 'task_id', 'concept_name', 'method', 'variant',
+        'interaction_count', 'coverage', 'corr_uncert_abs_error', 'auroc_future_correction',
+        'spearman', 'kendall_tau', 'pairwise_acc', 'topk_extreme_precision', 'auroc_binary',
+    ],
+    'query_policy': [
+        'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
+        'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
+        'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
+        'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
+        'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
+        'topk_extreme_precision_defined', 'auroc_binary_defined',
+    ],
+    'undefined': [
+        'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
+        'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
+        'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
+        'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
+        'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
+        'topk_extreme_precision_defined', 'auroc_binary_defined',
+    ],
+    'ablation': [
+        'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
+        'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
+        'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
+        'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
+        'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
+        'topk_extreme_precision_defined', 'auroc_binary_defined',
+    ],
+    'representative_rankings': [
+        'ts_utc', 'run_id', 'variant', 'dataset', 'task_id', 'concept_name', 'method', 'policy',
+        'interaction_count', 'example_slot', 'image_id', 'image_path', 'reference_score',
+        'reference_rank_global', 'reference_rank_sample', 'pred_score', 'pred_rank_global',
+        'pred_rank_sample', 'is_undefined',
+    ],
+}
+
+
+def build_loggers(output_dir: Path = OUTPUT_DIR) -> Dict[str, CSVAppender]:
+    root = Path(output_dir)
     return {
-        'runs': CSVAppender(
-            OUTPUT_DIR / 'runs.csv',
-            [
-                'ts_utc', 'run_id', 'run_name', 'note', 'active_datasets_json', 'active_methods_json',
-                'method_specs_json', 'active_ablations_json', 'ablation_specs_json', 'budgets_json',
-                'main_policy', 'query_policies_json', 'representative_task_ids_json',
-                'representative_images_per_task',
-            ],
-        ),
-        'tasks': CSVAppender(
-            OUTPUT_DIR / 'tasks.csv',
-            [
-                'ts_utc', 'run_id', 'dataset', 'task_id', 'concept_name', 'concept_kind', 'metadata_field',
-                'metadata_value', 'query', 'image_count', 'undefined_count', 'pos_prompts_json',
-                'neg_prompts_json', 'reference_meta_json',
-            ],
-        ),
-        'prior': CSVAppender(
-            OUTPUT_DIR / 'prior.csv',
-            [
-                'ts_utc', 'run_id', 'dataset', 'task_id', 'concept_name', 'method', 'spearman',
-                'kendall_tau', 'pairwise_acc', 'topk_extreme_precision', 'auroc_binary',
-                'image_count', 'undefined_count', 'status',
-            ],
-        ),
-        'refinement': CSVAppender(
-            OUTPUT_DIR / 'refinement.csv',
-            [
-                'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
-                'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
-                'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
-                'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
-                'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
-                'topk_extreme_precision_defined', 'auroc_binary_defined',
-            ],
-        ),
-        'uncertainty': CSVAppender(
-            OUTPUT_DIR / 'uncertainty.csv',
-            [
-                'ts_utc', 'run_id', 'row_type', 'dataset', 'task_id', 'concept_name', 'method', 'variant',
-                'interaction_count', 'coverage', 'corr_uncert_abs_error', 'auroc_future_correction',
-                'spearman', 'kendall_tau', 'pairwise_acc', 'topk_extreme_precision', 'auroc_binary',
-            ],
-        ),
-        'query_policy': CSVAppender(
-            OUTPUT_DIR / 'query_policy.csv',
-            [
-                'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
-                'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
-                'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
-                'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
-                'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
-                'topk_extreme_precision_defined', 'auroc_binary_defined',
-            ],
-        ),
-        'undefined': CSVAppender(
-            OUTPUT_DIR / 'undefined.csv',
-            [
-                'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
-                'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
-                'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
-                'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
-                'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
-                'topk_extreme_precision_defined', 'auroc_binary_defined',
-            ],
-        ),
-        'ablation': CSVAppender(
-            OUTPUT_DIR / 'ablation.csv',
-            [
-                'ts_utc', 'run_id', 'row_type', 'variant', 'dataset', 'task_id', 'concept_name', 'method',
-                'policy', 'allow_undefined', 'interaction_count', 'query_image_id', 'feedback_type',
-                'numeric_label_count', 'undefined_feedback_count', 'spearman_all', 'kendall_tau_all',
-                'pairwise_acc_all', 'topk_extreme_precision_all', 'auroc_binary_all',
-                'spearman_defined', 'kendall_tau_defined', 'pairwise_acc_defined',
-                'topk_extreme_precision_defined', 'auroc_binary_defined',
-            ],
-        ),
-        'representative_rankings': CSVAppender(
-            OUTPUT_DIR / 'representative_rankings.csv',
-            [
-                'ts_utc', 'run_id', 'variant', 'dataset', 'task_id', 'concept_name', 'method', 'policy',
-                'interaction_count', 'example_slot', 'image_id', 'image_path', 'reference_score',
-                'reference_rank_global', 'reference_rank_sample', 'pred_score', 'pred_rank_global',
-                'pred_rank_sample', 'is_undefined',
-            ],
-        ),
+        name: CSVAppender(root / f'{name}.csv', fieldnames)
+        for name, fieldnames in TABLE_FIELDNAMES.items()
     }
 
 
-def _load_run_frame(csv_name: str, run_id: str) -> pd.DataFrame:
-    path = OUTPUT_DIR / f'{csv_name}.csv'
+def _load_run_frame(csv_name: str, run_id: str, *, output_dir: Path = OUTPUT_DIR) -> pd.DataFrame:
+    path = Path(output_dir) / f'{csv_name}.csv'
     if not path.exists():
         return pd.DataFrame()
     df = pd.read_csv(path)
@@ -2448,8 +2588,8 @@ def _load_run_frame(csv_name: str, run_id: str) -> pd.DataFrame:
     return df
 
 
-def latest_modeling_run_id() -> str:
-    runs_path = OUTPUT_DIR / 'runs.csv'
+def latest_modeling_run_id(output_dir: Path = OUTPUT_DIR) -> str:
+    runs_path = Path(output_dir) / 'runs.csv'
     if not runs_path.exists():
         raise FileNotFoundError(f'No runs.csv found at {runs_path}')
     runs = pd.read_csv(runs_path)
@@ -2459,26 +2599,28 @@ def latest_modeling_run_id() -> str:
     return str(runs.iloc[-1]['run_id'])
 
 
-def export_modeling_eval_figures(run_id: str) -> Path:
+def export_modeling_eval_figures(run_id: str, *, output_dir: Path = OUTPUT_DIR) -> Path:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    figure_dir = OUTPUT_DIR / 'figures' / str(run_id)
+    root = Path(output_dir)
+    figure_dir = root / 'figures' / str(run_id)
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    prior = _load_run_frame('prior', run_id)
-    refinement = _load_run_frame('refinement', run_id)
-    query_policy = _load_run_frame('query_policy', run_id)
-    uncertainty = _load_run_frame('uncertainty', run_id)
-    undefined = _load_run_frame('undefined', run_id)
-    ablation = _load_run_frame('ablation', run_id)
-    representative = _load_run_frame('representative_rankings', run_id)
-    tasks = _load_run_frame('tasks', run_id)
+    prior = _load_run_frame('prior', run_id, output_dir=root)
+    refinement = _load_run_frame('refinement', run_id, output_dir=root)
+    query_policy = _load_run_frame('query_policy', run_id, output_dir=root)
+    uncertainty = _load_run_frame('uncertainty', run_id, output_dir=root)
+    undefined = _load_run_frame('undefined', run_id, output_dir=root)
+    ablation = _load_run_frame('ablation', run_id, output_dir=root)
+    representative = _load_run_frame('representative_rankings', run_id, output_dir=root)
+    tasks = _load_run_frame('tasks', run_id, output_dir=root)
 
     def _save(fig: Any, name: str) -> None:
         fig.tight_layout()
         fig.savefig(figure_dir / f'{name}.png', dpi=180, bbox_inches='tight')
+        fig.savefig(figure_dir / f'{name}.pdf', bbox_inches='tight')
         plt.close(fig)
 
     def _save_contact_sheet(df: pd.DataFrame, name: str) -> None:
@@ -2508,6 +2650,67 @@ def export_modeling_eval_figures(run_id: str) -> Path:
             caption = f"{int(item['example_slot'])}: {float(item['reference_score']):.2f}"
             draw.text((x0 + 4, y0 + cell_h + 4), caption, fill=(20, 20, 20))
         canvas.save(figure_dir / f'{name}.png')
+        canvas.save(figure_dir / f'{name}.pdf', 'PDF', resolution=180.0)
+
+    def _plot_dataset_curves(frame: pd.DataFrame, metric_col: str, *, title: str, ylabel: str, file_name: str) -> None:
+        metric_frame = frame.dropna(subset=[metric_col]).copy()
+        if metric_frame.empty:
+            return
+        datasets = sorted(metric_frame['dataset'].dropna().astype(str).unique().tolist())
+        if not datasets:
+            return
+        n_cols = min(2, len(datasets))
+        n_rows = int(math.ceil(len(datasets) / max(1, n_cols)))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4.2 * n_rows), squeeze=False)
+        for ax in axes.flat:
+            ax.set_visible(False)
+        for idx, dataset_name in enumerate(datasets):
+            ax = axes[idx // n_cols][idx % n_cols]
+            ax.set_visible(True)
+            sub = metric_frame[metric_frame['dataset'].astype(str) == dataset_name]
+            curve = (
+                sub.groupby(['method', 'interaction_count'], dropna=False)[metric_col]
+                .mean()
+                .reset_index()
+            )
+            for method, grp in curve.groupby('method', dropna=False):
+                grp = grp.sort_values('interaction_count')
+                ax.plot(grp['interaction_count'], grp[metric_col], marker='o', label=str(method))
+            ax.set_title(str(dataset_name))
+            ax.set_xlabel('Interaction count')
+            ax.set_ylabel(ylabel)
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc='upper center', ncol=min(4, len(labels)), fontsize=8)
+        _save(fig, file_name)
+
+    def _plot_grouped_dataset_bars(frame: pd.DataFrame, metric_cols: Sequence[Tuple[str, str]], *, title_prefix: str, file_name: str) -> None:
+        available = [(metric, label) for metric, label in metric_cols if metric in frame.columns and frame[metric].notna().any()]
+        if frame.empty or not available:
+            return
+        n_cols = len(available)
+        fig, axes = plt.subplots(1, n_cols, figsize=(5.6 * n_cols, 4.8), squeeze=False)
+        axes_flat = axes[0]
+        for ax, (metric, label) in zip(axes_flat, available):
+            pivot = (
+                frame.dropna(subset=[metric])
+                .groupby(['dataset', 'method'], dropna=False)[metric]
+                .mean()
+                .unstack('method')
+                .sort_index()
+            )
+            if pivot.empty:
+                ax.set_visible(False)
+                continue
+            pivot.plot(kind='bar', ax=ax)
+            ax.set_title(f'{title_prefix}: {label}')
+            ax.set_xlabel('Dataset')
+            ax.set_ylabel(label)
+            ax.tick_params(axis='x', rotation=0)
+            ax.legend(title='Method', fontsize=8, title_fontsize=9)
+        _save(fig, file_name)
+
+    breakdown_frames: List[pd.DataFrame] = []
 
     if not tasks.empty:
         task_summary = (
@@ -2563,6 +2766,36 @@ def export_modeling_eval_figures(run_id: str) -> Path:
                 ax.set_ylabel('Mean AUROC')
                 ax.tick_params(axis='x', rotation=35)
                 _save(fig, 'prior_mean_binary_auroc_by_method')
+
+                auc_dataset = (
+                    prior_auc.groupby(['dataset', 'method'], dropna=False)['auroc_binary']
+                    .mean()
+                    .unstack('method')
+                    .sort_index()
+                )
+                fig, ax = plt.subplots(figsize=(10, 4.8))
+                auc_dataset.plot(kind='bar', ax=ax)
+                ax.set_title('Prior Binary AUROC By Dataset')
+                ax.set_xlabel('Dataset')
+                ax.set_ylabel('Mean AUROC')
+                ax.tick_params(axis='x', rotation=0)
+                ax.legend(title='Method', fontsize=8, title_fontsize=9)
+                _save(fig, 'prior_binary_auroc_by_dataset')
+
+            for metric in ['spearman', 'kendall_tau', 'pairwise_acc', 'topk_extreme_precision', 'auroc_binary']:
+                metric_frame = prior_ok.dropna(subset=[metric]).copy()
+                if metric_frame.empty:
+                    continue
+                grouped = (
+                    metric_frame.groupby(['dataset', 'method'], dropna=False)[metric]
+                    .mean()
+                    .reset_index()
+                )
+                grouped['stage'] = 'prior'
+                grouped['metric'] = metric
+                grouped['interaction_count'] = np.nan
+                grouped['variant'] = 'prior'
+                breakdown_frames.append(grouped[['stage', 'variant', 'dataset', 'method', 'interaction_count', 'metric', metric]].rename(columns={metric: 'value'}))
 
     if not refinement.empty:
         steps = refinement[
@@ -2626,38 +2859,96 @@ def export_modeling_eval_figures(run_id: str) -> Path:
                 ax.set_ylabel('Mean AUROC')
                 ax.legend(fontsize=8, ncol=2)
                 _save(fig, 'refinement_binary_auroc_curves')
+            _plot_dataset_curves(
+                steps,
+                'metric',
+                title='Refinement Learning Curves By Dataset',
+                ylabel='Mean Spearman',
+                file_name='refinement_learning_curves_by_dataset',
+            )
+            _plot_dataset_curves(
+                steps,
+                'pairwise_metric',
+                title='Refinement Pairwise Accuracy Curves By Dataset',
+                ylabel='Mean pairwise accuracy',
+                file_name='refinement_pairwise_accuracy_curves_by_dataset',
+            )
+            _plot_dataset_curves(
+                steps,
+                'auroc_metric',
+                title='Refinement Binary AUROC Curves By Dataset',
+                ylabel='Mean AUROC',
+                file_name='refinement_binary_auroc_curves_by_dataset',
+            )
 
-            datasets = sorted(steps['dataset'].dropna().astype(str).unique().tolist())
-            if datasets:
-                n_cols = min(2, len(datasets))
-                n_rows = int(math.ceil(len(datasets) / max(1, n_cols)))
-                fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4.2 * n_rows), squeeze=False)
-                for ax in axes.flat:
-                    ax.set_visible(False)
-                for idx, dataset_name in enumerate(datasets):
-                    ax = axes[idx // n_cols][idx % n_cols]
-                    ax.set_visible(True)
-                    sub = steps[steps['dataset'].astype(str) == dataset_name]
-                    curve = (
-                        sub.groupby(['method', 'interaction_count'], dropna=False)['metric']
+            final_budget = int(pd.to_numeric(steps['interaction_count'], errors='coerce').max())
+            final_steps = steps[steps['interaction_count'] == final_budget].copy()
+            _plot_grouped_dataset_bars(
+                final_steps,
+                [
+                    ('metric', 'Mean Spearman'),
+                    ('pairwise_metric', 'Mean pairwise accuracy'),
+                    ('auroc_metric', 'Mean AUROC'),
+                ],
+                title_prefix=f'Final Budget {final_budget} By Dataset',
+                file_name='refinement_final_metrics_by_dataset',
+            )
+
+            for metric in ['metric', 'pairwise_metric', 'auroc_metric']:
+                metric_frame = final_steps.dropna(subset=[metric]).copy()
+                if metric_frame.empty:
+                    continue
+                grouped = (
+                    metric_frame.groupby(['dataset', 'method'], dropna=False)[metric]
+                    .mean()
+                    .reset_index()
+                )
+                grouped['stage'] = 'refinement_final'
+                grouped['variant'] = 'main'
+                grouped['interaction_count'] = float(final_budget)
+                grouped['metric_name'] = metric
+                breakdown_frames.append(
+                    grouped[['stage', 'variant', 'dataset', 'method', 'interaction_count', 'metric_name', metric]]
+                    .rename(columns={metric: 'value'})
+                )
+
+            summaries = refinement[
+                (refinement['row_type'].astype(str) == 'summary')
+                & (refinement['variant'].astype(str) == 'main')
+            ].copy()
+            for col in ['spearman_all', 'spearman_defined', 'pairwise_acc_all', 'pairwise_acc_defined', 'auroc_binary_all', 'auroc_binary_defined']:
+                summaries[col] = pd.to_numeric(summaries[col], errors='coerce')
+            if not summaries.empty:
+                summaries['metric'] = np.where(summaries['spearman_defined'].notna(), summaries['spearman_defined'], summaries['spearman_all'])
+                summaries['pairwise_metric'] = np.where(summaries['pairwise_acc_defined'].notna(), summaries['pairwise_acc_defined'], summaries['pairwise_acc_all'])
+                summaries['auroc_metric'] = np.where(summaries['auroc_binary_defined'].notna(), summaries['auroc_binary_defined'], summaries['auroc_binary_all'])
+                for metric in ['metric', 'pairwise_metric', 'auroc_metric']:
+                    metric_frame = summaries.dropna(subset=[metric]).copy()
+                    if metric_frame.empty:
+                        continue
+                    grouped = (
+                        metric_frame.groupby(['dataset', 'method'], dropna=False)[metric]
                         .mean()
                         .reset_index()
                     )
-                    for method, grp in curve.groupby('method', dropna=False):
-                        grp = grp.sort_values('interaction_count')
-                        ax.plot(grp['interaction_count'], grp['metric'], marker='o', label=str(method))
-                    ax.set_title(str(dataset_name))
-                    ax.set_xlabel('Interaction count')
-                    ax.set_ylabel('Mean Spearman')
-                handles, labels = axes[0][0].get_legend_handles_labels()
-                if handles:
-                    fig.legend(handles, labels, loc='upper center', ncol=min(4, len(labels)), fontsize=8)
-                _save(fig, 'refinement_learning_curves_by_dataset')
+                    grouped['stage'] = 'refinement_aulc'
+                    grouped['variant'] = 'main'
+                    grouped['interaction_count'] = np.nan
+                    grouped['metric_name'] = metric
+                    breakdown_frames.append(
+                        grouped[['stage', 'variant', 'dataset', 'method', 'interaction_count', 'metric_name', metric]]
+                        .rename(columns={metric: 'value'})
+                    )
 
     if not query_policy.empty:
         query_summary = query_policy[query_policy['row_type'].astype(str) == 'summary'].copy()
         query_steps = query_policy[query_policy['row_type'].astype(str) == 'step'].copy()
         for col in ['spearman_all', 'spearman_defined', 'interaction_count']:
+            if col in query_summary.columns:
+                query_summary[col] = pd.to_numeric(query_summary[col], errors='coerce')
+            if col in query_steps.columns:
+                query_steps[col] = pd.to_numeric(query_steps[col], errors='coerce')
+        for col in ['auroc_binary_all', 'auroc_binary_defined']:
             if col in query_summary.columns:
                 query_summary[col] = pd.to_numeric(query_summary[col], errors='coerce')
             if col in query_steps.columns:
@@ -2697,6 +2988,40 @@ def export_modeling_eval_figures(run_id: str) -> Path:
             ax.set_yticklabels(list(heat.index))
             fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
             _save(fig, 'query_policy_final_budget_heatmap')
+
+            bayes_policy_steps = query_steps[
+                (query_steps['method'].astype(str) == 'request_bayes_linear_gaussian')
+                & (query_steps['policy'].astype(str).isin(['random', 'uncertainty', 'diversity']))
+            ].copy()
+            bayes_policy_steps = bayes_policy_steps.dropna(subset=['auroc_binary_all'])
+            if not bayes_policy_steps.empty:
+                auroc_curves = (
+                    bayes_policy_steps.groupby(['policy', 'interaction_count'], dropna=False)['auroc_binary_all']
+                    .agg(mean_auroc='mean', std_auroc='std', sample_count='count')
+                    .reset_index()
+                )
+                auroc_curves['std_auroc'] = pd.to_numeric(auroc_curves['std_auroc'], errors='coerce').fillna(0.0)
+                auroc_curves['sample_count'] = pd.to_numeric(auroc_curves['sample_count'], errors='coerce').fillna(0.0)
+                auroc_curves['sem_auroc'] = auroc_curves['std_auroc'] / np.sqrt(np.clip(auroc_curves['sample_count'].to_numpy(dtype=float), 1.0, None))
+                policy_colors = {
+                    'random': '#64748b',
+                    'uncertainty': '#dc2626',
+                    'diversity': '#059669',
+                }
+                fig, ax = plt.subplots(figsize=(8.6, 4.8))
+                for policy_name, grp in auroc_curves.groupby('policy', dropna=False):
+                    grp = grp.sort_values('interaction_count')
+                    color = policy_colors.get(str(policy_name), None)
+                    xs = grp['interaction_count'].to_numpy(dtype=float)
+                    mean_vals = grp['mean_auroc'].to_numpy(dtype=float)
+                    sem_vals = grp['sem_auroc'].to_numpy(dtype=float)
+                    ax.plot(xs, mean_vals, marker='o', label=str(policy_name), color=color)
+                    ax.fill_between(xs, mean_vals - sem_vals, mean_vals + sem_vals, alpha=0.18, color=color)
+                ax.set_title('Bayes Linear AUROC By Query Policy')
+                ax.set_xlabel('Interaction count')
+                ax.set_ylabel('Mean AUROC')
+                ax.legend(title='Policy', fontsize=8, title_fontsize=9)
+                _save(fig, 'query_policy_bayes_linear_auroc_curves')
 
     if not uncertainty.empty:
         err = uncertainty[uncertainty['row_type'].astype(str) == 'error_prediction'].copy()
@@ -2879,8 +3204,17 @@ def export_modeling_eval_figures(run_id: str) -> Path:
         'run_id': str(run_id),
         'generated_at_utc': utc_now_iso(),
         'figure_dir': str(figure_dir),
-        'files': sorted(path.name for path in figure_dir.glob('*.png')),
+        'files': sorted(
+            path.name
+            for path in figure_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in {'.png', '.pdf'}
+        ),
     }
+    if breakdown_frames:
+        breakdown = pd.concat(breakdown_frames, ignore_index=True)
+        metric_col = 'metric_name' if 'metric_name' in breakdown.columns else 'metric'
+        breakdown = breakdown.sort_values(['stage', metric_col, 'dataset', 'method'], kind='mergesort')
+        breakdown.to_csv(figure_dir / 'dataset_metric_breakdown.csv', index=False)
     (figure_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return figure_dir
 
@@ -2893,9 +3227,35 @@ def main() -> None:
 
     active_methods = active_method_specs(ACTIVE_METHODS, METHOD_REGISTRY)
     ablation_methods = active_method_specs(ACTIVE_ABLATIONS, ABLATION_REGISTRY)
-    tasks = load_active_tasks()
+    methods_in_run = list(active_methods)
+    if RUN_ABLATIONS:
+        methods_in_run.extend(ablation_methods)
+    dino_methods = [spec.name for spec in methods_in_run if method_uses_dino(spec)]
+    if dino_methods:
+        raise RuntimeError(
+            'Modeling evaluation is configured to run in CLIP space only, '
+            f'but these active methods still require DINO: {sorted(dino_methods)}'
+        )
+
+    tasks = load_active_tasks(require_dino=False)
     if len(tasks) == 0:
         raise RuntimeError('No evaluation tasks were built from the active dataset configuration')
+    prompt_records = hydrate_prompt_cache(
+        tasks,
+        cache_path=CONTRASTIVE_PROMPT_CACHE_PATH,
+        source=CONTRASTIVE_PROMPT_SOURCE,
+        n_prompts=CONTRASTIVE_PROMPT_COUNT,
+        regenerate=CONTRASTIVE_PROMPT_REGENERATE,
+        max_retries=CONTRASTIVE_PROMPT_MAX_RETRIES,
+        retry_wait_sec=CONTRASTIVE_PROMPT_RETRY_WAIT_SEC,
+        logger=print,
+    )
+    applied_prompt_count = apply_prompt_cache_to_tasks(tasks, prompt_records)
+    print(
+        '[modeling-eval] prompt cache ready '
+        f'tasks={applied_prompt_count}/{len(tasks)} source={CONTRASTIVE_PROMPT_SOURCE} '
+        f'path={CONTRASTIVE_PROMPT_CACHE_PATH}'
+    )
     representative_task_ids = select_representative_task_ids(tasks, REPRESENTATIVE_TASKS_PER_DATASET)
     representative_task_id_set = set(representative_task_ids)
 

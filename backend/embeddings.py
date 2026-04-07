@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from functools import lru_cache
 from inspect import signature
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from threading import Lock
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -31,6 +31,13 @@ def normalize_multimodal_method(method: str) -> str:
     if method_l in SIGLIP2_METHOD_ALIASES:
         return 'siglip2'
     return method_l
+
+
+def embedding_cache_filename(method: str, normalize: bool = True) -> str:
+    cache_method = normalize_multimodal_method(method)
+    if cache_method in {'clip', 'siglip2'} and not bool(normalize):
+        return f'embeddings_{cache_method}_raw.npz'
+    return f'embeddings_{cache_method}.npz'
 
 def split_emb(emb, n_parts=4):
     """Split embeddings into n_parts parts."""
@@ -62,6 +69,7 @@ class CLIPEmbeddingExtractor:
             from transformers.models.clip.tokenization_clip import CLIPTokenizer
         self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_name = str(clip_model_name)
         self.model = CLIPModel.from_pretrained(
             clip_model_name,
             use_safetensors=True,
@@ -74,43 +82,53 @@ class CLIPEmbeddingExtractor:
             p.requires_grad = False
         self.available = True
 
-    def extract_image_embedding(self, image: Image.Image):
+    def extract_image_embedding(self, image: Image.Image, normalize: bool = True):
         if not self.available:
             raise RuntimeError("CLIPExtractor unavailable")
         torch = self.torch
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_image_features(**inputs)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
-    def extract_image_embeddings(self, images: Sequence[Image.Image]) -> np.ndarray:
+    def extract_image_embeddings(self, images: Sequence[Image.Image], normalize: bool = True) -> np.ndarray:
         if not self.available:
             raise RuntimeError("CLIPExtractor unavailable")
         torch = self.torch
         inputs = self.processor(images=list(images), return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_image_features(**inputs)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.detach().cpu().numpy().astype("float32")
 
-    def extract_text_embedding(self, text: str):
+    def extract_text_embedding(self, text: str, normalize: bool = True):
         if not self.available or self.tokenizer is None:
             raise RuntimeError("CLIPExtractor unavailable for text")
         torch = self.torch
         inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_text_features(**inputs)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
 
 class SigLIP2EmbeddingExtractor:
     def __init__(self, model_name: str = DEFAULT_SIGLIP2_MODEL_NAME):
         import torch
-        from transformers import AutoModel, AutoProcessor
+        try:
+            from transformers import AutoModel, AutoProcessor
+        except Exception:
+            # Some transformers builds resolve auto classes only from their direct
+            # submodules, and concurrent lazy loading can expose that path.
+            from transformers.models.auto.modeling_auto import AutoModel
+            from transformers.models.auto.processing_auto import AutoProcessor
         self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_name = str(model_name)
         self.model = AutoModel.from_pretrained(
             model_name,
             use_safetensors=True,
@@ -135,7 +153,7 @@ class SigLIP2EmbeddingExtractor:
             if key in allowed_keys
         }
 
-    def extract_image_embedding(self, image: Image.Image):
+    def extract_image_embedding(self, image: Image.Image, normalize: bool = True):
         if not self.available:
             raise RuntimeError("SigLIP2 extractor unavailable")
         torch = self.torch
@@ -143,10 +161,11 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._image_feature_args)
         with torch.no_grad():
             feats = self.model.get_image_features(**payload)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
-    def extract_image_embeddings(self, images: Sequence[Image.Image]) -> np.ndarray:
+    def extract_image_embeddings(self, images: Sequence[Image.Image], normalize: bool = True) -> np.ndarray:
         if not self.available:
             raise RuntimeError("SigLIP2 extractor unavailable")
         torch = self.torch
@@ -154,10 +173,11 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._image_feature_args)
         with torch.no_grad():
             feats = self.model.get_image_features(**payload)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.detach().cpu().numpy().astype("float32")
 
-    def extract_text_embedding(self, text: str):
+    def extract_text_embedding(self, text: str, normalize: bool = True):
         if not self.available:
             raise RuntimeError("SigLIP2 extractor unavailable for text")
         torch = self.torch
@@ -165,12 +185,15 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._text_feature_args)
         with torch.no_grad():
             feats = self.model.get_text_features(**payload)
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
 
+_MULTIMODAL_EXTRACTOR_CACHE: Dict[str, Any] = {}
+_MULTIMODAL_EXTRACTOR_CACHE_LOCK = Lock()
 
-@lru_cache(maxsize=4)
-def _build_multimodal_extractor_cached(normalized: str):
+
+def _build_multimodal_extractor_uncached(normalized: str):
     if normalized == 'clip':
         return CLIPEmbeddingExtractor()
     if normalized == 'siglip2':
@@ -180,7 +203,12 @@ def _build_multimodal_extractor_cached(normalized: str):
 
 def build_multimodal_extractor(method: str):
     normalized = normalize_multimodal_method(method)
-    return _build_multimodal_extractor_cached(normalized)
+    with _MULTIMODAL_EXTRACTOR_CACHE_LOCK:
+        if normalized in _MULTIMODAL_EXTRACTOR_CACHE:
+            return _MULTIMODAL_EXTRACTOR_CACHE[normalized]
+        extractor = _build_multimodal_extractor_uncached(normalized)
+        _MULTIMODAL_EXTRACTOR_CACHE[normalized] = extractor
+        return extractor
 
 
 class DINOEmbeddingExtractor:
@@ -206,7 +234,7 @@ class DINOEmbeddingExtractor:
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
 
-    def extract_image_embedding(self, image: Image.Image):
+    def extract_image_embedding(self, image: Image.Image, normalize: bool = True):
         if not self.available:
             raise RuntimeError("DINOExtractor unavailable")
         torch = self.torch
@@ -221,7 +249,8 @@ class DINOEmbeddingExtractor:
                 feats = out[0]
             else:
                 feats = out
-        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        if normalize:
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype('float32')
 
 
@@ -259,12 +288,13 @@ class EmbeddingEngine:
 
     def estimate_embeddings(self, images: Sequence[ImageEntry],
                             method: str = "color_rgb",
-                            resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
+                            resize: Tuple[int, int] = (32, 32),
+                            normalize: bool = True) -> np.ndarray:
         method_l = normalize_multimodal_method(method)
         if method_l in {"clip", "siglip2"}:
             extractor = build_multimodal_extractor(method_l)
             if getattr(extractor, 'available', False):
-                return self._extract_with_extractor(images, extractor, fallback_dim=512)
+                return self._extract_with_extractor(images, extractor, fallback_dim=512, normalize=normalize)
             method_l = "color_rgb"
         elif method_l in {"dino", "dino-vit"}:
             vecs = self._extract_with_local_dino(images)
@@ -404,7 +434,13 @@ class EmbeddingEngine:
         return np.vstack(vecs)
 
 
-    def _extract_with_extractor(self, images: Sequence[ImageEntry], extractor, fallback_dim: int) -> np.ndarray:
+    def _extract_with_extractor(
+        self,
+        images: Sequence[ImageEntry],
+        extractor,
+        fallback_dim: int,
+        normalize: bool = True,
+    ) -> np.ndarray:
         if hasattr(extractor, 'extract_image_embeddings'):
             batch_size = max(1, int(getattr(extractor, 'batch_size', 8) or 8))
             embs = []
@@ -414,13 +450,13 @@ class EmbeddingEngine:
                 for entry in batch_entries:
                     with Image.open(entry.path) as img:
                         batch_images.append(img.convert('RGB').copy())
-                embs.append(extractor.extract_image_embeddings(batch_images))
+                embs.append(extractor.extract_image_embeddings(batch_images, normalize=normalize))
             return np.vstack(embs)
         embs = []
         for e in images:
             with Image.open(e.path) as img:
                 img = img.convert('RGB')
-                vec = extractor.extract_image_embedding(img)
+                vec = extractor.extract_image_embedding(img, normalize=normalize)
                 embs.append(vec)
         return np.vstack(embs)
 
@@ -429,9 +465,8 @@ class EmbeddingEngine:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def load_embeddings_only(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
-        cache_method = normalize_multimodal_method(method)
-        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
+    def load_embeddings_only(self, entries: List[ImageEntry], method: str, normalize: bool = True) -> Optional[np.ndarray]:
+        cache = self._cache_dir() / embedding_cache_filename(method, normalize=normalize)
         if not cache.exists():
             return None
         data = np.load(cache, allow_pickle=False)
@@ -451,19 +486,18 @@ class EmbeddingEngine:
                     return embs
         return None
 
-    def compute_and_cache_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
-        embs = self.estimate_embeddings(entries, method=method)
+    def compute_and_cache_embeddings(self, entries: List[ImageEntry], method: str, normalize: bool = True) -> np.ndarray:
+        embs = self.estimate_embeddings(entries, method=method, normalize=normalize)
         import numpy as np
-        cache_method = normalize_multimodal_method(method)
-        cache = self._cache_dir() / f'embeddings_{cache_method}.npz'
+        cache = self._cache_dir() / embedding_cache_filename(method, normalize=normalize)
         paths = np.array([e.path for e in entries])
         mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
         np.savez_compressed(cache, paths=paths, mtimes=mtimes, embeddings=embs)
         return embs
 
-    def text_embedding(self, method: str, text: str) -> Optional[np.ndarray]:
+    def text_embedding(self, method: str, text: str, normalize: bool = True) -> Optional[np.ndarray]:
         extractor = build_multimodal_extractor(method)
         if extractor is not None and getattr(extractor, 'available', False):
-            vec = extractor.extract_text_embedding(text)
+            vec = extractor.extract_text_embedding(text, normalize=normalize)
             return vec
         return None

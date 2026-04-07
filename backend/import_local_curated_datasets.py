@@ -75,7 +75,7 @@ OVERWRITE = False
 # Precompute settings.
 SKIP_PRECOMPUTE = False
 METHODS = 'color_rgb,siglip2,clip,dino'
-REDUCTION = 'pca'
+REDUCTION = 'all'
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -86,9 +86,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help='Optional preset names or output names to import. Defaults to all batch items.',
     )
-    parser.add_argument('--skip-precompute', action='store_true', help='Skip embedding and PCA precompute.')
+    parser.add_argument('--skip-precompute', action='store_true', help='Skip embedding and 2D reduction precompute.')
     parser.add_argument('--methods', default=METHODS, help='Comma-separated embedding methods to precompute.')
-    parser.add_argument('--reduction', default=REDUCTION, help='2D reduction method to precompute.')
+    parser.add_argument('--reduction', default=REDUCTION, help='Comma-separated 2D reduction methods to precompute: pca, umap, tsne, or all.')
     return parser
 
 

@@ -5,18 +5,18 @@
 
   import { createEventDispatcher, onMount, onDestroy } from 'svelte'
   import { axisBuildersStore } from '../lib/axisBuilderStore'
+  import { buildApiUrl, resolveApiBase } from '../lib/apiBase'
+  import { axisPayloadFromSession, axisSessionFromResponse } from '../lib/axisSessions'
+  import {
+    createSubsetFilter,
+    normalizeSubsetFilters,
+    subsetChipsFromState,
+  } from '../lib/subsetState'
   import LassoSelector from './LassoSelector.svelte'
   import MaterialIcon from './MaterialIcon.svelte'
   export let items = [] // [{ id, url, thumbUrl?, fullUrl?, x, y, gx, gy }]
   export let axes = [] // [{ id, name, coords: Record<string, number> }]
-  export let apiBase = (() => {
-    if (typeof window !== 'undefined' && window.location) {
-      const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
-      const host = window.location.hostname || '127.0.0.1'
-      return `${protocol}//${host}:5002`
-    }
-    return 'http://127.0.0.1:5002'
-  })()
+  export let apiBase = resolveApiBase()
   export let width = 700
   export let height = 700
   export let viewFrac = 0.15 // viewport square fraction (initial)
@@ -27,9 +27,19 @@
   export let imageSubsampleSeed = 1337
   export let focusImageRequest = null
   export let restoreViewState = null
+  export let subsetFilters = []
+  export let saveVisualizationDisabled = false
 
   const dispatch = createEventDispatcher()
   $: axisBuilderSessions = $axisBuildersStore
+  function emitLog(action, detail = 'none') {
+    const actionText = String(action || '').trim()
+    if (!actionText) return
+    dispatch('logAction', {
+      action: actionText,
+      detail: String(detail || '').trim() || 'none',
+    })
+  }
 
   // Visual margin for display (map [0,1] -> [m, 1-m])
   export let displayMargin = 0.1
@@ -117,18 +127,9 @@
   // Lasso subset selection
   let lassoEnabled = false
   let subsetSelectionIds = []
-  let subsetFilter = null // { mode: 'isolate' | 'exclude', ids: string[] }
   let lassoRef
-  function normalizeSubsetFilter(raw) {
-    if (!raw || typeof raw !== 'object') return null
-    const mode = String(raw.mode || '').trim() === 'exclude' ? 'exclude' : 'isolate'
-    const ids = Array.isArray(raw.ids) ? raw.ids.map((id) => String(id || '').trim()).filter(Boolean) : []
-    if (ids.length === 0) return null
-    return { mode, ids }
-  }
   $: subsetSelectionSet = new Set((subsetSelectionIds || []).map((id) => String(id || '').trim()).filter(Boolean))
-  $: subsetFilterSet = new Set(Array.isArray(subsetFilter?.ids) ? subsetFilter.ids.map((id) => String(id || '').trim()).filter(Boolean) : [])
-  $: subsetFilterActive = subsetFilterSet.size > 0
+  $: activeSubsetFilters = normalizeSubsetFilters(subsetFilters)
   function clearLassoSelection() {
     subsetSelectionIds = []
     try { lassoRef && lassoRef.reset && lassoRef.reset() } catch (_) {}
@@ -145,15 +146,31 @@
   function applySubsetFilter(mode) {
     const ids = Array.from(subsetSelectionSet)
     if (!ids.length) return
-    const nextMode = mode === 'exclude' ? 'exclude' : 'isolate'
-    subsetFilter = { mode: nextMode, ids }
+    const nextFilter = createSubsetFilter(mode, ids)
+    if (!nextFilter) return
+    dispatch('subsetFiltersChange', { filters: [...activeSubsetFilters, nextFilter] })
     clearLassoSelection()
+    emitLog('lasso selection', `${nextFilter.mode} | ${ids.length}`)
   }
-  function clearSubsetFilter() {
-    subsetFilter = null
-    clearLassoSelection()
-    dispatch('sliceChange', { slices: [], slice: null })
-    resetView()
+  function removeSubsetFilter(filterId, detail = 'none') {
+    const id = String(filterId || '').trim()
+    if (!id) return
+    const next = activeSubsetFilters.filter((entry) => String(entry?.id || '').trim() !== id)
+    dispatch('subsetFiltersChange', { filters: next })
+    emitLog('clear subset', detail)
+  }
+  function removeHistogramSlice(axisId, detail = 'none') {
+    const id = String(axisId || '').trim()
+    if (!id) return
+    const next = activeHistogramSlices.filter((entry) => String(entry?.axisId || '').trim() !== id)
+    dispatch('sliceChange', { slices: next, slice: next.length === 1 ? next[0] : null })
+    emitLog('clear subset', detail)
+  }
+  function visibleScatterPositionForItem(it) {
+    const pos = screenPositionForItem(it)
+    if (!Number.isFinite(pos?.x) || !Number.isFinite(pos?.y)) return null
+    if (pos.x < 0 || pos.x > 1 || pos.y < 0 || pos.y > 1) return null
+    return pos
   }
   function toggleLassoTool() {
     lassoEnabled = !lassoEnabled
@@ -293,8 +310,7 @@
     return !!nonContinuousAxisById.get(axisId)
   }
   function apiUrl(path) {
-    const base = String(apiBase || '').trim().replace(/\/+$/, '')
-    return `${base}${path}`
+    return buildApiUrl(apiBase, path)
   }
   async function postJson(path, body) {
     const res = await fetch(apiUrl(path), {
@@ -308,32 +324,6 @@
       throw new Error(`HTTP ${res.status} ${details}`.trim())
     }
     return res.json()
-  }
-  function sessionFromAxisResponse(current, data) {
-    const axis = data?.axis
-    if (!axis?.id || !axis?.coords) return null
-    return {
-      axisId: axis.id,
-      q: String(current?.q || data?.q || axis?.name || '').trim(),
-      axis: {
-        ...axis,
-        name: String(current?.axis?.name || current?.q || axis?.name || '').trim() || axis.name,
-      },
-      ids: Array.isArray(data?.ids) ? data.ids.map((v) => String(v || '').trim()) : [],
-      projectionValues: Array.isArray(data?.projection_values) ? data.projection_values.map((v) => Number(v) || 0) : [],
-      projectionMin: Number(data?.projection_min || 0),
-      projectionMax: Number(data?.projection_max || 0),
-      scores: Array.isArray(data?.scores) ? data.scores.map((v) => Number(v) || 0) : [],
-      std: Array.isArray(data?.std) ? data.std.map((v) => Number(v) || 0) : [],
-      decileExemplars: Array.isArray(data?.decile_exemplars) ? data.decile_exemplars : [],
-      hotspots: Array.isArray(data?.hotspots) ? data.hotspots : [],
-      moveCount: Number(data?.move_count || 0),
-      maxMoves: Number(data?.max_moves || 0),
-      moves: Array.isArray(data?.moves) ? data.moves : [],
-      undefinedIds: Array.isArray(data?.undefined_ids) ? data.undefined_ids.map((v) => String(v || '').trim()).filter(Boolean) : [],
-      w0Summary: data?.w0_summary || {},
-      moveHistory: Array.isArray(current?.moveHistory) ? current.moveHistory : [],
-    }
   }
   function findBuilder(axisId) {
     return (axisBuilderSessions || []).find((entry) => entry?.axisId === axisId) || null
@@ -529,7 +519,9 @@
         image_id: canonicalImageId,
         new_score_0_100: target,
       })
-      const updated = sessionFromAxisResponse(current, data)
+      const updated = axisSessionFromResponse(current, data, {
+        preferredName: String(current?.axis?.name || current?.q || '').trim(),
+      })
       if (!updated) throw new Error('Invalid axis move response')
       const nextHistory = Array.isArray(current?.moveHistory) ? [...current.moveHistory] : []
       nextHistory.unshift({
@@ -539,7 +531,7 @@
       })
       updated.moveHistory = nextHistory.slice(0, 6)
       axisBuildersStore.upsert(updated)
-      if (updated?.axis?.id) dispatch('create', updated.axis)
+      if (updated?.axis?.id) dispatch('create', axisPayloadFromSession(updated))
       clearZoomDraft(axisId)
       return true
     } catch (err) {
@@ -553,7 +545,8 @@
   }
   async function commitZoomAxisEdit(axisId, imageId, fallbackScore) {
     const target = Math.max(0, Math.min(100, Number(zoomSliderDrafts[String(axisId)] ?? fallbackScore) || 0))
-    await applyAxisMove(axisId, imageId, target, fallbackScore)
+    const ok = await applyAxisMove(axisId, imageId, target, fallbackScore)
+    if (ok) emitLog('slider change', 'none')
   }
   function hashUnit01(seed) {
     const s = String(seed || '')
@@ -703,9 +696,12 @@
     if (ops.length === 0) return
     grabSaving = true
     try {
+      let moved = false
       for (const op of ops) {
-        await applyAxisMove(op.axisId, imageId, op.target0to100, op.fallbackScore)
+        const ok = await applyAxisMove(op.axisId, imageId, op.target0to100, op.fallbackScore)
+        moved = moved || ok
       }
+      if (moved) emitLog('grabbing', 'none')
     } finally {
       grabSaving = false
     }
@@ -776,6 +772,7 @@
     const p = pointerClientToWorld(e.clientX, e.clientY)
     if (!p) return
     grabDrag = { ...grabDrag, x: p.x, y: p.y }
+    ensureAnimationFrame()
     try { e.preventDefault() } catch (_) {}
   }
   async function onGrabPointerUp(e) {
@@ -820,6 +817,65 @@
   // Buttons: resize the viewport (blue rect)
   function viewportZoomIn() { vf = clamp(vf * 0.88, 0.04, 0.9) }
   function viewportZoomOut() { vf = clamp(vf / 0.88, 0.04, 0.9) }
+  let gridDismissRaf = 0
+  function clearScheduledGridDismiss() {
+    if (!gridDismissRaf) return
+    cancelAnimationFrame(gridDismissRaf)
+    gridDismissRaf = 0
+  }
+  function clearGridPacking({ closeZoomOverlay = false } = {}) {
+    clearScheduledGridDismiss()
+    griddingActive = false
+    activeCenterId = null
+    gridRect = null
+    griddedImsRect = null
+    if (closeZoomOverlay && zoomItemId) closeZoom()
+    syncHoverPreview()
+  }
+  function currentGridPackingVisualRect() {
+    if (!griddingActive || !gridRect) return null
+    const base = gridBackdrop || {
+      x0: worldXToScreenNorm(gridRect.x0),
+      y0: worldYTopToScreenNorm(gridRect.y0),
+      x1: worldXToScreenNorm(gridRect.x1),
+      y1: worldYTopToScreenNorm(gridRect.y1),
+    }
+    return {
+      x0: Math.min(Number(base.x0 ?? 0), Number(base.x1 ?? 0)),
+      y0: Math.min(Number(base.y0 ?? 0), Number(base.y1 ?? 0)),
+      x1: Math.max(Number(base.x0 ?? 0), Number(base.x1 ?? 0)),
+      y1: Math.max(Number(base.y0 ?? 0), Number(base.y1 ?? 0)),
+    }
+  }
+  function isClientPointInsideGridPacking(clientX, clientY) {
+    if (!griddingActive || !gridRect || !minimapEl) return false
+    const minimapRect = minimapEl.getBoundingClientRect()
+    if (!minimapRect || minimapRect.width <= 0 || minimapRect.height <= 0) return false
+    const visualRect = currentGridPackingVisualRect()
+    if (!visualRect) return false
+    const px = (Number(clientX) - minimapRect.left) / minimapRect.width
+    const py = (Number(clientY) - minimapRect.top) / minimapRect.height
+    return px >= visualRect.x0 && px <= visualRect.x1 && py >= visualRect.y0 && py <= visualRect.y1
+  }
+  function scheduleGridPackingDismiss(closeZoomOverlay = false) {
+    clearScheduledGridDismiss()
+    gridDismissRaf = requestAnimationFrame(() => {
+      gridDismissRaf = 0
+      if (!griddingActive) return
+      clearGridPacking({ closeZoomOverlay })
+    })
+  }
+  function onWindowClickCapture(e) {
+    if (!griddingActive) return
+    if (isClientPointInsideGridPacking(e.clientX, e.clientY)) return
+    scheduleGridPackingDismiss(true)
+  }
+  function onWindowKeyDown(e) {
+    if (!griddingActive) return
+    if (e.key !== 'Escape') return
+    try { e.preventDefault() } catch (_) {}
+    clearGridPacking({ closeZoomOverlay: true })
+  }
   // Wheel: zoom content around center
   function contentZoomIn() { zoomZ = clamp(zoomZ * 1.12, 1.0, 6.0) }
   function contentZoomOut() { zoomZ = clamp(zoomZ / 1.12, 1.0, 6.0) }
@@ -828,11 +884,7 @@
     cy = 0.5
     zoomZ = 1.0
     vf = viewFrac
-    griddingActive = false
-    activeCenterId = null
-    gridRect = null
-    griddedImsRect = null
-    syncHoverPreview()
+    clearGridPacking()
   }
   function applyRestoredViewState(raw) {
     const next = raw && typeof raw === 'object' ? raw : {}
@@ -841,18 +893,13 @@
     zoomZ = clamp(Number(next.zoomZ ?? 1.0), 1.0, 6.0)
     vf = clamp(Number(next.vf ?? viewFrac), 0.04, 0.9)
     showDensity = !!next.showDensity
-    showUncertainty = !!next.showUncertainty
+    showUncertainty = false
     imageMax = Math.max(0, Math.floor(Number(next.imageMax ?? imageMax) || 0))
-    subsetFilter = normalizeSubsetFilter(next.subsetFilter)
     clearLassoSelection()
-    griddingActive = false
-    activeCenterId = null
-    gridRect = null
-    griddedImsRect = null
+    clearGridPacking()
     zoomItemId = null
     zoomSliderDrafts = {}
     zoomError = ''
-    syncHoverPreview()
   }
   let appliedRestoreNonce = null
   $: {
@@ -1031,7 +1078,13 @@
     }
     ctx.restore()
   }
-  $: if (showDensity && densityCanvas && renderItemsVisible && width && height) {
+  $: densityScatterPoints = Array.isArray(itemsFiltered)
+    ? itemsFiltered
+      .map((it) => visibleScatterPositionForItem(it))
+      .filter(Boolean)
+      .map((pt) => ({ x: pt.x, y: pt.y }))
+    : []
+  $: if (showDensity && densityCanvas && width && height) {
     try {
       const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1
       const wpx = Math.max(1, Math.floor(width))
@@ -1043,7 +1096,7 @@
       const ctx = densityCanvas.getContext('2d')
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.clearRect(0, 0, wpx, hpx)
-      const pts = renderItemsVisible.map((r) => ({ x: r.x, y: r.y }))
+      const pts = densityScatterPoints
       if (pts.length > 0) {
         const { data, gw, gh } = buildDensityGrid(pts, wpx, hpx)
         const n = Math.max(1, Math.min(20, Math.floor(isoCount || 1)))
@@ -1161,10 +1214,50 @@
     }
     return { x, y }
   }
+  function targetWorldPositionForItem(it) {
+    const base = posOriginal(it)
+    const rect = (griddingActive && gridRect) ? gridRect : null
+    const rx0 = rect?.x0 ?? 0
+    const ry0 = rect?.y0 ?? 0
+    const rx1 = rect?.x1 ?? 1
+    const ry1 = rect?.y1 ?? 1
+    const rmg = rect?.margin ?? 0
+    const inside = !!(
+      griddingActive &&
+      rect &&
+      base.x >= (rx0 - rmg) &&
+      base.x <= (rx1 + rmg) &&
+      (1 - base.y) >= (ry0 - rmg) &&
+      (1 - base.y) <= (ry1 + rmg)
+    )
+    const packed = inside ? localPacked.get(it.id) : null
+    return packed || base
+  }
+  function screenPositionForItem(it) {
+    const track = tracks?.get(it.id)
+    const draggingThis = !!(grabDrag && String(grabDrag.id) === String(it?.id))
+    const world = track
+      ? {
+          x: draggingThis ? Number(grabDrag.x) : lerp(track.from.x, track.to.x, tNorm),
+          y: draggingThis ? Number(grabDrag.y) : lerp(track.from.y, track.to.y, tNorm),
+        }
+      : targetWorldPositionForItem(it)
+    const zx = cx + (world.x - cx) * zoomZ
+    const zy = cy + (world.y - cy) * zoomZ
+    return {
+      id: it.id,
+      x: toVisX(zx),
+      y: toVisY(zy),
+    }
+  }
   // Normalized items for the lasso overlay – use the actually rendered positions
-  // so selection matches the current (possibly customized) axes projection and packing.
-  $: lassoItems = Array.isArray(renderItemsVisible)
-    ? renderItemsVisible.map((it) => ({ id: it.id, x: it.x, y: 1 - it.y }))
+  // so selection matches the current (possibly customized) axes projection and packing,
+  // even for items that are currently represented as dots or omitted from thumbnail rendering.
+  $: lassoItems = Array.isArray(itemsFiltered)
+    ? itemsFiltered
+      .map((it) => screenPositionForItem(it))
+      .filter((it) => Number.isFinite(it.x) && Number.isFinite(it.y) && it.x >= 0 && it.x <= 1 && it.y >= 0 && it.y <= 1)
+      .map((it) => ({ id: it.id, x: it.x, y: 1 - it.y }))
     : []
 
   // Animation tracks
@@ -1179,23 +1272,41 @@
   }
   let startTs = performance.now()
   let nowTs = startTs
-  let rafId
+  let rafId = 0
   let resizeDrag = null
-  function tickAnim() {
-    nowTs = performance.now()
-    // update last positions in ORIGINAL coord space (not visual)
-    if (tracks && tracks.size > 0) {
-      for (const tr of tracks.values()) {
-        const x = lerp(tr.from.x, tr.to.x, tNorm)
-        const y = lerp(tr.from.y, tr.to.y, tNorm)
-        lastPosMap.set(tr.id, { x, y })
-      }
+  function transitionProgress(ts = nowTs) {
+    const elapsedMs = Math.max(0, Number(ts || 0) - Number(startTs || 0))
+    const ratio = Math.min(1, duration > 0 ? elapsedMs / duration : 1)
+    return easeInOutCubic(ratio)
+  }
+  function updateLastPositions(progress = transitionProgress()) {
+    if (!(tracks && tracks.size > 0)) return
+    for (const tr of tracks.values()) {
+      const x = lerp(tr.from.x, tr.to.x, progress)
+      const y = lerp(tr.from.y, tr.to.y, progress)
+      lastPosMap.set(tr.id, { x, y })
     }
+  }
+  function ensureAnimationFrame() {
+    if (rafId) return
     rafId = requestAnimationFrame(tickAnim)
   }
+  function tickAnim() {
+    rafId = 0
+    const ts = performance.now()
+    nowTs = ts
+    const progress = transitionProgress(ts)
+    updateLastPositions(progress)
+    if (grabDrag || progress < 0.999) {
+      ensureAnimationFrame()
+      return
+    }
+    updateLastPositions(1)
+  }
   onMount(() => {
-    rafId = requestAnimationFrame(tickAnim)
     syncHoverPreview()
+    window.addEventListener('click', onWindowClickCapture, true)
+    window.addEventListener('keydown', onWindowKeyDown)
   })
   function clearResizeDrag() {
     resizeDrag = null
@@ -1228,8 +1339,11 @@
   }
   onDestroy(() => {
     cancelAnimationFrame(rafId)
+    clearScheduledGridDismiss()
     clearResizeDrag()
     stopGrabListeners()
+    window.removeEventListener('click', onWindowClickCapture, true)
+    window.removeEventListener('keydown', onWindowKeyDown)
   })
 
   // Local packing for inside grid placement
@@ -1321,9 +1435,8 @@
       zoomZ,
       vf,
       showDensity,
-      showUncertainty,
+      showUncertainty: false,
       imageMax: normalizedImageMax,
-      subsetFilter: subsetFilter ? { mode: subsetFilter.mode, ids: Array.isArray(subsetFilter.ids) ? subsetFilter.ids : [] } : null,
     }
     const nextJson = JSON.stringify(snapshot)
     if (nextJson !== lastViewStateSnapshot) {
@@ -1390,13 +1503,19 @@
       const lp = localPacked.get(it.id)
       const to = (inside && lp) ? lp : p
       const prevTarget = prevTargets.get(it.id)
-      if (!posEqual(prevTarget, to)) anyChange = true
+      if (prevTarget && !posEqual(prevTarget, to)) anyChange = true
       const from = lastPosMap.get(it.id) || p
       m.set(it.id, { id: it.id, url: it.url, thumbUrl: it.thumbUrl, fullUrl: it.fullUrl, from, to })
       nextTargets.set(it.id, to)
     }
     tracks = m
-    if (anyChange) startTs = performance.now()
+    if (anyChange) {
+      startTs = performance.now()
+      nowTs = startTs
+      ensureAnimationFrame()
+    } else {
+      updateLastPositions(1)
+    }
     prevTargets = nextTargets
   }
 
@@ -1462,9 +1581,7 @@
       const inside = (vx >= rx0 && vx <= rx1 && vy >= ry0 && vy <= ry1)
       if (!inside) {
         // Click outside grid -> close grid
-        griddingActive = false
-        activeCenterId = null
-        gridRect = null
+        clearGridPacking()
         try { console.log('[minimap] grid closed') } catch(_) {}
         return
       }
@@ -1483,6 +1600,7 @@
     griddingActive = true
     activeCenterId = null
     gridRect = clickedRect
+    emitLog('local gridding', 'none')
     try {
       console.log('[minimap] grid enable gridRect (norm)', clickedRect)
       // compute and log grey bounds based on current visible items
@@ -1521,22 +1639,29 @@
 
   // Drag and drop handlers for X/Y axis selectors
   function allowDrop(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' }
+  function viewChoiceDetail(nextX, nextY) {
+    return `x:${axisName(nextX)}, y:${axisName(nextY)}`
+  }
+  function applyAxesChoice(nextX, nextY) {
+    selectedX = nextX ? String(nextX) : null
+    selectedY = nextY ? String(nextY) : null
+    dispatch('axesChange', { selectedX, selectedY })
+    emitLog('change view', viewChoiceDetail(selectedX, selectedY))
+  }
   function onDropX(e) {
     e.preventDefault()
     const id = e.dataTransfer.getData('application/axis-id') || e.dataTransfer.getData('text/plain')
     if (!id) return
-    selectedX = id
-    dispatch('axesChange', { selectedX, selectedY })
+    applyAxesChoice(id, selectedY)
   }
   function onDropY(e) {
     e.preventDefault()
     const id = e.dataTransfer.getData('application/axis-id') || e.dataTransfer.getData('text/plain')
     if (!id) return
-    selectedY = id
-    dispatch('axesChange', { selectedX, selectedY })
+    applyAxesChoice(selectedX, id)
   }
-  function clearX() { selectedX = null; dispatch('axesChange', { selectedX, selectedY }) }
-  function clearY() { selectedY = null; dispatch('axesChange', { selectedX, selectedY }) }
+  function clearX() { applyAxesChoice(null, selectedY) }
+  function clearY() { applyAxesChoice(selectedX, null) }
 
   // Selections provided by parent and top-center filtering controls
   export let selectionToolsEnabled = true
@@ -1569,6 +1694,7 @@
     return out
   })()
   $: histogramSliceActive = activeHistogramSlices.length > 0
+  $: activeSubsetChips = subsetChipsFromState(activeHistogramSlices, activeSubsetFilters)
   $: histogramSliceIds = (() => {
     if (!histogramSliceActive) return new Set()
     let intersection = null
@@ -1663,8 +1789,11 @@
     const base = Array.isArray(items) ? items : []
     let out = base
     if (histogramSliceActive) out = out.filter((it) => histogramSliceIds.has(String(it?.id || '')))
-    if (subsetFilter?.mode === 'isolate') out = out.filter((it) => subsetFilterSet.has(String(it?.id || '')))
-    else if (subsetFilter?.mode === 'exclude') out = out.filter((it) => !subsetFilterSet.has(String(it?.id || '')))
+    for (const filter of activeSubsetFilters) {
+      const ids = new Set(Array.isArray(filter?.ids) ? filter.ids.map((id) => String(id || '').trim()).filter(Boolean) : [])
+      if (filter?.mode === 'exclude') out = out.filter((it) => !ids.has(String(it?.id || '')))
+      else out = out.filter((it) => ids.has(String(it?.id || '')))
+    }
     if (filterMode === 'keep-pos') out = out.filter((it) => filterPosSet.has(it.id))
     else if (filterMode === 'discard-neg') out = out.filter((it) => !filterNegSet.has(it.id))
     return out
@@ -1690,18 +1819,29 @@
   <canvas bind:this={densityCanvas} style="position:absolute;left:0;top:0;z-index:0;opacity:0.9;pointer-events:none;"></canvas>
   <!-- Points overlay canvas (above images) -->
   <canvas bind:this={pointsCanvas} style="position:absolute;left:0;top:0;z-index:12;pointer-events:none;"></canvas>
-  {#if activeHistogramSlices.length > 0 || subsetFilterActive}
+  {#if activeSubsetChips.length > 0}
     <div class="minimap-chip-stack">
-      <div class="minimap-status-chip minimap-status-chip-subset">
-        <span>[Subset]</span>
-        <button
-          type="button"
-          class="subset-chip-clear"
-          aria-label="Clear subset"
-          title="Clear subset"
-          on:click|stopPropagation|preventDefault={clearSubsetFilter}
-        ><MaterialIcon name="close" size={14} /></button>
-      </div>
+      <button
+        type="button"
+        class="btn btn-ui-secondary btn-xs minimap-subset-save"
+        title="Save current subset"
+        on:click|stopPropagation|preventDefault={() => dispatch('saveSubset')}
+      >Save subset</button>
+      {#each activeSubsetChips as chip (chip.id)}
+        <div class="minimap-status-chip minimap-status-chip-subset">
+          <span>{chip.label}</span>
+          <button
+            type="button"
+            class="subset-chip-clear"
+            aria-label={`Remove ${chip.label}`}
+            title={`Remove ${chip.label}`}
+            on:click|stopPropagation|preventDefault={() => {
+              if (chip.chipType === 'slice') removeHistogramSlice(chip.axisId, chip.label)
+              else removeSubsetFilter(chip.id, chip.label)
+            }}
+          ><MaterialIcon name="close" size={14} /></button>
+        </div>
+      {/each}
     </div>
   {/if}
   {#if griddingActive && gridBackdrop}
@@ -1815,54 +1955,64 @@
   <div class="minimap-tools" on:pointerdown|stopPropagation>
     <button
       type="button"
-      class={`btn btn-icon btn-minimap minimap-tool-btn ${(!grabMode && !lassoEnabled) ? 'is-active' : ''}`}
+      class={`btn btn-minimap minimap-tool-btn ${(!grabMode && !lassoEnabled) ? 'is-active' : ''}`}
       on:click|stopPropagation|preventDefault={() => { lassoEnabled = false; clearLassoSelection(); grabMode = false; grabDrag = null; stopGrabListeners() }}
       aria-pressed={!grabMode && !lassoEnabled}
-      title="Select mode (pan and inspect)"
-      aria-label="Select mode"
+      title="Grid"
+      aria-label="Grid"
     >
       <MaterialIcon name="arrow_selector_tool" />
+      <span class="minimap-tool-label">GRID</span>
     </button>
     <button
       type="button"
-      class={`btn btn-icon btn-minimap minimap-tool-btn ${grabMode ? 'is-active' : ''}`}
+      class={`btn btn-minimap minimap-tool-btn ${grabMode ? 'is-active' : ''}`}
       on:click|stopPropagation|preventDefault={() => { lassoEnabled = false; clearLassoSelection(); grabMode = true }}
       aria-pressed={grabMode}
-      title="Grab mode (move images)"
-      aria-label="Grab mode"
+      title="Move"
+      aria-label="Move"
     >
       <MaterialIcon name="tune" />
+      <span class="minimap-tool-label">MOVE</span>
     </button>
     <button
       type="button"
-      class={`btn btn-icon btn-minimap minimap-tool-btn ${lassoEnabled ? 'is-active' : ''}`}
+      class={`btn btn-minimap minimap-tool-btn ${lassoEnabled ? 'is-active' : ''}`}
       on:click|stopPropagation|preventDefault={toggleLassoTool}
       aria-pressed={lassoEnabled}
-      title="Lasso subset tool"
-      aria-label="Lasso subset tool"
+      title="Select"
+      aria-label="Select"
     >
       <MaterialIcon name="lasso_select" />
+      <span class="minimap-tool-label">SELECT</span>
     </button>
+    {#if lassoEnabled}
+      <button
+        type="button"
+        class="btn btn-minimap minimap-subset-btn"
+        disabled={subsetSelectionSet.size === 0}
+        on:click|stopPropagation|preventDefault={() => applySubsetFilter('isolate')}
+      >Isolate</button>
+      <button
+        type="button"
+        class="btn btn-minimap minimap-subset-btn"
+        disabled={subsetSelectionSet.size === 0}
+        on:click|stopPropagation|preventDefault={() => applySubsetFilter('exclude')}
+      >Exclude</button>
+    {/if}
     <button
       type="button"
-      class={`btn btn-icon btn-minimap minimap-tool-btn ${showDensity ? 'is-active' : ''}`}
+      class={`btn btn-minimap minimap-tool-btn ${showDensity ? 'is-active' : ''}`}
       on:click|stopPropagation|preventDefault={() => { showDensity = !showDensity }}
       aria-pressed={showDensity}
-      title="Density"
-      aria-label="Density"
+      title="Distribution"
+      aria-label="Distribution"
     >
       <svg class="minimap-tool-svg density-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M2 18C5 18 5.5 7 12 7s7 11 10 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
+      <span class="minimap-tool-label">DISTRIBUTION</span>
     </button>
-    <button
-      type="button"
-      class={`btn btn-icon btn-minimap minimap-tool-btn ${showUncertainty ? 'is-active' : ''}`}
-      on:click|stopPropagation|preventDefault={() => { showUncertainty = !showUncertainty }}
-      aria-pressed={showUncertainty}
-      title="Uncertainty"
-      aria-label="Uncertainty"
-    >U</button>
     <label class="minimap-tool-max" title="Maximum number of thumbnails in minimap (0 = all)">
       <span>max</span>
       <input
@@ -1876,25 +2026,16 @@
         on:input={(e)=>{ imageMax = Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)) }}
       />
     </label>
+    <button
+      type="button"
+      class="btn btn-icon btn-minimap minimap-tool-btn"
+      disabled={saveVisualizationDisabled}
+      on:click|stopPropagation|preventDefault={() => dispatch('saveVisualization')}
+      title="Save visualization"
+      aria-label="Save visualization"
+    ><MaterialIcon name="save" /></button>
     <button type="button" class="btn btn-icon btn-minimap minimap-tool-btn" on:click|stopPropagation|preventDefault={resetView} title="Reset view" aria-label="Reset view"><MaterialIcon name="replay" /></button>
   </div>
-
-  {#if lassoEnabled}
-    <div class="minimap-tools minimap-tools-secondary">
-      <button
-        type="button"
-        class="btn btn-minimap minimap-subset-btn"
-        disabled={subsetSelectionSet.size === 0}
-        on:click|stopPropagation|preventDefault={() => applySubsetFilter('isolate')}
-      >Isolate</button>
-      <button
-        type="button"
-        class="btn btn-minimap minimap-subset-btn"
-        disabled={subsetSelectionSet.size === 0}
-        on:click|stopPropagation|preventDefault={() => applySubsetFilter('exclude')}
-      >Exclude</button>
-    </div>
-  {/if}
 
   <!-- Axis categorical labels when metadata axes are selected -->
   {#if selectedY && (selectedY.startsWith('axis:meta:'))}
@@ -1945,12 +2086,12 @@
   <div
     class="axis-edge axis-edge-y text-sm"
     role="group"
-    style={`left:${Math.max(6, axisFrameLeftPx - 72)}px;top:${axisFrameCenterYPx}px;`}
+    style={`left:${axisFrameLeftPx - 10}px;top:${axisFrameCenterYPx}px;`}
     on:dragover={allowDrop}
     on:drop={onDropY}
     title="Drop a Y axis here"
   >
-    <select class="axis-inline-select axis-inline-select-y text-sm" on:change={(e)=>{ selectedY = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+    <select class="axis-inline-select axis-inline-select-y text-sm" on:change={(e)=>{ applyAxesChoice(selectedX, e.currentTarget.value || null) }}>
       <option value="">(none)</option>
       {#each axes as ax}
         <option value={ax.id} selected={selectedY===ax.id}>{ax.name}</option>
@@ -1989,12 +2130,12 @@
   <div
     class="axis-edge axis-edge-x text-sm"
     role="group"
-    style={`left:${axisFrameCenterXPx}px;top:${axisFrameBottomPx + 15}px;`}
+    style={`left:${axisFrameCenterXPx}px;top:${axisFrameBottomPx - 5}px;`}
     on:dragover={allowDrop}
     on:drop={onDropX}
     title="Drop an X axis here"
   >
-      <select class="axis-inline-select text-sm" on:change={(e)=>{ selectedX = e.currentTarget.value || null; dispatch('axesChange', { selectedX, selectedY }) }}>
+      <select class="axis-inline-select text-sm" on:change={(e)=>{ applyAxesChoice(e.currentTarget.value || null, selectedY) }}>
         <option value="">(none)</option>
         {#each axes as ax}
           <option value={ax.id} selected={selectedX===ax.id}>{ax.name}</option>
@@ -2082,14 +2223,14 @@
 
   .minimap-chip-stack {
     position: absolute;
-    top: 80px;
-    left: 8px;
+    top: 8px;
+    right: 8px;
     z-index: 30;
     display: flex;
-    align-items: center;
+    flex-direction: column;
+    align-items: flex-end;
     gap: 6px;
-    flex-wrap: wrap;
-    max-width: calc(100% - 180px);
+    max-width: min(320px, calc(100% - 16px));
   }
 
   .minimap-status-chip {
@@ -2105,10 +2246,19 @@
     font-size: 12px;
     line-height: 1;
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+    max-width: 100%;
   }
 
   .minimap-status-chip-subset {
     font-weight: 600;
+  }
+
+  .minimap-subset-save {
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+    align-self: flex-end;
   }
 
   .subset-chip-clear {
@@ -2137,7 +2287,7 @@
   }
 
   .axis-edge-y {
-    transform: translateY(-50%);
+    transform: translate(-100%, -50%);
     flex-direction: row;
     align-items: center;
     justify-content: center;
@@ -2214,20 +2364,19 @@
     padding: 4px 6px;
   }
 
-  .minimap-tools-secondary {
-    top: 44px;
-    left: 8px;
-    padding: 4px;
-    gap: 4px;
-  }
-
   .minimap-tool-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     color: #0f172a !important;
     border-color: #cbd5e1;
-    min-width: 28px;
+    min-width: 0;
     height: 28px;
-    padding: 0 6px;
+    padding: 0 8px;
     opacity: 1;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
   }
 
   .minimap-tool-btn.is-active {
@@ -2261,6 +2410,10 @@
     height: 16px;
     display: block;
     color: #0f172a;
+  }
+
+  .minimap-tool-label {
+    line-height: 1;
   }
 
   .density-icon {
