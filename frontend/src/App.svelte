@@ -18,7 +18,7 @@
   } from './lib/subsetState'
 
   const API_BASE = resolveApiBase()
-  const SYSTEM_NAME = 'ReQuest'
+  const SYSTEM_NAME = 'Reaxis'
   const SESSION_STORAGE_KEY = 'request.activeSession'
 
   let datasets = []
@@ -973,7 +973,7 @@
   <header class="app-header">
     <div class="app-header-inner">
       <div class="i-heroicons-sparkles brand-icon" />
-      <div class="brand-name">ReQuest</div>
+      <div class="brand-name">Reaxis</div>
       <div class="inline-flex items-center gap-2">
         <label for="dataset-select" class="text-xs text-gray-700">Dataset</label>
         <select
@@ -1077,9 +1077,6 @@
           <div class="tile-header flex items-center gap-2">
             <span class="i-heroicons-chart-bar-square text-slate-600" />
             Visualization
-            {#if embedFileName}
-              <span class="visualization-embed-file" title={`Gallery layout cache: ${embedFileName}`}>Layout: {embedFileName}</span>
-            {/if}
           </div>
           <div class="tile-content flush minimap-panel" bind:this={minimapContainerRef}>
             <AxesMinimap
@@ -1594,16 +1591,6 @@
     color: #64748b;
     font-size: var(--font-size-small);
     text-align: center;
-  }
-
-  .visualization-embed-file {
-    max-width: 34ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--font-size-small);
-    font-weight: 500;
-    color: #94a3b8;
   }
 
   @media (max-width: 1080px) {

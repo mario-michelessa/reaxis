@@ -334,7 +334,7 @@
   <header class="app-header">
     <div class="app-header-inner">
       <div class="i-heroicons-sparkles brand-icon" />
-      <div class="brand-name">ReQuest (Standalone)</div>
+      <div class="brand-name">Reaxis (Standalone)</div>
       <div class="ml-4 inline-flex items-center gap-2">
         <label for="dataset-select" class="text-sm text-gray-700">Dataset</label>
         <select

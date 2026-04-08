@@ -8,6 +8,11 @@
   import { buildApiUrl, resolveApiBase } from '../lib/apiBase'
   import { axisPayloadFromSession, axisSessionFromResponse } from '../lib/axisSessions'
   import {
+    buildMetadataAxisEntries,
+    buildMetadataColorLookup,
+    isMetadataAxis,
+  } from '../lib/metadataAxisColoring'
+  import {
     createSubsetFilter,
     normalizeSubsetFilters,
     subsetChipsFromState,
@@ -29,6 +34,11 @@
   export let restoreViewState = null
   export let subsetFilters = []
   export let saveVisualizationDisabled = false
+  const MIN_CELL_PX = 10
+  const MAX_CELL_PX = 32
+  const CELL_PX_STEP = 2
+  const Y_AXIS_EDGE_NUDGE_PX = 90
+  let cellPx = 16
 
   const dispatch = createEventDispatcher()
   $: axisBuilderSessions = $axisBuildersStore
@@ -40,6 +50,7 @@
       detail: String(detail || '').trim() || 'none',
     })
   }
+  function touch(..._args) {}
 
   // Visual margin for display (map [0,1] -> [m, 1-m])
   export let displayMargin = 0.1
@@ -237,8 +248,29 @@
   // Selected axis ids for X and Y
   export let selectedX = null
   export let selectedY = null
+  let selectedColorAxisId = null
 
   $: axesById = new Map((axes || []).map(a => [a.id, a]))
+  $: metadataAxes = (axes || []).filter((axis) => isMetadataAxis(axis))
+  $: metadataAxesById = new Map((metadataAxes || []).map((axis) => [axis.id, axis]))
+  $: selectedXAxis = selectedX ? (axesById.get(selectedX) || null) : null
+  $: selectedYAxis = selectedY ? (axesById.get(selectedY) || null) : null
+  $: selectedColorAxis = selectedColorAxisId ? (metadataAxesById.get(selectedColorAxisId) || null) : null
+  $: metadataColorLookup = buildMetadataColorLookup(selectedColorAxis)
+  $: if (selectedColorAxisId && !metadataAxesById.has(selectedColorAxisId)) selectedColorAxisId = null
+  $: scatterLayoutDeps = {
+    selectedX,
+    selectedY,
+    selectedXAxis,
+    selectedYAxis,
+    selectedXAxisCoords: selectedXAxis?.coords || null,
+    selectedYAxisCoords: selectedYAxis?.coords || null,
+    selectedColorAxisId,
+    selectedColorAxis,
+    selectedColorAxisCoords: selectedColorAxis?.coords || null,
+    sameAxisKdeLayout,
+    showUncertainty,
+  }
   $: itemsById = new Map((items || []).map((item) => [String(item?.id || ''), item]).filter((row) => row[0]))
 
   function axisName(id) { return (axesById.get(id)?.name) || '—' }
@@ -258,11 +290,11 @@
   }
   function axisTicks(axisId) {
     const ax = axisId ? axesById.get(axisId) : null
-    if (!ax) return { labels: [], pos: [] }
-    const labels = Array.isArray(ax.labels) ? ax.labels : []
-    const pos = Array.isArray(ax.label_positions) ? ax.label_positions : []
-    console.log('axisTicks', axisId, labels, pos)
-    return { labels, pos }
+    if (!ax) return { labels: [], pos: [], entries: [] }
+    const entries = buildMetadataAxisEntries(ax)
+    const labels = entries.map((entry) => entry.label)
+    const pos = entries.map((entry) => entry.pos)
+    return { labels, pos, entries }
   }
   function normalizeAxisType(v) {
     const s = String(v || '').trim().toLowerCase()
@@ -716,7 +748,7 @@
     for (let i = renderItemsVisible.length - 1; i >= 0; i--) {
       const it = renderItemsVisible[i]
       const inside = griddingActive && insideIds.has(it.id)
-      const sz = renderThumbSizePx(it.id, inside)
+      const sz = renderThumbSizePx(it.id, inside, sizeInside, sizeOutside, subsampleDotPx, subsampleActive)
       const dx = Math.abs(px - it.x) * rect.width
       const dy = Math.abs(py - 1 + it.y) * rect.height
       if (dx <= sz / 2 && dy <= sz / 2) { hitId = it.id; break }
@@ -895,6 +927,8 @@
     showDensity = !!next.showDensity
     showUncertainty = false
     imageMax = Math.max(0, Math.floor(Number(next.imageMax ?? imageMax) || 0))
+    cellPx = clamp(Math.round(Number(next.cellPx ?? cellPx) || 16), MIN_CELL_PX, MAX_CELL_PX)
+    selectedColorAxisId = String(next.selectedColorAxisId || '').trim() || null
     clearLassoSelection()
     clearGridPacking()
     zoomItemId = null
@@ -1079,10 +1113,13 @@
     ctx.restore()
   }
   $: densityScatterPoints = Array.isArray(itemsFiltered)
-    ? itemsFiltered
-      .map((it) => visibleScatterPositionForItem(it))
-      .filter(Boolean)
-      .map((pt) => ({ x: pt.x, y: pt.y }))
+    ? (() => {
+        touch(scatterLayoutDeps)
+        return itemsFiltered
+          .map((it) => visibleScatterPositionForItem(it))
+          .filter(Boolean)
+          .map((pt) => ({ x: pt.x, y: pt.y }))
+      })()
     : []
   $: if (showDensity && densityCanvas && width && height) {
     try {
@@ -1111,9 +1148,23 @@
       if (ctx) ctx.clearRect(0, 0, densityCanvas.width, densityCanvas.height)
     } catch (_) {}
   }
+  function metadataColorForId(imageId) {
+    const key = String(imageId || '').trim()
+    if (!key) return null
+    return metadataColorLookup.get(key) || null
+  }
+  function pointColorForId(imageId, fallback) {
+    const meta = metadataColorForId(imageId)
+    return meta?.pointColor || fallback
+  }
+  function pointStrongColorForId(imageId, fallback) {
+    const meta = metadataColorForId(imageId)
+    return meta?.pointColorStrong || fallback
+  }
 
   // Points overlay drawing
   $: {
+    touch(scatterLayoutDeps)
     const drawAllPoints = pointRadius > 0
     const drawSubsampleDots = !drawAllPoints && subsampleActive && !griddingActive
     if (pointsCanvas && width && height && (drawAllPoints || drawSubsampleDots)) {
@@ -1142,9 +1193,10 @@
           }
           // Color by label: neg=red, pos=green, unlabeled=black
           const lv = labelOf(it.id)
-          const col = (lv === 'neg') ? 'rgba(220,38,38,0.95)'
-                    : (lv === 'pos') ? 'rgba(22,163,74,0.95)'
-                    : 'rgba(17,24,39,0.95)'
+          const fallback = (lv === 'neg') ? 'rgba(220,38,38,0.95)'
+                         : (lv === 'pos') ? 'rgba(22,163,74,0.95)'
+                         : 'rgba(17,24,39,0.95)'
+          const col = pointStrongColorForId(it.id, fallback)
           ctx.fillStyle = col
           ctx.beginPath()
           ctx.arc(x, y, r, 0, Math.PI * 2)
@@ -1162,7 +1214,9 @@
           if (sx < 0 || sx > 1 || sy < 0 || sy > 1) continue
           const x = sx * wpx
           const y = (1 - sy) * hpx
-          ctx.fillStyle = isSliceFilteredOut(it.id) ? 'rgba(148,163,184,0.30)' : 'rgba(143,151,170,0.74)'
+          ctx.fillStyle = isSliceFilteredOut(it.id)
+            ? 'rgba(148,163,184,0.30)'
+            : pointColorForId(it.id, 'rgba(143,151,170,0.74)')
           ctx.beginPath()
           ctx.arc(x, y, dotR, 0, Math.PI * 2)
           ctx.fill()
@@ -1418,7 +1472,6 @@
   }
 
   // Derived layout
-  $: cellPx = 16
   $: imSize = Math.max(minImagePx, Math.floor(cellPx ))
   $: vfRatio = 0.35 / Math.max(0.08, Math.min(1.0, vf))
   $: insideScale = Math.max(1.5, 1.7 + 1 * (vfRatio - 1))
@@ -1437,6 +1490,8 @@
       showDensity,
       showUncertainty: false,
       imageMax: normalizedImageMax,
+      cellPx,
+      selectedColorAxisId: selectedColorAxisId || '',
     }
     const nextJson = JSON.stringify(snapshot)
     if (nextJson !== lastViewStateSnapshot) {
@@ -1460,10 +1515,10 @@
     if (griddingActive && inside) return true
     return sampledIds.has(id)
   }
-  function renderThumbSizePx(id, inside) {
-    const base = inside ? sizeInside : sizeOutside
-    if (!subsampleActive) return Math.max(6, Math.floor(base))
-    if (!showsImageThumb(id, inside)) return subsampleDotPx
+  function renderThumbSizePx(id, inside, insidePx = sizeInside, outsidePx = sizeOutside, dotPx = subsampleDotPx, subsampled = subsampleActive) {
+    const base = inside ? insidePx : outsidePx
+    if (!subsampled) return Math.max(6, Math.floor(base))
+    if (!showsImageThumb(id, inside)) return dotPx
     if (inside) return Math.max(8, Math.floor(base))
     return Math.max(8, Math.floor(base * 0.72))
   }
@@ -1478,18 +1533,24 @@
   })()
 
   // Precompute inside ids set (using original positions and fixed gridRect captured on click)
-  $: insideIds = (!griddingActive || !gridRect)
-    ? new Set()
-    : new Set(itemsFiltered.filter((it) => {
+  $: insideIds = (() => {
+    touch(scatterLayoutDeps)
+    if (!griddingActive || !gridRect) return new Set()
+    return new Set(itemsFiltered.filter((it) => {
       const p = posOriginal(it)
       const margin = Number(gridRect.margin || 0)
       return p.x >= (gridRect.x0 - margin) && p.x <= (gridRect.x1 + margin) && (1 - p.y) >= (gridRect.y0 - margin) && (1 - p.y) <= (gridRect.y1 + margin)
     }).map((it) => it.id))
+  })()
 
-  $: localPacked = computeLocalPacked(itemsFiltered, (griddingActive && gridRect) ? gridRect : null, sizeInside, spacingScale, width, height)
+  $: localPacked = (() => {
+    touch(scatterLayoutDeps)
+    return computeLocalPacked(itemsFiltered, (griddingActive && gridRect) ? gridRect : null, sizeInside, spacingScale, width, height)
+  })()
 
   // Compute animation targets and renderItems
   $: {
+    touch(scatterLayoutDeps)
     const nextTargets = new Map(); const m = new Map(); let anyChange = false
     for (const it of renderSourceItems) {
       const p = posOriginal(it)
@@ -1662,6 +1723,9 @@
   }
   function clearX() { applyAxesChoice(null, selectedY) }
   function clearY() { applyAxesChoice(selectedX, null) }
+  function adjustThumbSize(delta) {
+    cellPx = clamp(Math.round(Number(cellPx || 16) + Number(delta || 0)), MIN_CELL_PX, MAX_CELL_PX)
+  }
 
   // Selections provided by parent and top-center filtering controls
   export let selectionToolsEnabled = true
@@ -1854,8 +1918,9 @@
     {#each renderItemsVisible as it (it.id)}
       {@const inside = griddingActive && insideIds.has(it.id)}
       {@const showThumb = showsImageThumb(it.id, inside)}
-      {@const thumbPx = renderThumbSizePx(it.id, inside)}
+      {@const thumbPx = renderThumbSizePx(it.id, inside, sizeInside, sizeOutside, subsampleDotPx, subsampleActive)}
       {@const subsetSelected = lassoEnabled && subsetSelectionSet.has(String(it.id || ''))}
+      {@const metadataColor = metadataColorForId(it.id)}
       {#if showThumb}
         <img
           alt=""
@@ -1872,6 +1937,8 @@
                   z-index:${isSliceFilteredOut(it.id) ? 0 : (inside ? 10 : 1)}; 
                   opacity:${isSliceFilteredOut(it.id) ? 0.22 : (inside ? 1 : 0.85)}; 
                   filter:${isSliceFilteredOut(it.id) ? 'grayscale(1) saturate(0.12) brightness(1.06)' : 'none'};
+                  outline:${metadataColor ? `2px solid ${metadataColor.outlineColor}` : 'none'};
+                  outline-offset:${metadataColor ? '1px' : '0'};
                   border:${labelOf(it.id)?'2px solid '+(labelOf(it.id)==='pos'?'#16a34a':'#dc2626'):(subsetSelected ? '2px solid #2563eb' : 'none')}; 
                   box-shadow:${labelOf(it.id)?'0 0 0 1px rgba(255,255,255,0.8)':(subsetSelected ? '0 0 0 1px rgba(255,255,255,0.92)' : 'none')};`}
         />
@@ -1886,7 +1953,8 @@
                   height:${thumbPx}px;
                   z-index:${isSliceFilteredOut(it.id) ? 0 : 1};
                   opacity:${isSliceFilteredOut(it.id) ? 0.22 : 0.8};
-                  box-shadow:${subsetSelected ? '0 0 0 2px rgba(37,99,235,0.9)' : '0 0 0 1px rgba(255, 255, 255, 0.55)'};`}
+                  background:${metadataColor ? metadataColor.pointColorMuted : '#8f97aa'};
+                  box-shadow:${subsetSelected ? '0 0 0 2px rgba(37,99,235,0.9)' : (metadataColor ? `0 0 0 1px ${metadataColor.outlineColor}` : '0 0 0 1px rgba(255, 255, 255, 0.55)')};`}
         />
       {/if}
     {/each}
@@ -2026,6 +2094,38 @@
         on:input={(e)=>{ imageMax = Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)) }}
       />
     </label>
+    <div class="minimap-tool-size" title="Thumbnail size">
+      <span>size</span>
+      <button
+        type="button"
+        class="btn btn-minimap minimap-size-step"
+        on:click|stopPropagation|preventDefault={() => adjustThumbSize(-CELL_PX_STEP)}
+        aria-label="Decrease thumbnail size"
+        title="Decrease thumbnail size"
+      >-</button>
+      <span class="minimap-tool-size-value">{cellPx}</span>
+      <button
+        type="button"
+        class="btn btn-minimap minimap-size-step"
+        on:click|stopPropagation|preventDefault={() => adjustThumbSize(CELL_PX_STEP)}
+        aria-label="Increase thumbnail size"
+        title="Increase thumbnail size"
+      >+</button>
+    </div>
+    <label class="minimap-tool-color" title="Color thumbnails and scatter points by metadata axis">
+      <span>color</span>
+      <select
+        class="axis-inline-select minimap-tool-select"
+        on:click|stopPropagation
+        on:mousedown|stopPropagation
+        on:change={(e) => { selectedColorAxisId = String(e.currentTarget.value || '').trim() || null }}
+      >
+        <option value="" selected={!selectedColorAxisId}>none</option>
+        {#each metadataAxes as ax}
+          <option value={ax.id} selected={selectedColorAxisId===ax.id}>{ax.name}</option>
+        {/each}
+      </select>
+    </label>
     <button
       type="button"
       class="btn btn-icon btn-minimap minimap-tool-btn"
@@ -2040,22 +2140,18 @@
   <!-- Axis categorical labels when metadata axes are selected -->
   {#if selectedY && (selectedY.startsWith('axis:meta:'))}
     {#await Promise.resolve(axisTicks(selectedY)) then t}
-      {#if t.labels.length === t.pos.length && t.labels.length > 0}
-        {#each t.labels as lab, i}
-          {#if typeof t.pos[i] === 'number'}
-            <div class="axis-label y-meta" style={`position:absolute;left:60px;top:${(1 - toVisY(t.pos[i])) * 100}%;transform:translateY(-50%);pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{lab}</div>
-          {/if}
+      {#if t.entries.length > 0}
+        {#each t.entries as entry (entry.key)}
+          <div class="axis-label y-meta" style={`position:absolute;left:60px;top:${(1 - toVisY(entry.pos)) * 100}%;transform:translateY(-50%);pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{entry.label}</div>
         {/each}
       {/if}
     {/await}
   {/if}
   {#if selectedX && (selectedX.startsWith('axis:meta:'))}
     {#await Promise.resolve(axisTicks(selectedX)) then t}
-      {#if t.labels.length === t.pos.length && t.labels.length > 0}
-        {#each t.labels as lab, i}
-          {#if typeof t.pos[i] === 'number'}
-            <div class="axis-label x-meta" style={`position:absolute;bottom:80px;left:${toVisX(t.pos[i]) * 100}%;transform:translateX(-50%) rotate(-90deg);transform-origin:center;pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{lab}</div>
-          {/if}
+      {#if t.entries.length > 0}
+        {#each t.entries as entry (entry.key)}
+          <div class="axis-label x-meta" style={`position:absolute;bottom:80px;left:${toVisX(entry.pos) * 100}%;transform:translateX(-50%) rotate(-90deg);transform-origin:center;pointer-events:none;font-size:11px;color:#334155;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:4px;z-index:15;`}>{entry.label}</div>
         {/each}
       {/if}
     {/await}
@@ -2086,7 +2182,7 @@
   <div
     class="axis-edge axis-edge-y text-sm"
     role="group"
-    style={`left:${axisFrameLeftPx - 10}px;top:${axisFrameCenterYPx}px;`}
+    style={`left:${axisFrameLeftPx + Y_AXIS_EDGE_NUDGE_PX}px;top:${axisFrameCenterYPx}px;`}
     on:dragover={allowDrop}
     on:drop={onDropY}
     title="Drop a Y axis here"
@@ -2434,6 +2530,44 @@
     height: 26px;
     font-size: 11px;
     padding: 0 4px;
+  }
+
+  .minimap-tool-size {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: #334155;
+    font-size: 11px;
+  }
+
+  .minimap-tool-color {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #334155;
+    font-size: 11px;
+  }
+
+  .minimap-tool-select {
+    min-width: 124px;
+    max-width: 180px;
+    height: 28px;
+  }
+
+  .minimap-tool-size-value {
+    min-width: 20px;
+    text-align: center;
+    color: #475569;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .minimap-size-step {
+    min-width: 24px;
+    height: 24px;
+    padding: 0;
+    border-color: #cbd5e1;
+    font-size: 14px;
+    line-height: 1;
   }
 
 </style>

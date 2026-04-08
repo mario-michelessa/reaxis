@@ -1,7 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte'
 
-  export let systemName = 'ReQuest'
+  export let systemName = 'Reaxis'
   export let busy = false
   export let error = ''
 
