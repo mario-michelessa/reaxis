@@ -49,6 +49,7 @@ MAX_VALUE_COUNT = 9
 DATASET_LLM_CONTEXT: dict[str, str] = {
     'CUB': 'Photos of birds spanning many species, poses, plumage patterns, and natural backgrounds.',
     'EmoSet': 'Images labeled by emotion, including people, objects, scenes, and symbolic visuals designed to evoke feelings.',
+    'AffectNet': 'Face images labeled by expression, with local metadata exposing emotion-derived valence and arousal proxy axes.',
     'HAM10000': 'Dermoscopy close-ups of skin lesions with diagnosis-relevant color, border, and texture variation.',
     'HubbleStars': 'Hubble astronomy images focused on stars, stellar clusters, nebulae, and bright celestial structures.',
     'ISIC2017': 'Dermoscopy images of skin lesions used for melanoma-related visual assessment.',
@@ -57,6 +58,15 @@ DATASET_LLM_CONTEXT: dict[str, str] = {
     'ImageNet_R': 'Artistic, rendered, or stylized depictions of ImageNet object classes rather than plain natural photos.',
     'ImageNet_n029583': 'A single ImageNet object class collection, so useful axes should focus on within-class visual variation.',
     'Imagenette1500': 'Natural photos from ten broad object classes in the Imagenette subset.',
+    'KonIQ10k': 'In-the-wild photographs with mean opinion scores for perceptual image quality.',
+    'SCUTFBP5500': 'Face photographs with attractiveness scores and demographic group metadata from SCUT-FBP5500.',
+    'ISIC2024': 'Dermoscopy images with continuous lesion geometry, asymmetry, border, color, and position features.',
+    'Messidor2': 'Retinal fundus images with diabetic retinopathy severity grades from benign to severe.',
+    'VinDrMammo': 'Mammography images with BI-RADS assessment, breast density, and finding-region metadata.',
+    'AADB': 'General photographs with aesthetic score and composition, light, color, and depth-of-field ratings.',
+    'LaMem': 'General image memorability dataset with continuous memorability scores.',
+    'OASIS': 'Emotion-evoking images with valence, arousal, and beauty ratings.',
+    'HousePrices': 'House view images paired with sale price, square footage, bedrooms, bathrooms, and view type.',
     'MapillaryVistas': 'Street-scene photos with roads, cars, signs, buildings, sidewalks, and urban outdoor layouts.',
     'VIS30K': 'Visualization images such as charts, diagrams, plots, maps, and other designed graphics.',
     'VIS30KGUI': 'Information visualization and interface images, including charts, dashboards, and GUI-like visual designs.',
@@ -75,6 +85,7 @@ DATASET_LLM_CONTEXT: dict[str, str] = {
     'qajar_carpets': 'Images of Qajar carpets with variation in motifs, symmetry, palette, and ornamental density.',
     'sinhala_brahmi_inscriptions': 'Photos of Sinhala Brahmi inscriptions carved into stone with variation in script, wear, and contrast.',
     'stars_hubble': 'Hubble astronomy images focused on stars, stellar clusters, nebulae, and bright celestial structures.',
+    'UTKFace': 'Face images labeled by age, with variation in apparent age, gender, identity, pose, and capture conditions.',
 }
 
 # Zero-shot regressor defaults.

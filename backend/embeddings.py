@@ -39,6 +39,24 @@ def embedding_cache_filename(method: str, normalize: bool = True) -> str:
         return f'embeddings_{cache_method}_raw.npz'
     return f'embeddings_{cache_method}.npz'
 
+def pooled_feature_tensor(features: Any, preferred_attrs: Sequence[str]):
+    if hasattr(features, 'norm'):
+        return features
+    for attr in preferred_attrs:
+        value = getattr(features, attr, None)
+        if value is not None:
+            return value
+    pooled = getattr(features, 'pooler_output', None)
+    if pooled is not None:
+        return pooled
+    hidden = getattr(features, 'last_hidden_state', None)
+    if hidden is not None:
+        return hidden[:, 0] if getattr(hidden, 'ndim', 0) >= 3 else hidden
+    if isinstance(features, (list, tuple)) and features:
+        first = features[0]
+        return first[:, 0] if getattr(first, 'ndim', 0) >= 3 else first
+    raise TypeError(f'Could not extract pooled feature tensor from {type(features).__name__}')
+
 def split_emb(emb, n_parts=4):
     """Split embeddings into n_parts parts."""
     size = emb.shape[2]
@@ -89,6 +107,7 @@ class CLIPEmbeddingExtractor:
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_image_features(**inputs)
+        feats = pooled_feature_tensor(feats, ('image_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
@@ -100,6 +119,7 @@ class CLIPEmbeddingExtractor:
         inputs = self.processor(images=list(images), return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_image_features(**inputs)
+        feats = pooled_feature_tensor(feats, ('image_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.detach().cpu().numpy().astype("float32")
@@ -111,6 +131,7 @@ class CLIPEmbeddingExtractor:
         inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
         with torch.no_grad():
             feats = self.model.get_text_features(**inputs)
+        feats = pooled_feature_tensor(feats, ('text_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
@@ -161,6 +182,7 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._image_feature_args)
         with torch.no_grad():
             feats = self.model.get_image_features(**payload)
+        feats = pooled_feature_tensor(feats, ('image_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
@@ -173,6 +195,7 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._image_feature_args)
         with torch.no_grad():
             feats = self.model.get_image_features(**payload)
+        feats = pooled_feature_tensor(feats, ('image_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.detach().cpu().numpy().astype("float32")
@@ -185,6 +208,7 @@ class SigLIP2EmbeddingExtractor:
         payload = self._move_payload(inputs, self._text_feature_args)
         with torch.no_grad():
             feats = self.model.get_text_features(**payload)
+        feats = pooled_feature_tensor(feats, ('text_embeds',))
         if normalize:
             feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
         return feats.squeeze(0).detach().cpu().numpy().astype("float32")
