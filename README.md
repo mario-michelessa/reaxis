@@ -1,123 +1,111 @@
-# ReQuest
+# Reaxis
 
-Interactive UI for creating, refining, and reusing semantic axes over image collections.
+Reaxis allows to define and refine semantic axes over image collections. 
+The Svelte interface displays an image projection; the Flask backend serves prepared datasets, metadata, embedding layouts, language-model suggestions, and Bayesian axis updates.
 
-This README documents the current live UI. It intentionally excludes hidden or obsolete components.
+## Architecture
+
+```text
+frontend/                    Svelte 4 + Vite interface
+backend/                     Flask API, embeddings, AxisBayes, dataset importers
+backend/ordinal_study/       ordinal modeling and evaluation pipeline
+postprocessing/user_study/  offline user-study analysis and figure source
+scripts/                     small experiment launchers
+tests/                       backend unit tests
+data/README.md               dataset acquisition and preparation contract
+outputs/                     generated results; ignored
+```
+
+Runtime and analysis are deliberately separated. Nothing under `postprocessing/` is imported by the live backend.
+
+## Installation
+
+```bash
+conda env create -f environment.yml
+conda activate scaledit
+npm --prefix frontend ci
+cp .env.example .env
+```
+
+`make install` can be used to refresh Python development and frontend dependencies after the environment exists.
+
+## Configuration
+
+All machine-dependent roots and server settings are defined by environment variables read in [`backend/runtime_config.py`](backend/runtime_config.py). Direct Python commands and `make` load the same root `.env`; existing shell environment variables take precedence.
+
+| variable | default | purpose |
+| --- | --- | --- |
+| `REAXIS_DATA_ROOT` | `data` | parent for local runtime data |
+| `REAXIS_DATASETS_ROOT` | `data/datasets` | prepared UI datasets |
+| `REAXIS_SESSIONS_ROOT` | `data/sessions` | session logs and saved axes/views |
+| `REAXIS_UPLOADS_ROOT` | `data/uploads` | uploads when no active dataset exists |
+| `REAXIS_OUTPUT_ROOT` | `outputs` | generated analyses and exports |
+| `REAXIS_RAW_DATASETS_ROOT` | `data/raw` | manually downloaded source datasets |
+| `REAXIS_DATASYNTH_ROOT` | `data/raw` | alternate root for legacy local curated presets |
+| `REAXIS_DEFAULT_DATASET` | `ISIC2017` | backend dataset when no name is supplied |
+| `REAXIS_BACKEND_HOST` | `0.0.0.0` | Flask bind host |
+| `REAXIS_BACKEND_PORT` | `5001` | Flask port |
+| `REAXIS_FLASK_DEBUG` | `true` | Flask development debugger/reloader |
+| `REAXIS_LLM_PROVIDER` | `gemini_api` | `gemini_api` or `huggingface_local` |
+| `REAXIS_GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model identifier |
+| `REAXIS_GEMINI_API_KEY_FILE` | `data/secrets/gemini_api_key.txt` | ignored text file containing the API key |
+| `REAXIS_HF_MODEL_PATH` | empty | local Hugging Face model directory |
 
 ## Dataset Preparation
 
-Prepared datasets live under `data/datasets/` and are built with:
+Obtain a source dataset, prepare a flat UI dataset under `REAXIS_DATASETS_ROOT`, and precompute at least the CLIP embedding and PCA coordinate caches.
+
+Four curated sources can be downloaded directly by the importer:
 
 ```bash
-python backend/import_curated_dataset.py --preset <preset> --name <output> --limit 1500
-python backend/import_local_curated_datasets.py --only <dataset> [<dataset> ...]
+python -m backend.import_curated_dataset --list-presets
+python -m backend.import_curated_dataset \
+  --preset imagenette_160 \
+  --name Imagenette1500 \
+  --limit 1500 \
+  --methods clip \
+  --reduction pca
 ```
 
-Current local batch-prepared outputs include:
+The ordinal datasets are manual downloads because several require registration or impose non-redistribution terms:
 
-- `broden1_224`
-- `CUB`
-- `HAM10000`
-- `ImageNet_R`
-- `ImageNet_n02958343` (1307 images available in source)
-- `Imagenette1500`
-- `inat2021birds`
-- `MapillaryVistas`
+```bash
+python -m backend.import_ordinal_datasets --only utkface koniq10k
+python -m backend.import_expanded_ordinal_datasets --only scut aadb lamem oasis house
+```
 
-Each prepared dataset is flattened into a single folder and includes:
+Generate or repair the normalized layout caches and the raw CLIP axis cache with:
 
-- `metadata.csv`
-- `.cache/embeddings_color_rgb.npz`
-- `.cache/embeddings_siglip2.npz`
-- `.cache/embeddings_clip.npz`
-- `.cache/embeddings_dino.npz`
-- `.cache/coords_pca2d_color_rgb.npz`
-- `.cache/coords_pca2d_siglip2.npz`
-- `.cache/coords_pca2d_clip.npz`
-- `.cache/coords_pca2d_dino.npz`
+```bash
+python -m backend.precompute_embeddings /path/to/prepared-dataset \
+  --methods clip,siglip2 \
+  --reduction pca,umap
+python -m backend.precompute_embeddings /path/to/prepared-dataset \
+  --methods clip \
+  --raw
+```
 
-Notes:
+Validate configuration and cache availability without starting the service:
 
-- `siglip2` is now the default semantic feature space in the backend and frontend. Older datasets that only have `clip` caches still load through a compatibility fallback until they are backfilled.
-- Large source images are resized during import instead of being dropped when they exceed the configured source-pixel ceiling.
-- `inat2021birds` carries taxonomy and observation metadata from the source JSON tables.
-- `MapillaryVistas` uses the `training` and `validation` image sets plus `v2.0` semantic masks; `testing` is excluded because it has no labels.
+```bash
+make doctor
+```
 
-## UI Interactions
+## Run the Interface
 
-### Global Workspace
+Start Flask and Vite together:
 
-- Change the active dataset from the `Dataset` dropdown in the top bar.
-- Open the saved-axis drawer from the hamburger menu in the top-right corner.
-- Load a saved axis from the drawer into the current dataset by clicking its row.
-- Delete a saved axis from the drawer with the red close button.
-- Resize the left sidebar by dragging the vertical divider between the sidebar and the visualization panel.
+```bash
+conda activate scaledit
+make dev
+```
 
-### Axes Creation Panel
+## Ordinal Modeling Study
 
-- Enter a free-form visualization request in the prompt box.
-- Click the `Analyze` button to run the LLM and extract candidate attributes.
-- Hover a suggested attribute chip to highlight the prompt words that supported that attribute.
-- Select or deselect suggested attribute chips by clicking them.
-- Rename a suggested attribute inline with the edit button on the chip.
-- Create axes from the currently selected suggested attributes with the add button at the bottom-right of the suggestion area.
-- Add a custom axis directly from the manual text input in the `Axes` section.
-- Clear all active histogram slices with the `Unslice` button when slices are active.
+See [`backend/ordinal_study/README.md`](backend/ordinal_study/README.md).
 
-### Axis Builder Cards
+Main entrypoint:
 
-Each created axis opens an axis-builder card with its own interactions.
-
-- Save the axis to the reusable axis library with the save button.
-- Assign the axis to the minimap `X` or `Y` coordinate with the `X` and `Y` buttons.
-- Remove the axis entirely with the red close button.
-- Inspect the negative anchor prompts from the left anchor button.
-- Inspect the positive anchor prompts from the right anchor button.
-- Edit either anchor-prompt list from its popup and save the edits to recompute the axis prior.
-- Hover a histogram bar to preview representative thumbnails for that value range.
-- Drag across the histogram to create a slice on that axis and immediately filter the minimap to that subset.
-- Double-click the histogram to clear that axis slice.
-- Drag a thumbnail from a rating bin to another bin to refine the axis with user feedback.
-- Drag a thumbnail onto the undefined cross to mark that image as undefined for this axis.
-- Click the undefined cross to open the undefined-image tooltip.
-- Drag an image back out of the undefined tooltip and drop it onto a rating bin to restore it to the axis.
-- Click any thumbnail in the builder or in the undefined tooltip to open the large image focus view in the visualization panel.
-
-### Visualization Panel
-
-- Pick the current `X` axis from the dropdown below the canvas.
-- Pick the current `Y` axis from the dropdown on the left side of the canvas.
-- Resize the minimap by dragging the small resize handle at the bottom-right corner of the panel.
-- Scroll on the canvas to zoom the visualization around the cursor.
-- Hold `Shift` and scroll to change the size of the local focus rectangle used for gridding.
-- Hover the canvas in select mode to preview the local focus rectangle.
-- Click the canvas in select mode to open a local gridded view around the hovered area.
-- Click outside the active grid to close the gridded view.
-- Click an image inside the gridded view to open the large image focus view.
-
-### Visualization Toolbox
-
-- Use `Select` mode to inspect the scatterplot and create the local gridded view.
-- Use `Grab` mode to drag an image directly in the visualization and turn that move into axis feedback.
-- Use `Lasso` mode to draw a free-form region over the current visible points.
-- After drawing a lasso, click `Isolate` to show only the selected images.
-- After drawing a lasso, click `Exclude` to hide the selected images.
-- Toggle `Density` to overlay a density map on top of the current scatterplot.
-- Toggle `Uncertainty` to replace the vertical coordinate with uncertainty values.
-- Change `max` to limit how many thumbnails are shown directly in the minimap before the rest are replaced by dots.
-- Click `Reset view` to restore the default zoom and close the current local grid.
-- Clear an active lasso subset or histogram-based subset from the `[Subset]` chip at the top of the minimap. This restores all images and resets the current view.
-
-### Image Focus View
-
-- Open the focus view by clicking an image inside the minimap grid or by clicking a thumbnail in an axis builder.
-- Inspect a larger version of the image in the focus backdrop.
-- Adjust any displayed axis slider to move the image along that axis and trigger a backend axis update when the slider is released.
-- Close the focus view with the close button or by clicking outside the panel.
-
-## Component Notes
-
-- The left panel is driven by `frontend/src/components/PromptSidebar.svelte`.
-- The per-axis refinement cards are implemented in `frontend/src/components/AxisBuilder.svelte`.
-- The visualization panel is implemented in `frontend/src/components/AxesMinimap.svelte`.
-- The main application shell is implemented in `frontend/src/App.svelte`.
+```bash
+python -m backend.run_ordinal_modeling_study --help
+```

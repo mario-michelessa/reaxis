@@ -16,8 +16,10 @@ from PIL import Image
 
 try:
     from .gallery_backend import ImageGalleryEngine
+    from .runtime_config import OUTPUT_ROOT
 except ImportError:
     from gallery_backend import ImageGalleryEngine
+    from runtime_config import OUTPUT_ROOT
 
 
 def _normalize_rows(x: np.ndarray) -> np.ndarray:
@@ -1217,7 +1219,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help='Fallback template as src:dst percent pairs (used if --moves-json is empty).')
     p.add_argument('--max-images', type=int, default=1500, help='Maximum images to include (0 = all).')
     p.add_argument('--batch-size', type=int, default=32, help='Batch size for model encoding.')
-    p.add_argument('--log-csv', type=str, default='backend/experiments/bayes_repr_compare.csv',
+    p.add_argument('--log-csv', type=str, default=str(OUTPUT_ROOT / 'bayes_repr_compare.csv'),
                    help='Append-only CSV path for all rows.')
     return p
 

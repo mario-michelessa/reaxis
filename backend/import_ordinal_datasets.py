@@ -12,6 +12,7 @@ try:
         precompute_ordinal_dataset,
         selected_specs,
     )
+    from .runtime_config import RAW_DATASETS_ROOT
 except ImportError:
     from ordinal_dataset_import import (
         import_ordinal_dataset,
@@ -19,6 +20,7 @@ except ImportError:
         precompute_ordinal_dataset,
         selected_specs,
     )
+    from runtime_config import RAW_DATASETS_ROOT
 
 
 DEFAULT_METHODS = 'clip'
@@ -34,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         description='Import local ordinal datasets into data/datasets/ for the Reaxis UI and ordinal study.'
     )
     parser.add_argument('--only', nargs='*', default=[], help='Optional dataset keys: utkface, affectnet, koniq10k.')
-    parser.add_argument('--local-root', default='/mnt/raid/mario/datasets', help='Root containing raw dataset folders.')
+    parser.add_argument('--local-root', default=str(RAW_DATASETS_ROOT), help='Root containing raw dataset folders.')
     parser.add_argument('--limit', type=int, default=DEFAULT_LIMIT, help='Maximum images per imported dataset; <=0 keeps all.')
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Sampling seed.')
     parser.add_argument('--max-edge', type=int, default=DEFAULT_MAX_EDGE, help='Prepared image maximum edge length.')

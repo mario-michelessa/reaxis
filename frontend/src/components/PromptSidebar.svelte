@@ -11,6 +11,7 @@
   export let selectedX = null
   export let selectedY = null
   export let apiBase = resolveApiBase()
+  export let sessionName = ''
   export let dataset = ''
   export let externalSlices = []
   export let subsetIds = []
@@ -969,6 +970,7 @@
       const axisDebug = axisDebugRequest()
       for (const target of targets) {
         const data = await postJson('/axis/create', {
+          session: sessionName,
           collection_id: dataset || undefined,
           dataset: dataset || undefined,
           q: target.query,
@@ -1015,6 +1017,7 @@
     const current = (axisBuilders || []).find((entry) => entry?.axisId === axisId)
     try {
       const data = await postJson('/axis/move', {
+        session: sessionName,
         axis_id: axisId,
         image_id: imageId,
         new_score_0_100: newScore0To100,
@@ -1067,6 +1070,7 @@
     promptUpdatingAxisId = axisId
     try {
       const data = await postJson('/axis/update_prompts', {
+        session: sessionName,
         axis_id: axisId,
         pos_prompts: posPrompts,
         neg_prompts: negPrompts,

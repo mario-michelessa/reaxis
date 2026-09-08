@@ -19,15 +19,16 @@ except ImportError as exc:
 
 try:
     from .gallery_backend import ImageGalleryEngine
+    from .runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 except ImportError:
     from gallery_backend import ImageGalleryEngine
+    from runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 
 
 # =============================
 # Tunables (no argparse needed)
 # =============================
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DATASET_ROOT = REPO_ROOT / 'data' / 'datasets' / 'EmoSet'
+DATASET_ROOT = DATASETS_ROOT / 'EmoSet'
 CSV_LOG_PATH: Optional[Path] = None
 
 CLIP_MODEL_NAME = 'openai/clip-vit-base-patch32'  # or local path
@@ -131,7 +132,7 @@ def normalize_mode(mode: str) -> str:
 
 def default_csv_log_path(mode: str) -> Path:
     mode_name = normalize_mode(mode)
-    return REPO_ROOT / 'backend' / 'experiments' / f'emoset_optuna_{mode_name}.csv'
+    return OUTPUT_ROOT / 'sweeps' / f'emoset_optuna_{mode_name}.csv'
 
 
 def quantile_from_sorted(z_sorted: np.ndarray, p01: float) -> float:

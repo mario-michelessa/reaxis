@@ -27,14 +27,15 @@ try:
     from .gallery_backend import ImageGalleryEngine
     from .embeddings import embedding_cache_filename
     from .reduction_cache import coords_cache_filename, parse_reduction_methods
+    from .runtime_config import DATASETS_ROOT, RAW_DATASETS_ROOT
 except ImportError:
     from gallery_backend import ImageGalleryEngine
     from embeddings import embedding_cache_filename
     from reduction_cache import coords_cache_filename, parse_reduction_methods
+    from runtime_config import DATASETS_ROOT, RAW_DATASETS_ROOT
 
 
-DATASETS_ROOT = (Path(__file__).resolve().parent.parent / 'data' / 'datasets').resolve()
-DEFAULT_LOCAL_ROOT = Path('/mnt/raid/mario/datasets')
+DEFAULT_LOCAL_ROOT = RAW_DATASETS_ROOT
 DEFAULT_METHODS = ('color_rgb', 'siglip2', 'clip', 'dino')
 DEFAULT_REDUCTION = 'all'
 DEFAULT_MAX_EDGE = 512
@@ -330,8 +331,8 @@ def value_to_string(value: Any, feature: Any = None) -> str:
         try:
             if isinstance(value, int):
                 return feature.int2str(value)
-        except Exception:
-            pass
+        except (IndexError, ValueError):
+            return str(value)
     if isinstance(value, (str, int, float, bool)):
         return str(value)
     if isinstance(value, Path):
@@ -662,7 +663,7 @@ def load_simple_xlsx_rows(xlsx_path: Path) -> List[Dict[str, str]]:
                     try:
                         text = shared_strings[int(text)]
                     except (IndexError, ValueError):
-                        pass
+                        text = ''
                 cells[idx] = text
             if cells:
                 rows_raw.append(cells)

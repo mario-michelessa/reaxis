@@ -176,8 +176,8 @@ def render_thumbnail(image_path: str, cell_w: int, cell_h: int) -> Image.Image:
                 color=(245, 245, 245),
             )
             thumb.paste(fitted, (0, 0))
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        return thumb
     return thumb
 
 

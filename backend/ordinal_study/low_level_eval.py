@@ -16,7 +16,7 @@ except ImportError:
     from gallery_backend import ImageGalleryEngine
 
 from .baselines import ClipTextEmbedder, METHOD_SUPPORTS_FEEDBACK, make_session
-from .config import BUDGETS, DATASETS_ROOT, GLOBAL_SEED, REPETITIONS, REPO_ROOT
+from .config import BUDGETS, DATASETS_ROOT, GLOBAL_SEED, OUTPUT_ROOT, REPETITIONS
 from .data import OrdinalTask, _load_clip_embeddings, _load_metadata
 from .fixed_reaxis import labeled_rank_mae, pairwise_agreement, validate_target_mode
 from .io import CSVAppender, read_completed_metric_keys, utc_now_iso, write_json
@@ -25,7 +25,7 @@ from .low_level_reports import export_low_level_reports
 from .metrics import compute_metrics, spearman_corr
 
 
-LOW_LEVEL_OUTPUT_DIR = REPO_ROOT / 'backend' / 'experiments' / 'low_level_ordinal'
+LOW_LEVEL_OUTPUT_DIR = OUTPUT_ROOT / 'low_level_ordinal'
 LOW_LEVEL_METHODS = (
     'text_prior',
     'prompt_ladder',

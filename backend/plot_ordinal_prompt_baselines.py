@@ -7,14 +7,14 @@ from pathlib import Path
 
 try:
     from .ordinal_study.combined_prompt_plot import export_prompt_baseline_plot
-    from .ordinal_study.config import OUTPUT_DIR, REPO_ROOT
+    from .ordinal_study.config import OUTPUT_DIR
 except ImportError:
     from ordinal_study.combined_prompt_plot import export_prompt_baseline_plot
-    from ordinal_study.config import OUTPUT_DIR, REPO_ROOT
+    from ordinal_study.config import OUTPUT_DIR
 
 
 def build_parser() -> argparse.ArgumentParser:
-    diagnostics_dir = REPO_ROOT / 'backend' / 'experiments' / 'ordinal_modeling_diagnostics'
+    diagnostics_dir = OUTPUT_DIR.parent / 'ordinal_modeling_diagnostics'
     parser = argparse.ArgumentParser(description='Plot ordinal prompt-initialization variants with baselines.')
     parser.add_argument('--diagnostics-dir', default=str(diagnostics_dir))
     parser.add_argument('--baseline-dir', default=str(OUTPUT_DIR))

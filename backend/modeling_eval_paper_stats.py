@@ -9,10 +9,13 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
+try:
+    from .runtime_config import OUTPUT_ROOT
+except ImportError:
+    from runtime_config import OUTPUT_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-MODELING_DIR = REPO_ROOT / 'backend' / 'experiments' / 'modeling_eval'
-OUTPUT_PATH = REPO_ROOT / 'backend' / 'figures' / 'modeling_eval_paper_stats.json'
+MODELING_DIR = OUTPUT_ROOT / 'modeling_eval'
+OUTPUT_PATH = OUTPUT_ROOT / 'modeling_eval' / 'modeling_eval_paper_stats.json'
 
 TARGET_METHOD = 'request_bayes_linear_gaussian'
 BASELINE_METHODS = [
@@ -193,7 +196,7 @@ def build_report(modeling_dir: Path, run_id: str) -> Dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Summarize modeling-study results for the paper.')
-    parser.add_argument('--run-id', default='', help='Optional run id. Defaults to the latest run in backend/experiments/modeling_eval.')
+    parser.add_argument('--run-id', default='', help='Optional run id. Defaults to the latest run in REAXIS_OUTPUT_ROOT/modeling_eval.')
     parser.add_argument('--output', default=str(OUTPUT_PATH), help='Where to write the JSON summary.')
     args = parser.parse_args()
 

@@ -10,7 +10,7 @@ editable in one place:
 - sections (prior, refinement, uncertainty, undefined, ablations) can be
   turned on/off with booleans below
 
-Outputs are append-only CSV files written under backend/experiments/modeling_eval.
+Outputs are append-only CSV files written under REAXIS_OUTPUT_ROOT/modeling_eval.
 The script logs rows incrementally so long runs still leave usable partial data.
 """
 
@@ -68,6 +68,7 @@ try:
     )
     from .gallery_backend import ImageGalleryEngine
     from .modeling_eval_prompt_cache import hydrate_prompt_cache
+    from .runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 except ImportError:
     from axis_bayes import AxisBayesEngine, CollectionCache
     from constants import (
@@ -108,13 +109,13 @@ except ImportError:
     )
     from gallery_backend import ImageGalleryEngine
     from modeling_eval_prompt_cache import hydrate_prompt_cache
+    from runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 
 
 # =============================
 # Top-level run configuration
 # =============================
-REPO_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = REPO_ROOT / 'backend' / 'experiments' / 'modeling_eval'
+OUTPUT_DIR = OUTPUT_ROOT / 'modeling_eval'
 CACHE_DIR = OUTPUT_DIR / 'cache'
 
 RUN_NAME = 'modeling_eval_v1'
@@ -276,7 +277,7 @@ class MethodSpec:
 DATASET_REGISTRY: Dict[str, DatasetSpec] = {
     'EmoSet': DatasetSpec(
         name='EmoSet',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'EmoSet',
+        dataset_root=DATASETS_ROOT / 'EmoSet',
         concepts=(
             ConceptSpec(kind='metadata_one_vs_rest', name='emotion', field='emotion', query_prefix='emotion', min_count=1, max_values=8),
             ConceptSpec(kind='derived_metric', name='brightness', undefined_band=DEFAULT_UNDEFINED_BAND),
@@ -286,7 +287,7 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
     ),
     'paintings_wikiart': DatasetSpec(
         name='paintings_wikiart',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'paintings_wikiart',
+        dataset_root=DATASETS_ROOT / 'paintings_wikiart',
         concepts=(
             ConceptSpec(kind='metadata_one_vs_rest', name='genre', field='genre', query_prefix='genre', min_count=30, exclude_values=('Unknown Genre',)),
             ConceptSpec(kind='metadata_one_vs_rest', name='style', field='style', query_prefix='style', min_count=20),
@@ -297,28 +298,28 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
     ),
     'celeba_dataset': DatasetSpec(
         name='celeba_dataset',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'celeba_dataset',
+        dataset_root=DATASETS_ROOT / 'celeba_dataset',
         concepts=(
             ConceptSpec(kind='metadata_binary_prefix', name='face_attribute', field_prefix='attr_', min_count=1),
         ),
     ),
     'chest_xray_pneumonia': DatasetSpec(
         name='chest_xray_pneumonia',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'chest_xray_pneumonia',
+        dataset_root=DATASETS_ROOT / 'chest_xray_pneumonia',
         concepts=(
             ConceptSpec(kind='metadata_binary_value', name='pneumonia', field='label', positive_values=('PNEUMONIA',), min_count=1),
         ),
     ),
     'brain_mri_images': DatasetSpec(
         name='brain_mri_images',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'brain_mri_images',
+        dataset_root=DATASETS_ROOT / 'brain_mri_images',
         concepts=(
             ConceptSpec(kind='metadata_binary_value', name='tumor', field='label', positive_values=('yes',), min_count=1),
         ),
     ),
     'HAM10000': DatasetSpec(
         name='HAM10000',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'HAM10000',
+        dataset_root=DATASETS_ROOT / 'HAM10000',
         concepts=(
             ConceptSpec(
                 kind='metadata_one_vs_rest',
@@ -2644,8 +2645,8 @@ def export_modeling_eval_figures(run_id: str, *, output_dir: Path = OUTPUT_DIR) 
                     px = int((cell_w - img.width) * 0.5)
                     py = int((cell_h - img.height) * 0.5)
                     thumb.paste(img, (px, py))
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                print(f'[modeling-eval] thumbnail unavailable path={item["image_path"]}: {exc}')
             canvas.paste(thumb, (x0, y0))
             caption = f"{int(item['example_slot'])}: {float(item['reference_score']):.2f}"
             draw.text((x0 + 4, y0 + cell_h + 4), caption, fill=(20, 20, 20))

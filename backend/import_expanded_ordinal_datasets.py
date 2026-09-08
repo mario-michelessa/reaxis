@@ -12,6 +12,7 @@ try:
         selected_specs,
     )
     from .import_curated_dataset import log
+    from .runtime_config import RAW_DATASETS_ROOT
 except ImportError:
     from ordinal_study.expanded_dataset_import import (
         import_expanded_dataset,
@@ -19,12 +20,13 @@ except ImportError:
         selected_specs,
     )
     from import_curated_dataset import log
+    from runtime_config import RAW_DATASETS_ROOT
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Import expanded ordinal datasets for UI and modeling.')
     parser.add_argument('--only', nargs='*', default=[], help='Optional keys: scut isic2024 messidor2 vindr aadb lamem oasis house.')
-    parser.add_argument('--local-root', default='/mnt/raid/mario/datasets', help='Root containing raw dataset folders.')
+    parser.add_argument('--local-root', default=str(RAW_DATASETS_ROOT), help='Root containing raw dataset folders.')
     parser.add_argument('--limit', type=int, default=1500, help='Maximum images per dataset; <=0 keeps all.')
     parser.add_argument('--seed', type=int, default=7, help='Deterministic sampling seed.')
     parser.add_argument('--max-edge', type=int, default=512, help='Prepared image maximum edge length.')

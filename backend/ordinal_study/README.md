@@ -75,19 +75,21 @@ Scalar-Gaussian ReAxis improves over the text prior but does not close the label
 | `python backend/run_ordinal_prompt_sweep.py ...` | prompt-initialization diagnostic sweep |
 | `python backend/plot_ordinal_prompt_baselines.py` | combined prompt/baseline Spearman plot |
 
-## Main Artifacts
+## Generated Artifacts
+
+The following are generated under `REAXIS_OUTPUT_ROOT` and are intentionally absent from a source-only clone:
 
 | file | contents |
 | --- | --- |
-| `backend/experiments/ordinal_modeling_diagnostics/ordinal_modeling_study_paper_section.md` | current paper-facing technical modeling-study draft |
-| `backend/experiments/ordinal_modeling_diagnostics/ordinal_all_methods_summary_for_paper.csv` | consolidated method/budget metrics |
-| `backend/experiments/ordinal_modeling_diagnostics/ordinal_all_methods_spearman_curve_for_paper.csv` | Spearman curve table used in the draft |
-| `backend/experiments/ordinal_modeling_diagnostics/ordinal_all_methods_b10_b20_for_paper.csv` | compact b10/b20 metric table |
-| `backend/experiments/ordinal_modeling_diagnostics/ordinal_best_reaxis_vs_label_only_for_paper.csv` | transition-regime comparison |
-| `backend/experiments/ordinal_modeling_expanded/metrics.csv` | expanded Gaussian ReAxis and original baselines |
-| `backend/experiments/ordinal_label_only_more/metrics.csv` | added label-only methods and `reaxis_pairwise` |
-| `backend/experiments/ordinal_modeling_expanded_log/metrics.csv` | log-target ablation |
-| `backend/experiments/ordinal_gaussian_sweep_top_full/ordinal_gaussian_sweep_results.csv` | full-metric tuned Gaussian run |
+| `ordinal_modeling_diagnostics/ordinal_modeling_study_paper_section.md` | current paper-facing technical modeling-study draft |
+| `ordinal_modeling_diagnostics/ordinal_all_methods_summary_for_paper.csv` | consolidated method/budget metrics |
+| `ordinal_modeling_diagnostics/ordinal_all_methods_spearman_curve_for_paper.csv` | Spearman curve table used in the draft |
+| `ordinal_modeling_diagnostics/ordinal_all_methods_b10_b20_for_paper.csv` | compact b10/b20 metric table |
+| `ordinal_modeling_diagnostics/ordinal_best_reaxis_vs_label_only_for_paper.csv` | transition-regime comparison |
+| `ordinal_modeling/metrics.csv` | expanded Gaussian ReAxis and original baselines |
+| `ordinal_label_only_more/metrics.csv` | added label-only methods and `reaxis_pairwise` |
+| `ordinal_modeling_expanded_log/metrics.csv` | log-target ablation |
+| `ordinal_gaussian_sweep_top_full/ordinal_gaussian_sweep_results.csv` | full-metric tuned Gaussian run |
 
 ## Interpretation Notes
 

@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
+try:
+    from ..runtime_config import DATASETS_ROOT, OUTPUT_ROOT
+except ImportError:
+    from runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DATASETS_ROOT = REPO_ROOT / 'data' / 'datasets'
-OUTPUT_DIR = REPO_ROOT / 'backend' / 'experiments' / 'ordinal_modeling'
+OUTPUT_DIR = OUTPUT_ROOT / 'ordinal_modeling'
 
 GLOBAL_SEED = 20260620
 BUDGETS = (0, 1, 3, 5, 10, 20)

@@ -37,7 +37,13 @@ class StubAxisBayesEngine(AxisBayesEngine):
     def _get_collection(self, dataset_root: str, collection_id: str) -> CollectionCache:
         return self._stub_collection
 
-    def _embed_prompt_ensemble(self, q: str):
+    def _embed_prompt_ensemble(
+        self,
+        q: str,
+        semantic_method: str,
+        norm: bool | None = None,
+        dataset_name: str = '',
+    ):
         return (
             self._stub_prompt.copy(),
             [f'high {q}'],
@@ -45,7 +51,16 @@ class StubAxisBayesEngine(AxisBayesEngine):
             {'source': 'test', 'provider': 'test'},
         )
 
-    def _embed_prompt_lists(self, pos_prompts, neg_prompts, *, source: str, provider: str):
+    def _embed_prompt_lists(
+        self,
+        pos_prompts,
+        neg_prompts,
+        *,
+        semantic_method: str,
+        norm: bool | None = None,
+        source: str,
+        provider: str,
+    ):
         pos_list = self._clean_prompt_list(pos_prompts)
         neg_list = self._clean_prompt_list(neg_prompts)
         axis_x = sum('x' in prompt.lower() or 'horizontal' in prompt.lower() for prompt in pos_list)
@@ -73,8 +88,11 @@ class AxisBayesPiecewiseTests(unittest.TestCase):
             collection_id='test-dataset',
             ids=ids,
             embeddings=X.astype(np.float32),
+            embedding_norms=np.linalg.norm(X, axis=1).astype(np.float32),
             id_to_index={image_id: idx for idx, image_id in enumerate(ids)},
             feature_space='clip',
+            semantic_method='clip',
+            norm=True,
             clip_dim=int(X.shape[1]),
             dino_dim=0,
             clip_scale=1.0,
@@ -248,6 +266,7 @@ class AxisBayesPiecewiseTests(unittest.TestCase):
         self.assertNotIn(image_id, exemplar_ids)
 
         blob = engine.serialize_axis(created['axis_id'])
+        self.assertEqual(blob['dataset_root'], 'test-dataset')
         restored = StubAxisBayesEngine(
             self._collection(coll.embeddings),
             prompt,

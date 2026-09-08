@@ -24,7 +24,13 @@ class StubResidualEngine(AxisBayesEngine):
         key = str(Path(dataset_root).resolve())
         return self._collections_by_root[key]
 
-    def _embed_prompt_ensemble(self, q: str):
+    def _embed_prompt_ensemble(
+        self,
+        q: str,
+        semantic_method: str,
+        norm: bool | None = None,
+        dataset_name: str = '',
+    ):
         return (
             self._stub_prompt.copy(),
             [f'high {q}'],
@@ -53,8 +59,11 @@ def _fused_collection(
         collection_id=Path(dataset_root).name,
         ids=ids,
         embeddings=fused,
+        embedding_norms=np.linalg.norm(fused, axis=1).astype(np.float32),
         id_to_index={image_id: idx for idx, image_id in enumerate(ids)},
         feature_space='clip_dino',
+        semantic_method='clip',
+        norm=True,
         clip_dim=int(clip.shape[1]),
         dino_dim=int(dino.shape[1]),
         clip_scale=clip_scale,

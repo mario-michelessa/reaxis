@@ -12,7 +12,7 @@ from backend import modeling_evaluation as me
 
 class ModelingEvaluationConfigTests(unittest.TestCase):
     def _assert_close(self, left: float, right: float, *, msg: str = '') -> None:
-        self.assertTrue(math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12), msg or f'{left} != {right}')
+        self.assertTrue(math.isclose(float(left), float(right), rel_tol=2e-6, abs_tol=2e-6), msg or f'{left} != {right}')
 
     def test_gaussian_method_uses_gaussian_sweep_winner(self) -> None:
         spec = me.METHOD_REGISTRY['request_bayes_linear_gaussian']

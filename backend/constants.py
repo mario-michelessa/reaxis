@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# Backend server runtime constants.
-BACKEND_HOST = '0.0.0.0'
-BACKEND_PORT = 5001
+try:
+    from .runtime_config import (
+        BACKEND_HOST,
+        BACKEND_PORT,
+        GEMINI_API_KEY_PATH,
+        GEMINI_MODEL_NAME,
+        HF_LOCAL_MODEL_PATH,
+        LLM_PROVIDER,
+    )
+except ImportError:
+    from runtime_config import (
+        BACKEND_HOST,
+        BACKEND_PORT,
+        GEMINI_API_KEY_PATH,
+        GEMINI_MODEL_NAME,
+        HF_LOCAL_MODEL_PATH,
+        LLM_PROVIDER,
+    )
 
 # Initial gallery projection shown by the UI when no explicit /gallery.json
 # `method` query is provided.
@@ -13,21 +28,15 @@ INITIAL_GALLERY_PROJECTION_METHOD = 'pca'  # 'pca' | 'umap' | 'tsne'
 # LLM provider configuration.
 # - huggingface_local: local model loaded from HF_LOCAL_MODEL_PATH
 # - gemini_api: Google Gemini API using a locally stored API key file
-LLM_PROVIDER = 'gemini_api'
-
 # Gemini API configuration.
 # Keep the API key in an ignored local file, not in tracked source.
 # GEMINI_MODEL_NAME = 'gemma-3-27b'
-GEMINI_MODEL_NAME = 'gemini-2.5-flash-lite'
 # GEMINI_MODEL_NAME = 'gemini-2.5-flash'
 # GEMINI_MODEL_NAME = 'gemini-3-flash'
-GEMINI_API_KEY_PATH = 'data/secrets/gemini_api_key.txt'
 GEMINI_API_TIMEOUT_SEC = 45
 
 # Local Hugging Face LLM configuration.
-# You can hardcode a path here, e.g.:
-# HF_LOCAL_MODEL_PATH = "/models/Qwen2.5-3B-Instruct"
-HF_LOCAL_MODEL_PATH = '/mnt/raid/mario/models/llms-theory/Qwen/Qwen2.5-3B-Instruct'
+# Set REAXIS_HF_MODEL_PATH when LLM_PROVIDER is huggingface_local.
 HF_LOCAL_FILES_ONLY = True
 HF_TRUST_REMOTE_CODE = False
 HF_MAX_NEW_TOKENS = 256

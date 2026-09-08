@@ -1,0 +1,5 @@
+# Only needed for the local quantized LLM and legacy feature extractors.
+accelerate>=0.28
+bitsandbytes>=0.43
+diffusers>=0.27
+open-clip-torch>=2.24

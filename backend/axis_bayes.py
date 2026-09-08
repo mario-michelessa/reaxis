@@ -16,8 +16,8 @@ import torch.nn.functional as F
 torch.set_num_threads(1)
 try:
     torch.set_num_interop_threads(1)
-except Exception:
-    pass
+except RuntimeError as exc:
+    print(f'[axis-bayes] could not set PyTorch interop threads: {exc}')
 
 try:
     from .constants import (
@@ -2181,13 +2181,13 @@ class AxisBayesEngine:
         else:
             scoring_method = 'bayesian_ridge_refinement'
         semantic_embedding_file = embedding_cache_filename(state.semantic_method, normalize=state.norm)
-        semantic_embedding_path = str(Path(state.dataset_root) / '.cache' / semantic_embedding_file)
+        semantic_embedding_path = f'.cache/{semantic_embedding_file}'
         text_encoder = self._text_encoder_debug_info(state.semantic_method)
 
         return {
             'axis_id': state.axis_id,
             'collection_id': state.collection_id,
-            'dataset_root': state.dataset_root,
+            'dataset_root': Path(state.dataset_root).name,
             'q': state.q,
             'mode': mode_name,
             'model_type': str(state.model_type),
@@ -2640,7 +2640,7 @@ class AxisBayesEngine:
             'format_version': 2,
             'axis_id': state.axis_id,
             'collection_id': state.collection_id,
-            'dataset_root': state.dataset_root,
+            'dataset_root': Path(state.dataset_root).name,
             'q': state.q,
             'axis_name': state.axis_name,
             'model_type': state.model_type,
@@ -2805,7 +2805,12 @@ class AxisBayesEngine:
             raise KeyError(f'Unknown axis_id: {axis_id}')
         return self._serialize_state(state, fit=True)
 
-    def deserialize_axis(self, payload: Dict[str, Any]) -> AxisBayesState:
+    def deserialize_axis(
+        self,
+        payload: Dict[str, Any],
+        *,
+        dataset_root_override: Optional[str] = None,
+    ) -> AxisBayesState:
         """Load a serialized axis state back into memory. Missing newer fields fall back safely."""
         if not isinstance(payload, dict):
             raise ValueError('Serialized axis payload must be a dict')
@@ -2817,7 +2822,7 @@ class AxisBayesEngine:
         state = AxisBayesState(
             axis_id=str(payload.get('axis_id') or f'axis:restored:{uuid.uuid4().hex[:8]}'),
             collection_id=str(payload.get('collection_id') or ''),
-            dataset_root=str(payload.get('dataset_root') or ''),
+            dataset_root=str(dataset_root_override or payload.get('dataset_root') or ''),
             q=str(payload.get('q') or ''),
             axis_name=str(payload.get('axis_name') or payload.get('q') or 'Axis'),
             model_type=model_type,
@@ -2910,9 +2915,16 @@ class AxisBayesEngine:
 
         source_root = str(payload.get('dataset_root') or '').strip()
         source_ids = [str(v) for v in (payload.get('ids') or [])]
+        source_path = Path(source_root).expanduser() if source_root else None
+        source_matches_target = bool(
+            source_path
+            and (
+                (source_path.is_absolute() and source_path.resolve() == Path(target_root).resolve())
+                or (not source_path.is_absolute() and source_path.name == Path(target_root).name)
+            )
+        )
         same_collection = (
-            source_root
-            and Path(source_root).resolve() == Path(target_root).resolve()
+            source_matches_target
             and source_ids == list(coll.ids)
         )
 
@@ -2922,7 +2934,7 @@ class AxisBayesEngine:
         mode_name = _normalize_mode(payload.get('mode') or self.mode)
 
         if same_collection:
-            restored = self.deserialize_axis(payload)
+            restored = self.deserialize_axis(payload, dataset_root_override=target_root)
             old_axis_id = str(restored.axis_id)
             self._axes.pop(old_axis_id, None)
             restored.axis_id = f'axis:bayes:{_slugify(restored.q or requested_name)}:{uuid.uuid4().hex[:8]}'

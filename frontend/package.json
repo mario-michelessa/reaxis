@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview",
-    "postbuild": "cp -R dist/* /var/www/mario-server/ && sudo chown -R www-data:www-data /var/www/mario-server/ && sudo chmod -R 755 /var/www/mario-server/"
+    "preview": "vite preview"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^2.4.6",

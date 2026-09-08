@@ -17,10 +17,13 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+try:
+    from .runtime_config import OUTPUT_ROOT, REPO_ROOT
+except ImportError:
+    from runtime_config import OUTPUT_ROOT, REPO_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-MODELING_DIR = REPO_ROOT / 'backend' / 'experiments' / 'modeling_eval'
-DEFAULT_OUTPUT_DIR = REPO_ROOT / 'backend' / 'figures' / 'modeling_eval_paper'
+MODELING_DIR = OUTPUT_ROOT / 'modeling_eval'
+DEFAULT_OUTPUT_DIR = OUTPUT_ROOT / 'modeling_eval_paper'
 DEFAULT_BUMP_CONFIG = REPO_ROOT / 'backend' / 'modeling_eval_paper_bump_config.json'
 
 METHOD_ORDER = [

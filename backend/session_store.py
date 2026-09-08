@@ -11,6 +11,7 @@ AXES_FILENAME = 'axes.json'
 VISUALIZATIONS_FILENAME = 'visualizations.json'
 SUBSETS_FILENAME = 'subsets.json'
 ACTIVITY_LOG_FILENAME = 'activity.txt'
+AXIS_PROJECTION_SNAPSHOTS_FILENAME = 'axis_projection_snapshots.jsonl'
 MAX_SESSION_NAME_LENGTH = 80
 
 _INVALID_SESSION_CHARS = re.compile(r'[^A-Za-z0-9._ -]+')
@@ -56,6 +57,10 @@ def session_activity_log_path(root: Path, session_name: object) -> Path:
     return session_dir(root, session_name) / ACTIVITY_LOG_FILENAME
 
 
+def session_axis_projection_snapshots_path(root: Path, session_name: object) -> Path:
+    return session_dir(root, session_name) / AXIS_PROJECTION_SNAPSHOTS_FILENAME
+
+
 def iter_session_names(root: Path, *, include_default: bool = True) -> Iterable[str]:
     root_resolved = root.resolve()
     names = set()
@@ -94,12 +99,10 @@ def append_session_log(root: Path, session_name: object, action: object, detail:
 
 def session_summary(root: Path, session_name: object, *, axes_count: int, visualizations_count: int) -> dict:
     normalized = normalize_session_name(session_name)
-    directory = session_dir(root, normalized, create=True)
+    session_dir(root, normalized, create=True)
     return {
         'id': normalized,
         'label': normalized,
-        'path': str(directory),
         'axes_count': int(axes_count),
         'visualizations_count': int(visualizations_count),
-        'activity_log': str(session_activity_log_path(root, normalized)),
     }

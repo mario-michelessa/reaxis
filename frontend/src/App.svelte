@@ -1039,6 +1039,7 @@
               selectedX={selectedAxisX}
               selectedY={selectedAxisY}
               apiBase={API_BASE}
+              sessionName={currentSession}
               dataset={datasetPath}
               axisDebugEmbeddingOption={axisDebugAppliedEmbeddingOption}
               axisDebugPriorMode={axisDebugAppliedPriorMode}
@@ -1082,6 +1083,7 @@
             <AxesMinimap
               items={minimapItems}
               apiBase={API_BASE}
+              sessionName={currentSession}
               selections={[]}
               axes={axes}
               width={minimapSide}

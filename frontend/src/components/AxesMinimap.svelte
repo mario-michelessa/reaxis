@@ -22,6 +22,7 @@
   export let items = [] // [{ id, url, thumbUrl?, fullUrl?, x, y, gx, gy }]
   export let axes = [] // [{ id, name, coords: Record<string, number> }]
   export let apiBase = resolveApiBase()
+  export let sessionName = ''
   export let width = 700
   export let height = 700
   export let viewFrac = 0.15 // viewport square fraction (initial)
@@ -547,6 +548,7 @@
     zoomSavingAxisIds = new Set([...zoomSavingAxisIds, String(axisId)])
     try {
       const data = await postJson('/axis/move', {
+        session: sessionName,
         axis_id: axisId,
         image_id: canonicalImageId,
         new_score_0_100: target,

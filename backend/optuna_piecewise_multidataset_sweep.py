@@ -20,16 +20,17 @@ except ImportError as exc:
 try:
     from .axis_bayes import AxisBayesEngine, CollectionCache
     from .gallery_backend import ImageGalleryEngine
+    from .runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 except ImportError:
     from axis_bayes import AxisBayesEngine, CollectionCache
     from gallery_backend import ImageGalleryEngine
+    from runtime_config import DATASETS_ROOT, OUTPUT_ROOT
 
 
 # =============================
 # Sweep configuration
 # =============================
-REPO_ROOT = Path(__file__).resolve().parent.parent
-CSV_LOG_PATH = REPO_ROOT / 'backend' / 'experiments' / 'piecewise_multidataset_optuna.csv'
+CSV_LOG_PATH = OUTPUT_ROOT / 'sweeps' / 'piecewise_multidataset_optuna.csv'
 
 AXIS_MODEL_TYPE = 'piecewise_linear'
 AXIS_FEATURE_SPACE = 'clip_dino'
@@ -79,7 +80,7 @@ class LoadedTask:
 TASK_SPECS: List[TaskSpec] = [
     TaskSpec(
         name='emoset_emotion',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'EmoSet',
+        dataset_root=DATASETS_ROOT / 'EmoSet',
         field='emotion',
         query_prefix='emotion',
         min_count=1,
@@ -89,7 +90,7 @@ TASK_SPECS: List[TaskSpec] = [
     ),
     TaskSpec(
         name='paintings_wikiart_genre',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'paintings_wikiart',
+        dataset_root=DATASETS_ROOT / 'paintings_wikiart',
         field='genre',
         query_prefix='genre',
         min_count=30,
@@ -99,7 +100,7 @@ TASK_SPECS: List[TaskSpec] = [
     ),
     TaskSpec(
         name='paintings_wikiart_style',
-        dataset_root=REPO_ROOT / 'data' / 'datasets' / 'paintings_wikiart',
+        dataset_root=DATASETS_ROOT / 'paintings_wikiart',
         field='style',
         query_prefix='style',
         min_count=20,

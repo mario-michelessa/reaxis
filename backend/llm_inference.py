@@ -182,8 +182,8 @@ def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
             obj = json.loads(candidate)
             if isinstance(obj, dict):
                 return obj
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            continue
 
         for match in re.finditer(r'\{', candidate):
             start = match.start()
@@ -485,8 +485,8 @@ class LightweightLLMEngine:
                 rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 if isinstance(rendered, str) and rendered.strip():
                     return rendered
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log('chat template rendering failed; using plain prompt: %s', exc)
         chunks: List[str] = []
         for m in messages:
             role = str(m.get('role') or 'user').strip().capitalize()

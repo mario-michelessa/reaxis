@@ -207,8 +207,8 @@ class ImageGalleryEngine:
             mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
             np.savez_compressed(cache, paths=paths, mtimes=mtimes, coords=coords2d)
             print(f"[coords] cached {reduction_method.upper()} coords at {cache}")
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            print(f'[coords] could not cache {reduction_method} coordinates at {cache}: {exc}')
         return coords2d
 
     def _load_cached_coords(self, entries: List[ImageEntry], method: str, reduction: str = DEFAULT_REDUCTION_METHOD) -> Optional[np.ndarray]:

@@ -17,6 +17,7 @@ try:
         parse_methods,
         precompute_dataset,
     )
+    from .runtime_config import DATASYNTH_RAW_ROOT
 except ImportError:
     from import_curated_dataset import (
         DATASETS_ROOT,
@@ -28,6 +29,7 @@ except ImportError:
         parse_methods,
         precompute_dataset,
     )
+    from runtime_config import DATASYNTH_RAW_ROOT
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class BatchItem:
 
 # Local source root containing the raw curated datasets.
 LOCAL_ROOT = Path(DEFAULT_LOCAL_ROOT)
-DATASYNTH_LOCAL_ROOT = Path('/home/mario/codes/datasynth-xai/data')
+DATASYNTH_LOCAL_ROOT = DATASYNTH_RAW_ROOT
 
 # Output datasets created under data/datasets/.
 BATCH_DATASETS = [

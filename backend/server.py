@@ -37,6 +37,10 @@ try:
     from .gallery_backend import ImageGalleryEngine
     from .embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, embedding_cache_filename, normalize_multimodal_method
     from .reduction_cache import normalize_reduction_method
+    from .axis_metric_snapshots import (
+        append_axis_projection_snapshot,
+        ensure_axis_projection_baseline,
+    )
     from .session_store import (
         DEFAULT_SESSION_NAME,
         LEGACY_SESSION_NAME,
@@ -108,6 +112,10 @@ except ImportError:
     from gallery_backend import ImageGalleryEngine
     from embeddings import EmbeddingEngine, DEFAULT_SEMANTIC_EMBED_METHOD, embedding_cache_filename, normalize_multimodal_method
     from reduction_cache import normalize_reduction_method
+    from axis_metric_snapshots import (
+        append_axis_projection_snapshot,
+        ensure_axis_projection_baseline,
+    )
     from session_store import (
         DEFAULT_SESSION_NAME,
         LEGACY_SESSION_NAME,
@@ -176,6 +184,25 @@ except ImportError:
     from llm_inference import LightweightLLMEngine
     from zero_shot_regressor import ZeroShotAttributeRegressor, slugify
 
+try:
+    from .runtime_config import (
+        DATASETS_ROOT,
+        DEFAULT_DATASET_ROOT,
+        FLASK_DEBUG,
+        LEGACY_AXIS_LIBRARY_PATH,
+        SESSIONS_ROOT,
+        UPLOADS_ROOT,
+    )
+except ImportError:
+    from runtime_config import (
+        DATASETS_ROOT,
+        DEFAULT_DATASET_ROOT,
+        FLASK_DEBUG,
+        LEGACY_AXIS_LIBRARY_PATH,
+        SESSIONS_ROOT,
+        UPLOADS_ROOT,
+    )
+
 
 app = Flask(__name__)
 CORS(app)
@@ -185,10 +212,7 @@ CORS(app)
 - DATASETS_ROOT: base folder containing available datasets
 - DATASET_PATH: default dataset folder (used if no dataset query is provided)
 """
-DATASETS_ROOT = (Path(__file__).parent.parent / 'data' / 'datasets').resolve()
-DATASET_PATH = (DATASETS_ROOT / 'ISIC2017').resolve()
-SESSIONS_ROOT = (Path(__file__).parent.parent / 'data' / 'sessions').resolve()
-LEGACY_AXIS_LIBRARY_PATH = (Path(__file__).parent.parent / 'data' / 'axis_library.json').resolve()
+DATASET_PATH = DEFAULT_DATASET_ROOT
 
 # Keep the currently active dataset root for serving images
 app.config['DATASET_ROOT'] = str(DATASET_PATH) if DATASET_PATH.exists() else None
@@ -331,15 +355,17 @@ def list_available_datasets():
 
 def resolve_dataset_root(name_or_none: str | None) -> Path:
     if not name_or_none:
-        return DATASET_PATH
+        candidate = DATASET_PATH
+    else:
+        candidate = (DATASETS_ROOT / str(name_or_none).strip()).resolve()
     # Only allow names that resolve under DATASETS_ROOT to avoid arbitrary paths
-    candidate = (DATASETS_ROOT / name_or_none).resolve()
     try:
         candidate.relative_to(DATASETS_ROOT)
-    except Exception:
-        # Outside datasets root; reject by falling back to default
-        return DATASET_PATH
-    return candidate if candidate.exists() else DATASET_PATH
+    except ValueError:
+        abort(400, description='Dataset must be a name under the configured datasets root')
+    if not candidate.is_dir():
+        abort(404, description=f'Dataset not found: {candidate.name}')
+    return candidate
 
 
 def _normalize_session_name(value: Any) -> str:
@@ -674,7 +700,10 @@ def _project_saved_axis_payload(
         dataset_root=str(dataset_root),
         axis_name=axis_name,
     )
-    state = AXIS_BAYES_ENGINE.deserialize_axis(projected_blob)
+    state = AXIS_BAYES_ENGINE.deserialize_axis(
+        projected_blob,
+        dataset_root_override=str(dataset_root),
+    )
     return AXIS_BAYES_ENGINE._state_payload(state)
 
 
@@ -948,8 +977,8 @@ def _build_entry_lookup(entries: List[Any], dataset_root: Path) -> Dict[str, str
             add(rel, image_id)
             add(Path(rel).name, image_id)
             add(Path(rel).stem, image_id)
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            continue
     return lookup
 
 
@@ -1407,7 +1436,7 @@ def gallery() -> Any:
 
     if not Path(dataset).exists():
         print("[gallery] invalid dataset path:", dataset)
-        return jsonify({'items': [], 'dataset': dataset, 'n_layer': 0, 'n_tile': n_tile, 'method': method, 'embed': embed_method, 'warning': f'DATASET_PATH does not exist: {dataset}'}), 200
+        return jsonify({'items': [], 'dataset': dataset_path.name, 'n_layer': 0, 'n_tile': n_tile, 'method': method, 'embed': embed_method, 'warning': 'Configured dataset does not exist'}), 200
 
     # Be explicit and let errors surface (no swallowing). Easier debugging.
     print(f"[gallery] resolved dataset={Path(dataset).resolve()} n_layer={n_layer} n_tile={n_tile}")
@@ -1461,7 +1490,7 @@ def gallery() -> Any:
 
     print(f"[gallery] returning items={len(items)} meta_axes={len(metadata_axes)}")
     return jsonify({'items': items,
-                    'dataset': dataset,
+                    'dataset': dataset_root.name,
                     'n_layer': eff_layer,
                     'n_tile': n_tile,
                     'method': method,
@@ -1513,14 +1542,14 @@ def metadata_summary():
         axes = []
 
     return jsonify({
-        'dataset': str(dataset_root),
+        'dataset': dataset_root.name,
         'dataset_name': dataset_root.name,
         'image_count': int(summary.get('image_count') or 0),
         'matched_rows': int(summary.get('matched_rows') or 0),
         'field_count': int(len(summary.get('fields') or [])),
         'fields': summary.get('fields') or [],
         'metadata_axes': axes,
-        'metadata_path': str(dataset_root / 'metadata.csv'),
+        'metadata_file': 'metadata.csv',
     })
 
 
@@ -1627,11 +1656,11 @@ def metadata_upload():
 
     return jsonify({
         'ok': True,
-        'dataset': str(dataset_root),
+        'dataset': dataset_root.name,
         'dataset_name': dataset_root.name,
         'mode': mode,
         'source': source,
-        'metadata_path': str(meta_path),
+        'metadata_file': meta_path.name,
         'row_count': int(len(final_rows)),
         'field_count': int(len(summary.get('fields') or [])),
         'fields': summary.get('fields') or [],
@@ -1735,7 +1764,7 @@ def recommend_scatterplots():
     recommendations = recommendations[:top_k]
 
     return jsonify({
-        'dataset': str(dataset_root),
+        'dataset': dataset_root.name,
         'dataset_name': dataset_root.name,
         'weights': {
             'correlation': float(corr_w),
@@ -1790,7 +1819,6 @@ def export_artifacts():
         'created_at': now.isoformat(),
         'dataset': {
             'name': dataset_root.name,
-            'path': str(dataset_root),
             'image_count': int(len(entries)),
         },
         'prompt': prompt or None,
@@ -1805,7 +1833,7 @@ def export_artifacts():
         },
         'axes': axes,
         'metadata': {
-            'path': str(dataset_root / 'metadata.csv'),
+            'file': 'metadata.csv',
             'fields': metadata_fields,
         },
     }
@@ -1821,10 +1849,10 @@ def export_artifacts():
 
     return jsonify({
         'ok': True,
-        'dataset': str(dataset_root),
+        'dataset': dataset_root.name,
         'dataset_name': dataset_root.name,
         'filename': filename,
-        'artifact_path': str(out_path),
+        'artifact_file': f'artifacts/{filename}',
         'subset_size': int(len(subset_ids)),
         'axis_count': int(len(axes)),
         'artifact': artifact,
@@ -1834,6 +1862,7 @@ def export_artifacts():
 @app.post('/axis/create')
 def axis_create():
     payload = request.get_json(silent=True) or {}
+    metric_session = str(payload.get('session') or '').strip()
     dataset_root = _resolve_dataset_from_payload(payload)
     q = str(payload.get('q') or payload.get('attribute') or '').strip()
     mode = str(payload.get('mode') or '').strip() or None
@@ -1864,6 +1893,17 @@ def axis_create():
         state = getattr(engine, '_axes', {}).get(axis_id)
         if state is not None:
             AXIS_BAYES_ENGINE._axes[axis_id] = state
+        if metric_session:
+            if state is None:
+                raise ValueError(f'Created axis {axis_id} has no in-memory state')
+            append_axis_projection_snapshot(
+                sessions_root=SESSIONS_ROOT,
+                session_name=metric_session,
+                state=state,
+                payload=result,
+                event_type='create',
+                baseline_kind='text_initialization',
+            )
     except Exception as e:
         abort(500, description=f'Axis creation failed: {e}')
     return jsonify(result)
@@ -1872,6 +1912,7 @@ def axis_create():
 @app.post('/axis/move')
 def axis_move():
     payload = request.get_json(silent=True) or {}
+    metric_session = str(payload.get('session') or '').strip()
     axis_id = str(payload.get('axis_id') or payload.get('axisId') or '').strip()
     image_id = str(payload.get('image_id') or payload.get('imageId') or '').strip()
     move_type = str(payload.get('move_type') or payload.get('moveType') or 'score').strip().lower() or 'score'
@@ -1889,12 +1930,39 @@ def axis_move():
             abort(400, description='Invalid new_score_0_100')
 
     try:
+        state = getattr(AXIS_BAYES_ENGINE, '_axes', {}).get(axis_id)
+        if state is None:
+            raise KeyError(f'Unknown axis_id: {axis_id}')
+        if metric_session:
+            ensure_axis_projection_baseline(
+                sessions_root=SESSIONS_ROOT,
+                session_name=metric_session,
+                state=state,
+                payload=AXIS_BAYES_ENGINE._state_payload(state),
+            )
         result = AXIS_BAYES_ENGINE.move_axis(
             axis_id=axis_id,
             image_id=image_id,
             new_score_0_100=new_score_0_100,
             move_type=move_type,
         )
+        if metric_session:
+            event_type = (
+                'delete_feedback'
+                if move_type in {'delete', 'remove'}
+                else ('undefined_feedback' if move_type in {'undefined', 'exclude'} else 'score_feedback')
+            )
+            append_axis_projection_snapshot(
+                sessions_root=SESSIONS_ROOT,
+                session_name=metric_session,
+                state=state,
+                payload=result,
+                event_type=event_type,
+                baseline_kind='post_feedback_update',
+                image_id=image_id,
+                move_type=move_type,
+                target_score_0_100=(None if event_type != 'score_feedback' else new_score_0_100),
+            )
     except KeyError as e:
         abort(404, description=str(e))
     except ValueError as e:
@@ -1907,6 +1975,7 @@ def axis_move():
 @app.post('/axis/update_prompts')
 def axis_update_prompts():
     payload = request.get_json(silent=True) or {}
+    metric_session = str(payload.get('session') or '').strip()
     axis_id = str(payload.get('axis_id') or payload.get('axisId') or '').strip()
     pos_prompts = payload.get('pos_prompts', payload.get('posPrompts'))
     neg_prompts = payload.get('neg_prompts', payload.get('negPrompts'))
@@ -1916,11 +1985,30 @@ def axis_update_prompts():
         abort(400, description='pos_prompts and neg_prompts must be arrays')
 
     try:
+        state = getattr(AXIS_BAYES_ENGINE, '_axes', {}).get(axis_id)
+        if state is None:
+            raise KeyError(f'Unknown axis_id: {axis_id}')
+        if metric_session:
+            ensure_axis_projection_baseline(
+                sessions_root=SESSIONS_ROOT,
+                session_name=metric_session,
+                state=state,
+                payload=AXIS_BAYES_ENGINE._state_payload(state),
+            )
         result = AXIS_BAYES_ENGINE.update_axis_prompts(
             axis_id=axis_id,
             pos_prompts=pos_prompts,
             neg_prompts=neg_prompts,
         )
+        if metric_session:
+            append_axis_projection_snapshot(
+                sessions_root=SESSIONS_ROOT,
+                session_name=metric_session,
+                state=state,
+                payload=result,
+                event_type='prompt_update',
+                baseline_kind='edited_text_initialization',
+            )
     except KeyError as e:
         abort(404, description=str(e))
     except ValueError as e:
@@ -1975,7 +2063,7 @@ def session_log():
     return jsonify({
         'ok': True,
         'session': session_name,
-        'path': str(path),
+        'log_file': path.name,
     })
 
 
@@ -2125,12 +2213,9 @@ def axis_library_project():
     if isinstance(axis_obj, dict):
         axis_obj['name'] = axis_name
 
-    try:
-        state = getattr(AXIS_BAYES_ENGINE, '_axes', {}).get(axis_id)
-        if state is not None:
-            state.axis_name = axis_name
-    except Exception:
-        pass
+    state = getattr(AXIS_BAYES_ENGINE, '_axes', {}).get(axis_id)
+    if state is not None:
+        state.axis_name = axis_name
 
     result['library_axis'] = {
         'id': str(item.get('id') or ''),
@@ -2728,7 +2813,7 @@ def llm_attribute_distribution():
     axis_name = re.sub(r'\s+', ' ', attribute).strip().title() or 'Attribute'
 
     resp: Dict[str, Any] = {
-        'dataset': str(dataset_root),
+        'dataset': dataset_root.name,
         'attribute': attribute,
         'attribute_type': attribute_type,
         'attribute_type_provider': attribute_type_provider,
@@ -2790,10 +2875,7 @@ def serve_image(relpath: str):
     if not Path(target).exists():
         return abort(404)
     resp = send_from_directory(directory, filename)
-    try:
-        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
-    except Exception:
-        pass
+    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
     return resp
 
 
@@ -2851,19 +2933,13 @@ def serve_thumbnail(size: int, relpath: str):
                 buf.seek(0)
                 from flask import send_file
                 resp = send_file(buf, mimetype='image/jpeg')
-                try:
-                    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
-                except Exception:
-                    pass
+                resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
                 return resp
         except Exception:
             return abort(500, description=f'Failed to generate thumbnail: {e}')
 
     resp = send_from_directory(str(cache_file.parent), cache_file.name)
-    try:
-        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
-    except Exception:
-        pass
+    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
     return resp
 
 
@@ -3052,17 +3128,27 @@ def upload_image():
     Form fields:
     - file: image file (required)
     - class: optional subfolder to place the image in
-    - dataset: optional dataset root; defaults to current DATASET_ROOT or backend/uploads
+    - dataset: optional dataset name under REAXIS_DATASETS_ROOT
     """
     f = request.files.get('file')
     if not f:
         return abort(400, description='Missing file')
     class_name = request.form.get('class', '').strip()
-    dataset = request.form.get('dataset')
-
-    root = Path(dataset) if dataset else (Path(app.config.get('DATASET_ROOT') or Path(__file__).parent / 'uploads'))
+    dataset = str(request.form.get('dataset') or '').strip()
+    if dataset:
+        root = resolve_dataset_root(dataset)
+    elif app.config.get('DATASET_ROOT'):
+        root = Path(str(app.config['DATASET_ROOT'])).resolve()
+    else:
+        root = UPLOADS_ROOT
     root.mkdir(parents=True, exist_ok=True)
-    target_dir = root / class_name if class_name else root
+    if class_name and Path(class_name).name != class_name:
+        abort(400, description='class must be a single directory name')
+    target_dir = (root / class_name).resolve() if class_name else root.resolve()
+    try:
+        target_dir.relative_to(root.resolve())
+    except ValueError:
+        abort(400, description='Invalid class directory')
     target_dir.mkdir(parents=True, exist_ok=True)
 
     # Sanitize filename
@@ -3078,7 +3164,7 @@ def upload_image():
 
 
 def main():
-    app.run(host=BACKEND_HOST, port=int(BACKEND_PORT), debug=True)
+    app.run(host=BACKEND_HOST, port=BACKEND_PORT, debug=FLASK_DEBUG)
 
 
 if __name__ == '__main__':

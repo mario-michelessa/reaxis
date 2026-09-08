@@ -10,15 +10,17 @@ try:
     from .import_curated_dataset import DEFAULT_REDUCTION, parse_methods, precompute_dataset
     from .embeddings import embedding_cache_filename, normalize_multimodal_method
     from .reduction_cache import coords_cache_filename, parse_reduction_methods
+    from .runtime_config import DATASETS_ROOT
 except ImportError:
     from import_curated_dataset import DEFAULT_REDUCTION, parse_methods, precompute_dataset
     from embeddings import embedding_cache_filename, normalize_multimodal_method
     from reduction_cache import coords_cache_filename, parse_reduction_methods
+    from runtime_config import DATASETS_ROOT
 
 
 DEFAULT_METHODS = ["siglip2"]
 DEFAULT_RAW_METHODS = ["siglip2", "clip"]
-DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
+DATASETS_DIR = DATASETS_ROOT
 
 
 def resolve_datasets(raw_datasets: List[str]) -> List[Path]:
