@@ -1,8 +1,57 @@
-backend/uploads
-backend/__pycache__
-frontend/node_modules
-frontend/public/datasets
-frontend/dist
-frontend/build
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+data/secrets/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+
+# Frontend dependencies and generated builds
+frontend/node_modules/
+frontend/dist*/
+frontend/build/
+frontend/public/datasets/
+frontend/*.log
+
+# Runtime and dataset state. Keep only documentation in data/.
 data/*
+!data/README.md
+!data/.gitkeep
+backend/uploads/
+docs
+# Research outputs and participant/session derivatives
+outputs/
+backend/experiments/
+backend/figures/
+user_study/
+
+# Local archives, logs, scratch files, and generated figures
 *.zip
+*.tar
+*.tar.gz
+*.tgz
+*.log
+*.bkp.*
+*.ipynb
+*.ipynb_checkpoints/
+/session_timeline.pdf
+/=*
+/PROMPT.md
+/tmp/
+
+# Local agent state
+.agent/
+CONTINUITY.md
+
+# Paper/build artifacts retained outside the public code release
+*.tex

@@ -1,0 +1,52 @@
+{
+  "methods": [
+    {
+      "name": "clip_text_similarity",
+      "label": "CLIP text",
+      "interaction_count": "latest"
+    },
+    {
+      "name": "prompt_ensemble",
+      "label": "Prompt ensemble",
+      "interaction_count": "latest"
+    },
+    {
+      "name": "label_only_linear",
+      "label": "Label-only linear",
+      "interaction_count": "latest"
+    },
+    {
+      "name": "knn_label_propagation",
+      "label": "kNN propagation",
+      "interaction_count": "latest"
+    },
+    {
+      "name": "request_bayes_linear_gaussian",
+      "label": "ReQuest Bayesian Linear",
+      "interaction_count": "latest"
+    }
+  ],
+  "panels": [
+    {
+      "task_id": "brain_mri_images__binary__label__tumor",
+      "title": "Brain MRI: tumor",
+      "selection_method": "request_bayes_linear_gaussian",
+      "selection_interaction_count": "latest",
+      "example_slots": [1, 3, 5, 7, 9, 12, 14, 16, 18, 20]
+    },
+    {
+      "task_id": "emoset__derived__saturation",
+      "title": "EmoSet: saturation",
+      "selection_method": "request_bayes_linear_gaussian",
+      "selection_interaction_count": "latest",
+      "example_slots": [1, 3, 5, 7, 9, 12, 14, 16, 18, 20]
+    },
+    {
+      "task_id": "celeba_dataset__binary_prefix__attr_bags_under_eyes",
+      "title": "CelebA: bags under eyes",
+      "selection_method": "request_bayes_linear_gaussian",
+      "selection_interaction_count": "latest",
+      "example_slots": [1, 3, 5, 7, 9, 12, 14, 16, 18, 20]
+    }
+  ]
+}

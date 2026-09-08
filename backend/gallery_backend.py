@@ -23,8 +23,36 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
-from embeddings import SUPPORTED_FORMATS, ImageEntry, EmbeddingEngine
-import layout as layout_utils
+try:
+    from .embeddings import (
+        DEFAULT_SEMANTIC_EMBED_METHOD,
+        SUPPORTED_FORMATS,
+        ImageEntry,
+        EmbeddingEngine,
+        embedding_cache_filename,
+        normalize_multimodal_method,
+    )
+    from . import layout as layout_utils
+    from .reduction_cache import (
+        DEFAULT_REDUCTION_METHOD,
+        coords_cache_filename,
+        normalize_reduction_method,
+    )
+except ImportError:
+    from embeddings import (
+        DEFAULT_SEMANTIC_EMBED_METHOD,
+        SUPPORTED_FORMATS,
+        ImageEntry,
+        EmbeddingEngine,
+        embedding_cache_filename,
+        normalize_multimodal_method,
+    )
+    import layout as layout_utils
+    from reduction_cache import (
+        DEFAULT_REDUCTION_METHOD,
+        coords_cache_filename,
+        normalize_reduction_method,
+    )
 
 class ImageGalleryEngine:
     """Orchestrates image discovery, embedding, 2D layout, and grid packing."""
@@ -39,8 +67,14 @@ class ImageGalleryEngine:
     def list_images(self) -> List[ImageEntry]:
         return self.emb.list_images()
 
-    def estimate_embeddings(self, images: Sequence[ImageEntry], method: str = "color_rgb", resize: Tuple[int, int] = (32, 32)) -> np.ndarray:
-        return self.emb.estimate_embeddings(images, method=method, resize=resize)
+    def estimate_embeddings(
+        self,
+        images: Sequence[ImageEntry],
+        method: str = DEFAULT_SEMANTIC_EMBED_METHOD,
+        resize: Tuple[int, int] = (32, 32),
+        normalize: bool = True,
+    ) -> np.ndarray:
+        return self.emb.estimate_embeddings(images, method=method, resize=resize, normalize=normalize)
 
     # Embedding extraction implementations moved to embeddings. No local copies here.
 
@@ -54,10 +88,10 @@ class ImageGalleryEngine:
         return layout_utils.pack_to_grid(coords01, n_layer=n_layer, n_tile=n_tile, filter_fn=filter_fn)
 
     def build_gallery(self, n_layer: int = 64, n_tile: int = 8,
-                      method: str = "pca", embed_method: str = "color_rgb") -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
+                      method: str = DEFAULT_REDUCTION_METHOD, embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD) -> Tuple[List[ImageEntry], np.ndarray, np.ndarray, int]:
         """End-to-end pipeline returning entries, reduced coords, and packed coords.
 
-        Embeddings and PCA coordinates are cached per dataset and model.
+        Embeddings and 2D reduction coordinates are cached per dataset and model.
         """
         entries = self.list_images()
         embs = self._load_or_compute_embeddings(entries, embed_method)
@@ -68,9 +102,9 @@ class ImageGalleryEngine:
     def _cache_dir(self) -> Path:
         return self.emb._cache_dir()
 
-    def _load_or_compute_embeddings(self, entries: List[ImageEntry], method: str) -> np.ndarray:
+    def _load_or_compute_embeddings(self, entries: List[ImageEntry], method: str, normalize: bool = True) -> np.ndarray:
         # Try fast-path: plain embeddings npz without path metadata (e.g., dift_sd_partXY)
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache = self._cache_dir() / embedding_cache_filename(method, normalize=normalize)
         if cache.exists():
             try:
                 data = np.load(cache, allow_pickle=False)
@@ -87,21 +121,21 @@ class ImageGalleryEngine:
                 # Fall through to normal path
                 print(f"[emb] failed to load minimal cache: {cache.name}")
         # Normal cached format with path+mtime checks
-        print(f"[emb] probing cache (full) embeddings_{method.lower()}.npz with paths/mtimes")
-        embs = self.emb.load_embeddings_only(entries, method=method)
+        print(f"[emb] probing cache (full) {cache.name} with paths/mtimes")
+        embs = self.emb.load_embeddings_only(entries, method=method, normalize=normalize)
         if embs is not None:
             print(f"[emb] loaded full cache shape={tuple(embs.shape)}")
             return embs
-        print(f"[emb] cache miss, computing embeddings method={method}")
-        return self.emb.compute_and_cache_embeddings(entries, method=method)
+        print(f"[emb] cache miss, computing embeddings method={method} normalize={bool(normalize)}")
+        return self.emb.compute_and_cache_embeddings(entries, method=method, normalize=normalize)
 
-    def _load_embeddings_only(self, entries: List[ImageEntry], method: str) -> Optional[np.ndarray]:
+    def _load_embeddings_only(self, entries: List[ImageEntry], method: str, normalize: bool = True) -> Optional[np.ndarray]:
         """Load cached embeddings only; supports both minimal and full cache formats.
 
         Minimal: npz with only an embeddings array (any key, prefers 'embeddings').
         Full: npz with paths/mtimes + embeddings; validates against current dataset.
         """
-        cache = self._cache_dir() / f'embeddings_{method.lower()}.npz'
+        cache = self._cache_dir() / embedding_cache_filename(method, normalize=normalize)
         if not cache.exists():
             print(f"[emb] cache file not found: {cache}")
             return None
@@ -113,22 +147,46 @@ class ImageGalleryEngine:
             # Full format with validation
             if {'paths', 'embeddings'}.issubset(set(data.files)):
                 print(f"[emb] found full format with paths/embeddings")
-                # Compare by image id (class/filename) only, not absolute paths
-                # Get absolute paths from entries
+                embs = data['embeddings']
+                if embs.ndim != 2 or embs.shape[0] != len(entries):
+                    print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
+                    print(f"[emb] cache format invalid or does not match dataset: {cache}")
+                    return None
+
+                # First try strict absolute-path comparison.
                 current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
                 cached_paths = np.array([str(Path(p).resolve()) for p in data['paths']])
                 paths_match = len(cached_paths) == len(current_paths) and np.all(cached_paths == current_paths)
                 print(f"[emb] validation results - paths match: {paths_match}")
                 if paths_match:
-                    embs = data['embeddings']
                     print(f"[emb] paths match, embeddings shape={embs.shape}")
-                    if embs.ndim == 2 and embs.shape[0] == len(entries):
-                        print(f"[emb] returning full format embeddings")
+                    print(f"[emb] returning full format embeddings")
+                    return embs
+
+                # If path roots differ (common when cache was built from another cwd),
+                # validate and align by image id (filename).
+                current_ids = [str(e.id) for e in entries]
+                cached_ids = [Path(str(p)).name for p in data['paths']]
+
+                if len(cached_ids) == len(current_ids):
+                    if np.all(np.asarray(cached_ids, dtype=object) == np.asarray(current_ids, dtype=object)):
+                        print("[emb] paths mismatch but ids match in order; accepting cache by id")
                         return embs
-                    else:
-                        print(f"[emb] shape mismatch in full format: expected ({len(entries)}, N), got {embs.shape}")
-                else:
-                    print(f"[emb] cache validation failed for full format (paths mismatch)")
+
+                    id_to_idx: Dict[str, int] = {}
+                    duplicate_id = False
+                    for idx, image_id in enumerate(cached_ids):
+                        if image_id in id_to_idx:
+                            duplicate_id = True
+                            break
+                        id_to_idx[image_id] = idx
+
+                    if (not duplicate_id) and all(image_id in id_to_idx for image_id in current_ids):
+                        remap = np.asarray([id_to_idx[image_id] for image_id in current_ids], dtype=np.int64)
+                        print("[emb] paths mismatch; remapping embeddings by image id order")
+                        return embs[remap]
+
+                print(f"[emb] cache validation failed for full format (paths/id mismatch)")
         except Exception:
             print(f"[emb] failed to load/validate cache: {cache}")
             return None
@@ -136,37 +194,58 @@ class ImageGalleryEngine:
         return None
 
     def _load_or_compute_coords(self, entries: List[ImageEntry], embs: np.ndarray, method: str, red_method: str) -> np.ndarray:
-        # Always cache PCA coordinates as primary; if UMAP requested and available, skip cache
-        cache = self._cache_dir() / f'coords_pca2d_{method.lower()}.npz'
-        current_ids = np.array([e.id for e in entries])
-        if red_method.lower() == 'pca' and cache.exists():
-            try:
-                data = np.load(cache, allow_pickle=False)
-                if 'paths' in data.files:
-                    cached_ids = np.array([f"{Path(p).parent.name}/{Path(p).name}" for p in data['paths']])
-                else:
-                    cached_ids = None
-                if (cached_ids is not None and len(cached_ids) == len(current_ids) and np.all(cached_ids == current_ids)):
-                    print(f"[coords] loaded cached PCA coords shape={tuple(data['coords'].shape)}")
-                    return data['coords']
-            except Exception:
-                pass
-        print(f"[coords] computing coords method={red_method} for embs shape={tuple(embs.shape)}")
-        coords2d = self.reduce_to_2d(embs, method=red_method)
-        if red_method.lower() == 'pca':
-            try:
-                # Persist identifiers for validation on reload
-                paths = np.array([e.path for e in entries])
-                mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
-                np.savez_compressed(cache, paths=paths, mtimes=mtimes, coords=coords2d)
-                print(f"[coords] cached PCA coords at {cache}")
-            except Exception:
-                pass
+        reduction_method = normalize_reduction_method(red_method)
+        cached_coords = self._load_cached_coords(entries, method=method, reduction=reduction_method)
+        if cached_coords is not None:
+            return cached_coords
+        cache = self._cache_dir() / coords_cache_filename(method, reduction=reduction_method)
+        print(f"[coords] computing coords method={reduction_method} for embs shape={tuple(embs.shape)}")
+        coords2d = self.reduce_to_2d(embs, method=reduction_method)
+        try:
+            # Persist identifiers for validation on reload
+            paths = np.array([e.path for e in entries])
+            mtimes = np.array([int(Path(p).stat().st_mtime) if Path(p).exists() else 0 for p in paths], dtype=np.int64)
+            np.savez_compressed(cache, paths=paths, mtimes=mtimes, coords=coords2d)
+            print(f"[coords] cached {reduction_method.upper()} coords at {cache}")
+        except (OSError, ValueError) as exc:
+            print(f'[coords] could not cache {reduction_method} coordinates at {cache}: {exc}')
         return coords2d
+
+    def _load_cached_coords(self, entries: List[ImageEntry], method: str, reduction: str = DEFAULT_REDUCTION_METHOD) -> Optional[np.ndarray]:
+        reduction_method = normalize_reduction_method(reduction)
+        cache = self._cache_dir() / coords_cache_filename(method, reduction=reduction_method)
+        current_paths = np.array([str(Path(e.path).resolve()) for e in entries])
+        current_names = np.array([Path(e.path).name for e in entries])
+        if not cache.exists():
+            return None
+        try:
+            data = np.load(cache, allow_pickle=False)
+            if 'paths' in data.files:
+                cached_paths = np.array([str(Path(p).resolve()) for p in data['paths']])
+                cached_names = np.array([Path(p).name for p in data['paths']])
+            else:
+                cached_paths = None
+                cached_names = None
+            paths_match = (
+                cached_paths is not None
+                and len(cached_paths) == len(current_paths)
+                and np.all(cached_paths == current_paths)
+            )
+            names_match = (
+                cached_names is not None
+                and len(cached_names) == len(current_names)
+                and np.all(cached_names == current_names)
+            )
+            if paths_match or names_match:
+                print(f"[coords] loaded cached {reduction_method.upper()} coords shape={tuple(data['coords'].shape)}")
+                return data['coords']
+        except Exception:
+            return None
+        return None
 
     def export_gallery_json(self, out_path: str, base_url: Optional[str] = None,
                              n_layer: int = 64, n_tile: int = 8,
-                             method: str = "umap", embed_method: str = "color_rgb") -> str:
+                             method: str = DEFAULT_REDUCTION_METHOD, embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD) -> str:
         """Generate a JSON file with image metadata and coordinates.
 
         - base_url: optional URL prefix to serve images (e.g., '/images')
@@ -198,7 +277,7 @@ class ImageGalleryEngine:
         return out_path
 
     def build_gallery_from_precomputed(self, n_layer: int = 64, n_tile: int = 8,
-                                       method: str = "pca", embed_method: str = "color_rgb"):
+                                       method: str = DEFAULT_REDUCTION_METHOD, embed_method: str = DEFAULT_SEMANTIC_EMBED_METHOD):
         """Build gallery using ONLY precomputed embeddings.
 
         Loads cached embeddings; if unavailable returns (None, None, None, 0).
@@ -215,7 +294,11 @@ class ImageGalleryEngine:
         if embs.ndim == 2 and embs.shape[0] == 2 and embs.shape[1] != 2 and embs.shape[1] == len(entries):
             print(f"Transposing embeddings from {embs.shape} to ({len(entries)}, 2) assumption")
             embs = embs.T
-        coords2d = self.reduce_to_2d(embs, method=method)
+        reduction_method = normalize_reduction_method(method)
+        coords2d = self._load_cached_coords(entries, method=embed_method, reduction=reduction_method)
+        if coords2d is None:
+            print(f"[build] No cached 2D coords found for method={embed_method} reduction={reduction_method}")
+            return None, None, None, 0
         # Sanity: coords must be (N,2). If (2,N), transpose.
         if coords2d.ndim == 2 and coords2d.shape[0] == 2 and coords2d.shape[1] == len(entries):
             print(f"Transposing coords2d from {coords2d.shape} to ({len(entries)}, 2)")
@@ -301,11 +384,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_tile", type=int, default=8)
     parser.add_argument("--method", type=str, default="pca", help="'umap' or 'pca'")
     parser.add_argument("--base_url", type=str, default=None, help="Optional URL prefix for images")
-    parser.add_argument("--embed", type=str, default="color_rgb", help="Embedding method: 'color_rgb', 'clip', 'dino', 'sd'")
+    parser.add_argument("--embed", type=str, default=DEFAULT_SEMANTIC_EMBED_METHOD, help="Embedding method: 'siglip2', 'color_rgb', 'clip', 'dino', 'sd'")
     # Standalone export-all
     parser.add_argument("--export_all_dir", type=str, default=None, help="Output folder for standalone dataset (copies images and writes gallery_*.json)")
-    parser.add_argument("--methods", type=str, default="color_rgb,clip,dino,dift_sd", help="Comma-separated embedding methods to export")
-    parser.add_argument("--default_method", type=str, default="color_rgb", help="Default method for gallery.json link")
+    parser.add_argument("--methods", type=str, default=f"color_rgb,{DEFAULT_SEMANTIC_EMBED_METHOD},clip,dino,dift_sd", help="Comma-separated embedding methods to export")
+    parser.add_argument("--default_method", type=str, default=DEFAULT_SEMANTIC_EMBED_METHOD, help="Default method for gallery.json link")
     args = parser.parse_args()
 
     if args.export_all_dir:

@@ -5,25 +5,20 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 
-import grid as grid_utils
+try:
+    from . import grid as grid_utils
+    from .reduction_cache import normalize_reduction_method
+except ImportError:
+    import grid as grid_utils
+    from reduction_cache import normalize_reduction_method
 
-# Create a fixed random reference at import time and project it to 2D via PCA.
-# We will align all subsequent 2D projections (PCA/UMAP) to this reference
-# using an orthogonal Procrustes rotation to stabilize orientation.
+# Create a fixed deterministic 2D reference at import time without heavy linear
+# algebra. Using SVD here can trigger OpenMP shared-memory initialization during
+# module import, which prevents the backend from starting in restricted runtime
+# environments.
 _REF_ROWS = 8192
-_REF_DIM = 64
 _rng = np.random.default_rng(12345)
-_REF_X = _rng.standard_normal((_REF_ROWS, _REF_DIM)).astype(np.float32)
-
-
-def _pca_2d(X: np.ndarray) -> np.ndarray:
-    Xc = X - X.mean(axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-    comps = Vt[:2]
-    return (Xc @ comps.T)
-
-
-_REF_2D = _pca_2d(_REF_X)  # shape (_REF_ROWS, 2)
+_REF_2D = _rng.standard_normal((_REF_ROWS, 2)).astype(np.float32)
 
 
 def _orthogonal_procrustes(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -44,19 +39,42 @@ def _orthogonal_procrustes(A: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 def reduce_to_2d(embeddings: np.ndarray, method: str = "pca", random_state: int = 42) -> np.ndarray:
     coords: np.ndarray
+    reduction_method = normalize_reduction_method(method)
     # Degenerate guard: no features
     if embeddings.size == 0 or embeddings.ndim != 2 or embeddings.shape[1] == 0:
         n = embeddings.shape[0] if embeddings.ndim >= 1 else 0
         return np.zeros((n, 2), dtype=np.float32)
-    if method == "umap":
-        try:
-            import umap  # type: ignore
-            reducer = umap.UMAP(n_components=2, random_state=random_state)
-            coords = reducer.fit_transform(embeddings)
-        except Exception:
-            coords = _pca_2d(embeddings)
-    else:
+    if reduction_method == "pca":
         coords = _pca_2d(embeddings)
+    elif reduction_method == "umap":
+        import umap  # type: ignore
+
+        reducer = umap.UMAP(
+            n_components=2,
+            random_state=random_state,
+            init='spectral',
+        )
+        coords = reducer.fit_transform(embeddings)
+    elif reduction_method == "tsne":
+        from sklearn.manifold import TSNE
+
+        n_samples = int(embeddings.shape[0])
+        if n_samples < 2:
+            coords = np.zeros((n_samples, 2), dtype=np.float32)
+        else:
+            perplexity = min(30.0, max(1.0, float(n_samples - 1) / 3.0))
+            perplexity = min(perplexity, float(n_samples - 1))
+            tsne_inputs = _pca_components(embeddings, max_components=50)
+            reducer = TSNE(
+                n_components=2,
+                init='pca',
+                learning_rate='auto',
+                random_state=random_state,
+                perplexity=perplexity,
+            )
+            coords = reducer.fit_transform(tsne_inputs)
+    else:
+        raise ValueError(f'Unsupported reduction method: {method}')
 
     # Align to common reference via orthogonal Procrustes (rotation-only)
     N = coords.shape[0]
@@ -82,6 +100,17 @@ def _pca_2d(X: np.ndarray) -> np.ndarray:
     U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
     comps = Vt[:2]
     return (Xc @ comps.T)
+
+
+def _pca_components(X: np.ndarray, max_components: int) -> np.ndarray:
+    Xc = X.astype(np.float32, copy=False) - X.mean(axis=0, keepdims=True)
+    n_samples, n_features = Xc.shape
+    target_dim = min(int(max_components), int(n_features), max(1, int(n_samples - 1)))
+    if target_dim >= n_features:
+        return Xc.astype(np.float32, copy=False)
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    comps = Vt[:target_dim]
+    return (Xc @ comps.T).astype(np.float32, copy=False)
 
 
 def pack_to_grid(coords01: np.ndarray, n_layer: int = 64, n_tile: int = 8,

@@ -1,0 +1,10 @@
+name: scaledit
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - nodejs>=20,<23
+  - pip
+  - pip:
+      - -r backend/requirements-dev.txt
+      - optuna>=3.6

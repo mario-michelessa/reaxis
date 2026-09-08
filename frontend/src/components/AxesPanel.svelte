@@ -12,7 +12,7 @@
   // - diftPart: current dift local composition part (e.g., '11')
   export let axes = []
   // export let items = []
-  export let embedSelection = 'color_rgb'
+  export let embedSelection = 'siglip2'
   // export let labels = new Map()
   // Projections forwarded from App: [{ value, label }]
   export let projections = []
@@ -55,6 +55,7 @@
   // Map a projection value to its grouping key (projection-level)
   function methodForProjectionValue(val) {
     // Built-ins group by projection, not variant
+    if (val === 'siglip2') return 'siglip2'
     if (val === 'clip') return 'clip'
     if (val === 'color_rgb') return 'color_rgb'
     if (val === 'shape') return 'shape'
@@ -68,6 +69,7 @@
     if (!axisId || !groupKey) return false
     if (groupKey === 'color_rgb') return axisId.startsWith('axis:color_lch:') || axisId.startsWith('axis:color_hsv:') || axisId.startsWith('axis:color_rgb:')
     if (groupKey === 'shape') return axisId.startsWith('axis:dino:') || axisId.startsWith('axis:dift_sd_part') || axisId.startsWith('axis:dift_sd:')
+    if (groupKey === 'siglip2') return axisId.startsWith('axis:siglip2:')
     if (groupKey === 'clip') return axisId.startsWith('axis:clip:')
     
     if (groupKey === 'meta') return axisId.startsWith('axis:meta:')

@@ -1,8 +1,9 @@
 <script>
   import ImageGrid from './ImageGrid.svelte'
+  import { buildApiUrl, resolveApiBase } from '../lib/apiBase'
 
   export let items = [] // full gallery items [{id,url,className,label,gx,gy,x,y}]
-  export let apiBase = 'http://localhost:5001'
+  export let apiBase = resolveApiBase()
   export let defaultTopN = 10
   export let onCreateConcept = (goodIds) => {}
   export let onRefreshGallery = async () => {}
@@ -28,10 +29,10 @@
     if (!queryText || !queryText.trim()) { error = 'Enter some text to search'; return }
     busy = true
     try {
-      const res = await fetch(`${apiBase}/text_force`, {
+      const res = await fetch(buildApiUrl(apiBase, '/text_force'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: queryText.trim(), rect: { x: 0, y: 0, w: 1, h: 1 }, embed: 'clip', method: 'pca', alpha: 0 })
+        body: JSON.stringify({ text: queryText.trim(), rect: { x: 0, y: 0, w: 1, h: 1 }, embed: 'siglip2', alpha: 0 })
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -54,7 +55,7 @@
     form.append('file', file)
     try {
       busy = true
-      const res = await fetch(`${apiBase}/upload`, { method: 'POST', body: form })
+      const res = await fetch(buildApiUrl(apiBase, '/upload'), { method: 'POST', body: form })
       if (!res.ok) throw new Error(await res.text())
       await onRefreshGallery()
     } catch (e) {
@@ -107,4 +108,3 @@
 
 <style>
 </style>
-

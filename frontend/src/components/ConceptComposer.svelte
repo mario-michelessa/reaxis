@@ -63,7 +63,6 @@
       const qs = new URLSearchParams()
       if (datasetPath && datasetPath.trim()) qs.set('dataset', datasetPath.trim())
       qs.set('embed', method)
-      qs.set('method', 'pca')
       const url = `${apiBase}/gallery.json?${qs.toString()}`
       const res = await fetch(url)
       if (!res.ok) throw new Error('fetch failed')

@@ -11,6 +11,7 @@
   function methodAlias(m) {
     if (!m) return ''
     if (m === 'avg') return 'Color (avg)'
+    if (m === 'siglip2') return 'Content (siglip2)'
     if (m === 'clip') return 'Content (clip)'
     if (m === 'dino') return 'Global composition (dino)'
     if (m === 'dift_sd') return 'Local composition (dift_sd)'
